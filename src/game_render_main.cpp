@@ -126,7 +126,67 @@ Uint8 Game::message_backdrop_alpha() const
         config_.message_half_tone,
         th2::GameConfig::min_message_half_tone,
         th2::GameConfig::max_message_half_tone);
-    return static_cast<Uint8>(255 * (128 - half_tone) / 128);
+    // AVG_ControlHalfTone() walks the background from its own brightness to
+    // the dimmed one over sixteen steps when the window comes up, so the
+    // wash arrives with the text rather than snapping in behind it.
+    const float ramp = std::clamp(half_tone_count_ / half_tone_steps, 0.0f, 1.0f);
+    return static_cast<Uint8>(255.0f * (128 - half_tone) / 128.0f * ramp);
+}
+
+float Game::half_tone_pulse() const
+{
+    // AVG_EffCntPuls(): how far the sixteen-step counter moves each frame.
+    // The original computes k*30/Avg.frame at 60 fps, so the slowest setting
+    // truncates to zero and is clamped back up to one.
+    switch (std::clamp(config_.effect_speed, 0, 4)) {
+    case 0:
+        return half_tone_steps;  // effects off: no ramp at all
+    case 1:
+        return 2.0f;             // eight frames
+    default:
+        return 1.0f;             // sixteen frames
+    }
+}
+
+void Game::raise_half_tone()
+{
+    // AVG_SetHalfTone(): from nothing it starts the ramp, but called again
+    // while the ramp is running it goes straight to the dimmed state.
+    if (half_tone_fading_) {
+        half_tone_fading_ = false;
+        half_tone_count_ = half_tone_steps;
+    }
+}
+
+void Game::update_half_tone()
+{
+    const auto now = std::chrono::steady_clock::now();
+    const float frames = std::clamp(
+        static_cast<float>(
+            std::chrono::duration<double>(now - half_tone_updated_).count()
+            * 60.0),
+        0.0f, 8.0f);
+    half_tone_updated_ = now;
+    if (!message_visible_ || message_.empty()) {
+        // AVG_ResetHalfTone() drops it in one go; the fade back in is
+        // commented out in the original and never runs.
+        half_tone_count_ = 0.0f;
+        half_tone_fading_ = false;
+        return;
+    }
+    if (half_tone_count_ >= half_tone_steps) {
+        return;
+    }
+    if (!half_tone_fading_) {
+        half_tone_fading_ = true;
+        half_tone_count_ = 0.0f;
+        return;
+    }
+    half_tone_count_ =
+        std::min(half_tone_steps, half_tone_count_ + half_tone_pulse() * frames);
+    if (half_tone_count_ >= half_tone_steps) {
+        half_tone_fading_ = false;
+    }
 }
 
 bool Game::handle_message_scroll_press(float x, float y)
@@ -621,7 +681,13 @@ void Game::draw_frame()
             if (animation.type == 1 || animation.type == 2) {
                 const float destination =
                     animation.type == 1 ? -600.0f : 600.0f;
-                x += (destination - x) * progress * progress * progress;
+                // CHAR_COND_OUT cubes the remaining count, not the elapsed
+                // one: the walk off screen starts fast and eases into the
+                // wings, the mirror of the entrance.  Cubing progress
+                // instead left the character standing still for most of the
+                // animation and then snapping away.
+                const float remaining = 1.0f - eased;  // (1 - progress)^3
+                x = destination + (x - destination) * remaining;
             } else {
                 alpha_value = static_cast<int>(
                     animation.from_alpha * (1.0f - progress));

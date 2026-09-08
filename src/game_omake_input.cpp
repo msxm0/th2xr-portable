@@ -124,11 +124,11 @@ void Game::activate_cg_gallery_item()
         omake_cg_phase_started_ = std::chrono::steady_clock::now();
         play_se(-1, 9104, false, 255);
     } else if (omake_highlight_ == 12) {
-        begin_transition(1, 7, 128, false);
+        begin_transition(1, 7, 128, false, EffectTiming::menu);
         omake_page_ = (omake_page_ + page_count - 1) % page_count;
         play_se(-1, 9104, false, 255);
     } else if (omake_highlight_ == 13) {
-        begin_transition(1, 7, 128, false);
+        begin_transition(1, 7, 128, false, EffectTiming::menu);
         omake_page_ = (omake_page_ + 1) % page_count;
         play_se(-1, 9104, false, 255);
     } else if (omake_highlight_ == 14) {

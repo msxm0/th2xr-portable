@@ -58,7 +58,7 @@ void Game::draw_omake_cancel(int highlight)
 
 void Game::open_cg_gallery()
 {
-    begin_transition(1, 15, 128, false);
+    begin_transition(1, 15, 128, false, EffectTiming::menu);
     omake_cg_entries_.clear();
     omake_cg_thumbnails_.clear();
     OmakeCgEntry entry;
@@ -105,7 +105,7 @@ void Game::open_cg_gallery()
 
 void Game::open_music_room()
 {
-    begin_transition(1, 30, 128, false);
+    begin_transition(1, 30, 128, false, EffectTiming::menu);
     bgm_.fade_to(0.0f, std::chrono::milliseconds(500), true);
     bgm_track_ = -1;
     omake_highlight_ = 40;
@@ -115,7 +115,7 @@ void Game::open_music_room()
 
 void Game::open_replay_gallery()
 {
-    begin_transition(1, 30, 128, false);
+    begin_transition(1, 30, 128, false, EffectTiming::menu);
     for (int slot = 0; slot < 9; ++slot) {
         omake_replay_thumbnails_[slot].reset();
         if (!unlocked_replays_.contains(replay_flags[slot])) {
@@ -135,7 +135,8 @@ void Game::open_replay_gallery()
 void Game::close_omake_screen()
 {
     begin_transition(
-        1, ui_mode_ == UiMode::cg_gallery ? 15 : 30, 128, false);
+        1, ui_mode_ == UiMode::cg_gallery ? 15 : 30, 128, false,
+        EffectTiming::menu);
     bgm_.fade_to(0.0f, std::chrono::milliseconds(1000), true);
     bgm_track_ = -1;
     omake_cg_full_.reset();

@@ -59,7 +59,7 @@ void Game::open_system_menu()
     // instant only when that is set to instant.
     play_se(-1, 9002, false, 150);
     save_snapshot_ = capture_frame_pixels();
-    begin_transition(1, 15, 128, false);
+    begin_transition(1, 15, 128, false, EffectTiming::menu);
     ui_mode_ = UiMode::system_menu;
     menu_highlight_ = 4;
 }
@@ -243,7 +243,7 @@ void Game::close_system_menu()
     // AVG_ControlConfigWindow takes its cmax = AVG_EffCnt(-1) once and uses
     // it for CNF_CLOSE as well as CNF_OPEN, so closing runs as long as
     // opening.
-    begin_transition(1, 15, 128, false);
+    begin_transition(1, 15, 128, false, EffectTiming::menu);
     ui_mode_ = UiMode::game;
 }
 

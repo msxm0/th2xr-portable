@@ -23,9 +23,11 @@ struct GameConfig {
     int text_speed_ms = 16;
     // Multiplies every effect duration, as Avg.wait does in the original:
     // AVG_EffCnt(n) = wait * n * frame / 60.  The options screen offers
-    // 0 (instant), 1 (normal), 2 and 4.
+    // 0 (off), 1 (fast), 2 (normal) and 4 (slow); GM_Avg.cpp starts Avg.wait
+    // at MES_NORMAL, which is 2, so a script's -1 runs half a second rather
+    // than a quarter.
     static constexpr std::array<int, 4> effect_speeds{0, 1, 2, 4};
-    int effect_speed = 1;
+    int effect_speed = 2;
     // Background half-tone while the message window is up, as in the
     // original: the background is multiplied by half_tone/128, so 128 leaves
     // it untouched and the darkest setting still shows 28% of the art.  The

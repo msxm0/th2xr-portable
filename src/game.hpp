@@ -498,6 +498,9 @@ private:
     Texture pose_blend_target_;
     // Set while a character animation has the message window hidden.
     bool message_restore_after_animation_ = false;
+    float half_tone_count_ = 0.0f;
+    bool half_tone_fading_ = false;
+    std::chrono::steady_clock::time_point half_tone_updated_{};
     std::array<float, 3> background_brightness_{128.0f, 128.0f, 128.0f};
     std::chrono::steady_clock::time_point skip_next_time_{};
     std::optional<std::chrono::steady_clock::time_point> auto_next_time_;
@@ -735,8 +738,13 @@ private:
     void retire_soak_gpu_work(bool force = false);
     std::vector<std::uint8_t> load_transition_mask(
         int type, int& width, int& height);
+    // Script-driven transitions run through AVG_EffCnt(), which the
+    // effect-speed setting scales; the title, save and gallery screens use
+    // AVG_EffCnt4(), which it does not.
+    enum class EffectTiming { script, menu };
     void begin_transition(
-        int type, int frames, int vague, bool resume_script);
+        int type, int frames, int vague, bool resume_script,
+        EffectTiming timing = EffectTiming::script);
     void update_transition();
     void draw_pattern_transition(float progress);
     void ensure_transition_target();
@@ -1028,6 +1036,12 @@ private:
     // half tone.  The backlog shares it: the original shows the log in the
     // same window over the same darkened background.
     Uint8 message_backdrop_alpha() const;
+    // The dimming behind the message window ramps in over sixteen steps and
+    // is dropped in one go, the way AVG_ControlHalfTone() does it.
+    static constexpr float half_tone_steps = 16.0f;
+    float half_tone_pulse() const;
+    void raise_half_tone();
+    void update_half_tone();
     bool handle_message_scroll_press(float x, float y);
     void set_message_scroll_from_y(float y);
     bool handle_backlog_scroll_press(float x, float y);

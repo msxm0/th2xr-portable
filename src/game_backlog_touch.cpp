@@ -336,7 +336,7 @@ void Game::open_save_load(UiMode mode)
     }
     save_return_mode_ =
         ui_mode_ == UiMode::title ? UiMode::title : UiMode::game;
-    begin_transition(1, 12, 128, false);
+    begin_transition(1, 12, 128, false, EffectTiming::menu);
     ui_mode_ = mode;
     save_confirm_slot_ = -1;
     save_hover_ = -1;
@@ -354,7 +354,7 @@ void Game::close_save_load()
 {
     save_confirm_slot_ = -1;
     load_error_.clear();
-    begin_transition(1, 12, 128, false);
+    begin_transition(1, 12, 128, false, EffectTiming::menu);
     ui_mode_ = save_return_mode_;
 }
 

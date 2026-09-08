@@ -295,6 +295,7 @@ bool Game::handle(const th2::Event& event)
             pending_backlog_voice_.reset();
         }
         message_visible_ = true;
+        raise_half_tone();
         current_line_key_ = runtime_.script_name() + ':'
             + std::to_string(runtime_.vm_pc());
         message_ends_block_ = number(event, 1) == 2;
@@ -313,6 +314,7 @@ bool Game::handle(const th2::Event& event)
             pending_backlog_voice_.reset();
         }
         message_visible_ = true;
+        raise_half_tone();
         current_line_key_ = runtime_.script_name() + ':'
             + std::to_string(runtime_.vm_pc());
         message_ends_block_ = number(event, 1) == 2;

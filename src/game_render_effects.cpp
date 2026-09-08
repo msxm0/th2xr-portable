@@ -145,12 +145,16 @@ std::vector<std::uint8_t> Game::load_transition_mask(
 }
 
 void Game::begin_transition(
-    int type, int frames, int vague, bool resume_script)
+    int type, int frames, int vague, bool resume_script,
+    EffectTiming timing)
 {
     if (type < 0) {
         return;
     }
-    const int effective_frames = effect_frames(frames);
+    // AVG_EffCnt4() is the same count in 30fps units with no Avg.wait in it,
+    // so a menu fade lasts the same half second whatever the effect speed.
+    const int effective_frames = timing == EffectTiming::menu
+        ? frames * 2 : effect_frames(frames);
     auto previous_pixels = capture_frame_pixels(true);
     auto previous = texture_from_surface(previous_pixels.get());
     Transition transition{
