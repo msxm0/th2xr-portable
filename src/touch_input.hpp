@@ -44,6 +44,13 @@ public:
 
     void process_event(const SDL_Event& event);
 
+    // Forget any gesture in progress.  Call when the touches can no longer
+    // be trusted to finish: the window lost focus, the page went to the
+    // background, or a fullscreen change swallowed the finger that was
+    // down.  Without this a finger stays marked active and every later tap
+    // is mistaken for the second finger of a two-finger gesture.
+    void reset();
+
     // Returns the most recently recognized action and clears it.
     TouchAction poll_action();
 
@@ -51,6 +58,26 @@ public:
     // when poll_action() returns TouchAction::Tap.
     float tap_x() const { return tap_x_; }
     float tap_y() const { return tap_y_; }
+
+    // True when the touch that ended most recently was consumed as a swipe
+    // or a scroll rather than a tap or a plain drag.  The caller synthesizes
+    // mouse input from touches and uses this to drop the click at the end of
+    // a gesture, so that swiping the backlog open does not also advance the
+    // text.
+    bool last_touch_was_gesture() const { return last_gesture_; }
+
+    // True when the finger that ended most recently travelled further than a
+    // tap is allowed to.  Sliding off a control cancels it, the way a touch
+    // UI is expected to behave, so the caller turns only still touches into
+    // clicks.  Unlike TouchAction::Tap this ignores how long the finger was
+    // down: a slow, steady press is still a tap.
+    bool last_touch_moved() const { return last_moved_; }
+
+    // Give up on interpreting the touch in progress: something else took it
+    // over, such as a slider or a scroll handle the finger landed on.  It
+    // then produces no swipes, no scroll steps and no tap, so dragging a
+    // handle does not also page the backlog underneath it.
+    void claim_touch();
 
     // True while the user is actively holding a rightward swipe (the
     // "hold to skip unconditionally" gesture).
@@ -68,6 +95,8 @@ private:
         float y = 0.0f;
         std::chrono::steady_clock::time_point start_time;
         std::chrono::steady_clock::time_point up_time;
+        // Furthest the finger has been from where it went down.
+        float travel = 0.0f;
         bool active = false;
     };
 
@@ -83,6 +112,8 @@ private:
     TouchAction pending_ = TouchAction::None;
     bool active_gesture_ = false;
     bool emitted_scroll_ = false;
+    bool last_gesture_ = false;
+    bool last_moved_ = false;
     float scroll_anchor_y_ = -1.0f;
     float tap_x_ = 0.0f;
     float tap_y_ = 0.0f;

@@ -31,6 +31,133 @@
 
 namespace th2app {
 
+std::size_t Game::message_visible_lines() const
+{
+    const float height = message_bottom_y - message_text_y();
+    return static_cast<std::size_t>(std::max(
+        1, static_cast<int>(height / text_line_height())));
+}
+
+int Game::message_scroll_limit(std::size_t total_lines) const
+{
+    return std::max(
+        0,
+        static_cast<int>(total_lines)
+            - static_cast<int>(message_visible_lines()));
+}
+
+namespace {
+
+float scroll_thumb_height(std::size_t total_lines, std::size_t visible_lines,
+                          float track_height)
+{
+    return std::max(
+        24.0f,
+        track_height * static_cast<float>(visible_lines)
+            / static_cast<float>(std::max<std::size_t>(total_lines, 1)));
+}
+
+}  // namespace
+
+void Game::draw_scrollbar(
+    std::size_t total_lines, int scroll, bool dragging)
+{
+    const int limit = message_scroll_limit(total_lines);
+    if (limit <= 0) {
+        return;
+    }
+    const float top = message_text_y();
+    const float height = message_bottom_y - top;
+    const float thumb_height = scroll_thumb_height(
+        total_lines, message_visible_lines(), height);
+    const float thumb_y = top
+        + (height - thumb_height) * static_cast<float>(scroll)
+            / static_cast<float>(limit);
+
+    SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
+    const SDL_FRect track{message_scroll_x, top, message_scroll_width, height};
+    SDL_SetRenderDrawColor(renderer_, 255, 255, 255, 40);
+    SDL_RenderFillRect(renderer_, &track);
+    const SDL_FRect thumb{
+        message_scroll_x, thumb_y, message_scroll_width, thumb_height};
+    SDL_SetRenderDrawColor(renderer_, 255, 255, 255, dragging ? 220 : 150);
+    SDL_RenderFillRect(renderer_, &thumb);
+}
+
+int Game::scroll_from_y(float y, std::size_t total_lines) const
+{
+    const int limit = message_scroll_limit(total_lines);
+    if (limit <= 0) {
+        return 0;
+    }
+    const float top = message_text_y();
+    const float height = message_bottom_y - top;
+    const float thumb_height = scroll_thumb_height(
+        total_lines, message_visible_lines(), height);
+    const float travel = std::max(1.0f, height - thumb_height);
+    const float position = std::clamp(
+        y - top - thumb_height / 2.0f, 0.0f, travel);
+    return static_cast<int>(std::lround(
+        position / travel * static_cast<float>(limit)));
+}
+
+bool Game::on_scrollbar(float x, float y) const
+{
+    return x >= message_scroll_x
+        && x < message_scroll_x + message_scroll_width
+        && y >= message_text_y() && y < message_bottom_y;
+}
+
+void Game::set_message_scroll_from_y(float y)
+{
+    message_scroll_follow_ = false;
+    message_scroll_ =
+        scroll_from_y(y, display_lines(message_.visible()).size());
+}
+
+Uint8 Game::message_backdrop_alpha() const
+{
+    // The original multiplies the background by half_tone/128 while the
+    // message window is up - in the log too, which shows its text in the
+    // same window over the same darkened background - and compositing black
+    // at the complementary alpha is the same thing.  It never reaches solid
+    // because half_tone stops at 36.
+    const int half_tone = std::clamp(
+        config_.message_half_tone,
+        th2::GameConfig::min_message_half_tone,
+        th2::GameConfig::max_message_half_tone);
+    return static_cast<Uint8>(255 * (128 - half_tone) / 128);
+}
+
+bool Game::handle_message_scroll_press(float x, float y)
+{
+    if (ui_mode_ != UiMode::game || !message_visible_ || message_.empty()
+        || !on_scrollbar(x, y)
+        || message_scroll_limit(
+               display_lines(message_.visible()).size()) <= 0) {
+        return false;
+    }
+    message_scroll_dragging_ = true;
+    set_message_scroll_from_y(y);
+    return true;
+}
+
+void Game::set_backlog_scroll_from_y(float y)
+{
+    backlog_scroll_ = scroll_from_y(y, backlog_view_lines().size());
+}
+
+bool Game::handle_backlog_scroll_press(float x, float y)
+{
+    if (!on_scrollbar(x, y)
+        || message_scroll_limit(backlog_view_lines().size()) <= 0) {
+        return false;
+    }
+    backlog_scroll_dragging_ = true;
+    set_backlog_scroll_from_y(y);
+    return true;
+}
+
 void Game::draw_click_indicator()
 {
     if (!waiting_for_input_ || !message_visible_ || message_.empty()
@@ -45,20 +172,34 @@ void Game::draw_click_indicator()
 
     const auto lines = display_lines(message_.visible());
     if (lines.empty()) return;
-    const auto& last_line = lines.back();
-    const float width = font_.text_width(last_line);
 
+    // Sits on the row the last line actually occupies, which is not the last
+    // row of the message once the page is scrolled.  If that line is out of
+    // the visible window there is nothing to point at.
+    const int row = static_cast<int>(lines.size()) - 1 - message_scroll_;
+    if (row < 0 || row >= static_cast<int>(message_visible_lines())) {
+        return;
+    }
+
+    // Fixed size, placed from the text baseline so it keeps sitting on the
+    // line as the font grows instead of hanging from the top of the row.
+    // The bitmap font reports no metrics, and keeps the original's offset.
+    constexpr float size = 36.0f;
+    const float row_top = message_text_y()
+        + static_cast<float>(row) * text_line_height();
+    const float ascent = font_.ascent();
+    const float width = font_.text_width(lines.back());
     const float x = message_text_x() + width + 4.0f;
-    const float y = message_text_y()
-        + (std::min(lines.size(), static_cast<std::size_t>(15)) - 1)
-        * text_line_height() - 2.0f;
+    const float y = ascent > 0.0f
+        ? row_top + ascent - 5.0f - size / 2.0f
+        : row_top - 2.0f;
 
     // Time-based 30fps animation matching original GlobalCount/2%30 (1s cycle)
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     const int frame = (ms / 33) % 30;
     const SDL_FRect src{frame * 40.0f, 0.0f, 40.0f, 40.0f};
-    const SDL_FRect dst{x, y, 36.0f, 36.0f};
+    const SDL_FRect dst{x, y, size, size};
     SDL_RenderTexture(renderer_, tex.get(), &src, &dst);
 }
 
@@ -204,6 +345,72 @@ void Game::reset_render_state()
     }
 }
 
+bool Game::draw_pose_dissolve(
+    SDL_Texture* next, SDL_Texture* previous, float progress,
+    Uint8 brightness, int alpha, const SDL_FRect& destination)
+{
+    if (!ensure_pose_blend_target()) {
+        return false;
+    }
+    // Both poses are added in weighted by their share of the dissolve, with
+    // the alpha channel weighted the same way, which is what makes the two
+    // of them add up to one solid sprite.
+    const auto accumulate = SDL_ComposeCustomBlendMode(
+        SDL_BLENDFACTOR_SRC_ALPHA, SDL_BLENDFACTOR_ONE,
+        SDL_BLENDOPERATION_ADD,
+        SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE,
+        SDL_BLENDOPERATION_ADD);
+    if (!SDL_SetTextureBlendMode(next, accumulate)
+        || !SDL_SetTextureBlendMode(previous, accumulate)) {
+        SDL_SetTextureBlendMode(next, SDL_BLENDMODE_BLEND);
+        SDL_SetTextureBlendMode(previous, SDL_BLENDMODE_BLEND);
+        return false;  // No custom blending here; the plain path still works.
+    }
+    auto* const scene = SDL_GetRenderTarget(renderer_);
+    SDL_SetRenderTarget(renderer_, pose_blend_target_.get());
+    SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 0);
+    SDL_RenderClear(renderer_);
+    const SDL_FRect whole{0.0f, 0.0f, 800.0f, 600.0f};
+    for (const auto& [texture, weight] : {
+             std::pair{previous, 1.0f - progress},
+             std::pair{next, progress}}) {
+        SDL_SetTextureColorMod(texture, 255, 255, 255);
+        SDL_SetTextureAlphaMod(
+            texture,
+            static_cast<Uint8>(std::clamp(weight * 255.0f, 0.0f, 255.0f)));
+        SDL_RenderTexture(renderer_, texture, nullptr, &whole);
+    }
+    SDL_SetRenderTarget(renderer_, scene);
+    SDL_SetTextureBlendMode(next, SDL_BLENDMODE_BLEND);
+    SDL_SetTextureBlendMode(previous, SDL_BLENDMODE_BLEND);
+    SDL_SetTextureColorMod(
+        pose_blend_target_.get(), brightness, brightness, brightness);
+    SDL_SetTextureAlphaMod(
+        pose_blend_target_.get(),
+        static_cast<Uint8>(std::clamp(alpha, 0, 255)));
+    SDL_RenderTexture(
+        renderer_, pose_blend_target_.get(), nullptr, &destination);
+    return true;
+}
+
+bool Game::ensure_pose_blend_target()
+{
+    if (pose_blend_target_) {
+        return true;
+    }
+    pose_blend_target_.reset(SDL_CreateTexture(
+        renderer_, SDL_PIXELFORMAT_RGBA32,
+        SDL_TEXTUREACCESS_TARGET, 800, 600));
+    if (!pose_blend_target_) {
+        return false;
+    }
+    // The dissolve accumulates both poses premultiplied, so the result is
+    // composited as premultiplied too.
+    return SDL_SetTextureBlendMode(
+        pose_blend_target_.get(), SDL_BLENDMODE_BLEND_PREMULTIPLIED);
+}
+
 void Game::ensure_shake_target()
 {
     if (shake_target_) {
@@ -220,6 +427,12 @@ void Game::ensure_shake_target()
 
 void Game::draw_frame()
 {
+    // present() composites these two layers over the art on every path, so
+    // they have to start empty here rather than in the game-mode branch
+    // below: otherwise the last message and sidebar stay on screen after
+    // returning to the title, or during a movie or a gallery.
+    clear_authentic_text();
+    clear_sidebar();
     SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
     SDL_Texture* art_target = upscaler_->art_target();
     const auto shake = shake_sample();
@@ -366,7 +579,6 @@ void Game::draw_frame()
             SDL_RenderFillRect(renderer_, &game_area);
         }
     }
-    draw_sakura();
     for (std::size_t i = 0; i < overlays_.size(); ++i) {
         if (overlay_states_[i].layer >= 5
             && overlay_states_[i].layer < 18) {
@@ -448,6 +660,21 @@ void Game::draw_frame()
             800.0f, 600.0f};
         if (animation.kind == CharacterAnimationKind::pose
             && animation.previous) {
+            // GM_AvgChar.cpp hangs the old pose off the same graphic as the
+            // new one (DSP_SetGraphBSet) and slides a single blend factor
+            // across the pair, so the character dissolves from one pose to
+            // the other without ever becoming see-through.  Blending the two
+            // in a scratch target reproduces that; drawing them one over the
+            // other straight onto the scene would let the background show
+            // through in the middle, which reads as the old pose leaving
+            // before the new one arrives.
+            if (draw_pose_dissolve(
+                    loaded.texture.get(), animation.previous.get(), progress,
+                    brightness,
+                    std::clamp(animation.to_alpha, 0, 256) * 255 / 256,
+                    destination)) {
+                continue;
+            }
             SDL_SetTextureColorMod(
                 animation.previous.get(),
                 brightness, brightness, brightness);
@@ -485,8 +712,6 @@ void Game::draw_frame()
             renderer_, shake_target_.get(), nullptr, &destination,
             shake.angle, nullptr, SDL_FLIP_NONE);
     }
-    clear_authentic_text();
-    clear_sidebar();
     begin_overlay();
     if (clock_state_ || calendar_state_) {
         draw_clock_calendar();
@@ -507,7 +732,7 @@ void Game::draw_frame()
             begin_authentic_text();
         }
         SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
-        SDL_SetRenderDrawColor(renderer_, 0, 0, 16, 150);
+        SDL_SetRenderDrawColor(renderer_, 0, 0, 0, message_backdrop_alpha());
         SDL_RenderFillRect(renderer_, nullptr);
         const auto visible = message_.visible();
         const auto reveal_start =
@@ -534,10 +759,23 @@ void Game::draw_frame()
         float y = message_text_y();
         std::size_t source_cursor = 0;
         const auto lines = display_lines(visible);
+        // A page taller than the screen scrolls; it follows the newest text
+        // unless the reader has dragged the bar away from the bottom.
+        const int scroll_limit = message_scroll_limit(lines.size());
+        if (message_scroll_follow_) {
+            message_scroll_ = scroll_limit;
+        } else {
+            message_scroll_ = std::clamp(message_scroll_, 0, scroll_limit);
+        }
+        std::size_t line_index = 0;
         for (const auto& line : lines) {
             auto line_start = visible.find(line, source_cursor);
             if (line_start == std::string_view::npos) {
                 line_start = source_cursor;
+            }
+            if (static_cast<int>(line_index++) < message_scroll_) {
+                source_cursor = line_start + line.size();
+                continue;
             }
             std::size_t glyph_offset = 0;
             float authentic_x = x;
@@ -587,7 +825,10 @@ void Game::draw_frame()
                         std::max(
                             1, static_cast<int>(
                                 std::ceil(glyph_right - glyph_left))),
-                        31};
+                        // Tall enough for the glyph and its shadow: a fixed
+                        // height clipped the bottom off large fonts.
+                        static_cast<int>(
+                            std::ceil(text_line_height())) + 4};
                     SDL_SetRenderClipRect(renderer_, &clip);
                     font_.draw(
                         renderer_, x + 2.0f, y + 2.0f,
@@ -601,13 +842,15 @@ void Game::draw_frame()
             }
             source_cursor = line_start + line.size();
             y += text_line_height();
-            if (y > 535.0f) {
+            if (y > message_bottom_y) {
                 break;
             }
         }
         if (font_.authentic()) {
             select_overlay();
         }
+        draw_scrollbar(
+            lines.size(), message_scroll_, message_scroll_dragging_);
     }
     if (ui_mode_ == UiMode::game
         && message_visible_ && choosing_ && !choices_.empty()) {
@@ -638,6 +881,10 @@ void Game::draw_frame()
         draw_sidebar();
     }
     select_overlay();
+    // The petals sit at LAY_WINDOW+10 in the original, above the characters
+    // and the message window alike, so they are drawn after the text rather
+    // than back with the scene.
+    draw_sakura();
     if (screen_flash_) {
         SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
         SDL_SetRenderDrawColor(

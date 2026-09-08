@@ -1,5 +1,7 @@
 #include "player_name.hpp"
 
+#include "data_source.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -41,10 +43,8 @@ PlayerName load_default_player_name(const std::filesystem::path& executable)
     PlayerName result{
         "河野", "貴明", "こうの", "たかあき", "たか", "タカ",
     };
-    std::ifstream input(executable, std::ios::binary);
-    const std::string bytes{
-        std::istreambuf_iterator<char>(input),
-        std::istreambuf_iterator<char>()};
+    const auto contents = read_data_file(executable);
+    const std::string bytes(contents.begin(), contents.end());
     const auto read_slot = [&](std::size_t offset) {
         const auto end = bytes.find('\0', offset);
         if (end == std::string::npos || end - offset > 12) {

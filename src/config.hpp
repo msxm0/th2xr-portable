@@ -18,7 +18,22 @@ struct GameConfig {
     std::array<bool, 11> character_voice_muted{};
     int auto_line_ms = 2000;
     int auto_page_ms = 4000;
-    int text_speed_ms = 24;
+    // 16 ms per character is the original's 60 chars/s (msg_wait 2);
+    // its faster setting is 120 chars/s and 0 is instant.
+    int text_speed_ms = 16;
+    // Multiplies every effect duration, as Avg.wait does in the original:
+    // AVG_EffCnt(n) = wait * n * frame / 60.  The options screen offers
+    // 0 (instant), 1 (normal), 2 and 4.
+    static constexpr std::array<int, 4> effect_speeds{0, 1, 2, 4};
+    int effect_speed = 1;
+    // Background half-tone while the message window is up, as in the
+    // original: the background is multiplied by half_tone/128, so 128 leaves
+    // it untouched and the darkest setting still shows 28% of the art.  The
+    // bounds come from the sidebar bar's travel (GM_AvgMsg.cpp: half_tone =
+    // 128 - clamp(y, 0, track_height - handle_height)).
+    static constexpr int min_message_half_tone = 36;
+    static constexpr int max_message_half_tone = 128;
+    int message_half_tone = 64;
     bool auto_skip_read = false;
     bool skip_unread = false;
     bool wheel_opens_backlog = true;

@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -22,7 +23,20 @@ public:
     void configure(bool authentic, std::string_view family,
                    int font_size, float framebuffer_scale);
     static const std::vector<std::string>& system_families();
+
+    // A font that ships with the app, for the platforms without fontconfig.
+    struct BundledFont {
+        std::string_view family;
+        std::string_view path;
+    };
+    static std::span<const BundledFont> bundled_fonts();
     float text_width(std::string_view text) const;
+    // Line advance the face itself asks for, in logical units; 0 when the
+    // modern font is unavailable.
+    float line_height() const;
+    // Distance from the top of a line to the text baseline, in logical
+    // units; 0 for the bitmap font, which has no metrics to ask.
+    float ascent() const;
     void draw(
         SDL_Renderer* renderer, float x, float y, std::string_view text,
         std::uint8_t red = 255, std::uint8_t green = 255,

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <ranges>
 
 namespace th2 {
 namespace {
@@ -53,6 +54,7 @@ int TouchInput::add_finger(SDL_FingerID id, float x, float y)
             fingers_[i].x = x;
             fingers_[i].y = y;
             fingers_[i].start_time = std::chrono::steady_clock::now();
+            fingers_[i].travel = 0.0f;
             fingers_[i].active = true;
             if (scroll_anchor_y_ < 0.0f) {
                 scroll_anchor_y_ = y;
@@ -72,11 +74,18 @@ void TouchInput::remove_finger(int index)
 
     const bool had_scroll = emitted_scroll_;
     emitted_scroll_ = false;
+    last_gesture_ = false;
+    last_moved_ = std::max(
+        finger.travel,
+        distance(finger.start_x, finger.start_y, finger.x, finger.y))
+        >= TapMaxMovement;
 
     const int other = 1 - index;
     if (fingers_[other].active) {
         // Wait for the second finger to lift before deciding if this was a
-        // two-finger tap.
+        // two-finger tap.  Whatever it turns out to be, it is a gesture and
+        // not a click.
+        last_gesture_ = true;
         return;
     }
 
@@ -84,6 +93,7 @@ void TouchInput::remove_finger(int index)
     // the lift as a swipe.
     if (had_scroll) {
         active_gesture_ = false;
+        last_gesture_ = true;
         return;
     }
 
@@ -98,6 +108,7 @@ void TouchInput::remove_finger(int index)
         skip_held_ = false;
         horizontal_state_ = HorizontalState::none;
         active_gesture_ = false;
+        last_gesture_ = true;
         return;
     }
 
@@ -117,11 +128,15 @@ void TouchInput::remove_finger(int index)
         if (movement < TapMaxMovement && duration < TapMaxDurationMs) {
             pending_ = TouchAction::BacklogOrHideTextbox;
             active_gesture_ = false;
+            last_gesture_ = true;
             return;
         }
     }
 
     evaluate_single_swipe(finger);
+    if (pending_ != TouchAction::None) {
+        last_gesture_ = true;
+    }
 
     // If it wasn't a swipe, treat a short, still lift as a tap.
     if (pending_ == TouchAction::None) {
@@ -241,6 +256,11 @@ void TouchInput::process_event(const SDL_Event& event)
         if (index >= 0) {
             fingers_[index].x = event.tfinger.x;
             fingers_[index].y = event.tfinger.y;
+            fingers_[index].travel = std::max(
+                fingers_[index].travel,
+                distance(
+                    fingers_[index].start_x, fingers_[index].start_y,
+                    fingers_[index].x, fingers_[index].y));
             maybe_emit_scroll(fingers_[index]);
             evaluate_horizontal_swipe(fingers_[index]);
         }
@@ -255,6 +275,23 @@ void TouchInput::process_event(const SDL_Event& event)
         }
         break;
     }
+    case SDL_EVENT_FINGER_CANCELED: {
+        // The browser or the OS took the touch over - an edge-swipe back
+        // gesture, a fullscreen change, a notification shade.  There is no
+        // lift to interpret, so drop the gesture rather than leave a finger
+        // marked active for good.
+        const int index = find_finger(event.tfinger.fingerID);
+        if (index >= 0) {
+            fingers_[index].active = false;
+            fingers_[index].up_time = std::chrono::steady_clock::now();
+        }
+        const bool still_down = std::ranges::any_of(
+            fingers_, [](const Finger& finger) { return finger.active; });
+        if (!still_down) {
+            reset();
+        }
+        break;
+    }
     case SDL_EVENT_KEY_DOWN:
         if (event.key.key == SDLK_AC_BACK) {
             pending_ = TouchAction::MenuToggle;
@@ -263,6 +300,31 @@ void TouchInput::process_event(const SDL_Event& event)
     default:
         break;
     }
+}
+
+void TouchInput::claim_touch()
+{
+    pending_ = TouchAction::None;
+    emitted_scroll_ = false;
+    // No anchor means maybe_emit_scroll() stops stepping the backlog, and a
+    // cancelled horizontal state means the lift is neither a swipe nor a tap.
+    scroll_anchor_y_ = -1.0f;
+    horizontal_state_ = HorizontalState::cancelled;
+    skip_held_ = false;
+    active_gesture_ = false;
+}
+
+void TouchInput::reset()
+{
+    fingers_ = {};
+    pending_ = TouchAction::None;
+    last_gesture_ = false;
+    last_moved_ = false;
+    active_gesture_ = false;
+    emitted_scroll_ = false;
+    scroll_anchor_y_ = -1.0f;
+    horizontal_state_ = HorizontalState::none;
+    skip_held_ = false;
 }
 
 TouchAction TouchInput::poll_action()

@@ -10,6 +10,7 @@
 #include <zstd.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -49,6 +50,22 @@ bool Game::volume_control(const char* label, int& volume, bool& muted)
     return volume_changed || mute_changed;
 }
 
+bool Game::compact_ui() const
+{
+#ifdef __ANDROID__
+    return true;
+#elif defined(TH2_IMGUI_TOUCH)
+    // A phone-sized browser viewport gets the same layout as Android: the
+    // panel fills the screen and its body scrolls, because a floating
+    // window sized for a desktop does not fit and cannot be dragged
+    // comfortably with a finger.
+    const auto& io = ImGui::GetIO();
+    return io.DisplaySize.x < 620.0f || io.DisplaySize.y < 560.0f;
+#else
+    return false;
+#endif
+}
+
 void Game::return_to_title()
 {
     if (soak_) {
@@ -81,28 +98,28 @@ void Game::draw_config()
     if (!config_open_) {
         return;
     }
-#ifdef __ANDROID__
-    const auto& io = ImGui::GetIO();
-    ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_Always);
-    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
-#else
-    ImGui::SetNextWindowSize(ImVec2(570.0f, 500.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2(115.0f, 50.0f), ImGuiCond_FirstUseEver);
-#endif
+    const bool compact = compact_ui();
+    if (compact) {
+        const auto& io = ImGui::GetIO();
+        ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
+    } else {
+        ImGui::SetNextWindowSize(
+            ImVec2(570.0f, 500.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(
+            ImVec2(115.0f, 50.0f), ImGuiCond_FirstUseEver);
+    }
     bool open = true;
-#ifdef __ANDROID__
-    constexpr auto config_flags =
-        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize
-        | ImGuiWindowFlags_NoCollapse;
-#else
-    constexpr auto config_flags = ImGuiWindowFlags{};
-#endif
+    const ImGuiWindowFlags config_flags = compact
+        ? ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize
+            | ImGuiWindowFlags_NoCollapse
+        : ImGuiWindowFlags{};
     if (ImGui::Begin("Panel Config", &open, config_flags)) {
-#ifdef __ANDROID__
-        ImGui::BeginChild(
-            "config_scroll", ImVec2(0, 0), 0,
-            ImGuiWindowFlags_NoMove);
-#endif
+        if (compact) {
+            ImGui::BeginChild(
+                "config_scroll", ImVec2(0, 0), 0,
+                ImGuiWindowFlags_NoMove);
+        }
         bool option_changed = false;
         const auto focus_next_for_gamepad = [&] {
             if (config_gamepad_focus_requested_) {
@@ -125,6 +142,38 @@ void Game::draw_config()
                 option_changed |= ImGui::SliderInt(
                     "Text speed", &config_.text_speed_ms,
                     0, 100, "%d ms/character");
+                {
+                    // The original offers these four multipliers on every
+                    // effect duration (Avg.wait).
+                    static constexpr std::array labels{
+                        "Instant", "Normal", "Slow", "Slowest"};
+                    const auto& speeds = th2::GameConfig::effect_speeds;
+                    int current = 1;
+                    for (int i = 0; i < static_cast<int>(speeds.size()); ++i) {
+                        if (speeds[i] == config_.effect_speed) {
+                            current = i;
+                        }
+                    }
+                    if (ImGui::BeginCombo(
+                            "Effect speed", labels[current])) {
+                        for (int i = 0;
+                             i < static_cast<int>(labels.size()); ++i) {
+                            const bool selected = i == current;
+                            if (ImGui::Selectable(labels[i], selected)) {
+                                config_.effect_speed = speeds[i];
+                                option_changed = true;
+                            }
+                            if (selected) {
+                                ImGui::SetItemDefaultFocus();
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+                }
+                option_changed |= ImGui::SliderInt(
+                    "Background half-tone", &config_.message_half_tone,
+                    th2::GameConfig::min_message_half_tone,
+                    th2::GameConfig::max_message_half_tone, "%d / 128");
                 ImGui::Separator();
                 option_changed |= ImGui::Checkbox(
                     "Auto-skip includes unread text",
@@ -264,69 +313,49 @@ void Game::draw_config()
             play_se(-1, 9104, false, 255);
         }
         ImGui::Separator();
-#ifdef __ANDROID__
-        if (ImGui::Button("Close", ImVec2(-FLT_MIN, 0.0f))) {
-            play_se(-1, 9104, false, 255);
-            open = false;
-        }
-        if (ui_mode_ != UiMode::title
-            && ImGui::Button("Return to Title", ImVec2(-FLT_MIN, 0.0f))) {
-            play_se(-1, 9104, false, 255);
-            confirm_return_title_ = true;
-            ImGui::OpenPopup("Return to Title?");
-        }
-#else
-        if (ImGui::Button("Close", ImVec2(110.0f, 0.0f))) {
+        if (ImGui::Button(
+                "Close", ImVec2(compact ? -FLT_MIN : 110.0f, 0.0f))) {
             play_se(-1, 9104, false, 255);
             open = false;
         }
         if (ui_mode_ != UiMode::title) {
-            ImGui::SameLine();
+            if (!compact) {
+                ImGui::SameLine();
+            }
             if (ImGui::Button(
-                    "Return to Title", ImVec2(140.0f, 0.0f))) {
+                    "Return to Title",
+                    ImVec2(compact ? -FLT_MIN : 140.0f, 0.0f))) {
                 play_se(-1, 9104, false, 255);
                 confirm_return_title_ = true;
                 ImGui::OpenPopup("Return to Title?");
             }
         }
-#endif
         if (ImGui::BeginPopupModal(
                 "Return to Title?", nullptr,
                 ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::TextUnformatted(
                 "Unsaved progress will be lost.\nReturn to the title screen?");
-#ifdef __ANDROID__
-            if (ImGui::Button("Return", ImVec2(-FLT_MIN, 0.0f))) {
+            const ImVec2 popup_button(compact ? -FLT_MIN : 120.0f, 0.0f);
+            if (ImGui::Button("Return", popup_button)) {
                 play_se(-1, 9104, false, 255);
                 return_to_title();
                 ImGui::CloseCurrentPopup();
                 open = false;
             }
-            if (ImGui::Button("Cancel", ImVec2(-FLT_MIN, 0.0f))) {
+            if (!compact) {
+                ImGui::SameLine();
+            }
+            if (ImGui::Button("Cancel", popup_button)) {
                 play_se(-1, 9107, false, 255);
                 confirm_return_title_ = false;
                 ImGui::CloseCurrentPopup();
             }
-#else
-            if (ImGui::Button("Return", ImVec2(120.0f, 0.0f))) {
-                play_se(-1, 9104, false, 255);
-                return_to_title();
-                ImGui::CloseCurrentPopup();
-                open = false;
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f))) {
-                play_se(-1, 9107, false, 255);
-                confirm_return_title_ = false;
-                ImGui::CloseCurrentPopup();
-            }
-#endif
             ImGui::EndPopup();
         }
-#ifdef __ANDROID__
-        imgui_->touch_drag_scroll();
-        ImGui::EndChild();
-#endif
+        if (compact) {
+            imgui_->touch_drag_scroll();
+            ImGui::EndChild();
+        }
     }
     ImGui::End();
     if (!open) {
@@ -339,63 +368,51 @@ void Game::draw_name_input()
     if (!name_input_open_) {
         return;
     }
-#ifdef __ANDROID__
-    const auto& io = ImGui::GetIO();
-    ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_Always);
-    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
-    ImGui::Begin(
-        "Player Name", nullptr,
-        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize
-            | ImGuiWindowFlags_NoTitleBar);
-    ImGui::BeginChild(
-        "name_scroll", ImVec2(0, 0), 0,
-        ImGuiWindowFlags_NoMove);
-#else
-    ImGui::SetNextWindowSize(ImVec2(430.0f, 330.0f), ImGuiCond_Always);
-    ImGui::SetNextWindowPos(
-        ImVec2(400.0f, 300.0f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::Begin(
-        "Player Name", nullptr,
-        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize);
-#endif
+    const bool compact = compact_ui();
+    if (compact) {
+        const auto& io = ImGui::GetIO();
+        ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
+        ImGui::Begin(
+            "Player Name", nullptr,
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize
+                | ImGuiWindowFlags_NoTitleBar);
+        ImGui::BeginChild(
+            "name_scroll", ImVec2(0, 0), 0,
+            ImGuiWindowFlags_NoMove);
+    } else {
+        ImGui::SetNextWindowSize(ImVec2(430.0f, 330.0f), ImGuiCond_Always);
+        ImGui::SetNextWindowPos(
+            ImVec2(400.0f, 300.0f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::Begin(
+            "Player Name", nullptr,
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize);
+    }
     ImGui::TextUnformatted("Enter the protagonist's name.");
     ImGui::Separator();
-#ifdef __ANDROID__
-    const auto full_width_input = [&](
+    const auto name_input = [&](
         const char* label, char* buf, std::size_t size) {
-        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (compact) {
+            ImGui::SetNextItemWidth(-FLT_MIN);
+        }
         ImGui::InputText(label, buf, size);
     };
-    full_width_input("Family name", name_family_.data(), name_family_.size());
-    full_width_input("Given name", name_given_.data(), name_given_.size());
-    full_width_input(
+    name_input("Family name", name_family_.data(), name_family_.size());
+    name_input("Given name", name_given_.data(), name_given_.size());
+    name_input(
         "Family reading", name_family_reading_.data(),
         name_family_reading_.size());
-    full_width_input(
+    name_input(
         "Given reading", name_given_reading_.data(),
         name_given_reading_.size());
-    full_width_input("Nickname", name_nickname_.data(), name_nickname_.size());
-#else
-    ImGui::InputText(
-        "Family name", name_family_.data(), name_family_.size());
-    ImGui::InputText(
-        "Given name", name_given_.data(), name_given_.size());
-    ImGui::InputText(
-        "Family reading", name_family_reading_.data(),
-        name_family_reading_.size());
-    ImGui::InputText(
-        "Given reading", name_given_reading_.data(),
-        name_given_reading_.size());
-    ImGui::InputText(
-        "Nickname", name_nickname_.data(), name_nickname_.size());
-#endif
+    name_input("Nickname", name_nickname_.data(), name_nickname_.size());
     if (!name_error_.empty()) {
         ImGui::TextColored(
             ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "%s",
             name_error_.c_str());
     }
-#ifdef __ANDROID__
-    if (ImGui::Button("Start Game", ImVec2(-FLT_MIN, 0.0f))) {
+    if (ImGui::Button(
+            "Start Game", ImVec2(compact ? -FLT_MIN : 120.0f, 0.0f))) {
         if (name_family_[0] == '\0' || name_given_[0] == '\0'
             || name_family_reading_[0] == '\0'
             || name_given_reading_[0] == '\0'
@@ -414,49 +431,26 @@ void Game::draw_name_input()
             start_new_game();
         }
     }
-    if (ImGui::Button("Reset Defaults", ImVec2(-FLT_MIN, 0.0f))) {
+    if (!compact) {
+        ImGui::SameLine();
+    }
+    if (ImGui::Button(
+            "Reset Defaults", ImVec2(compact ? -FLT_MIN : 130.0f, 0.0f))) {
         open_name_input();
     }
-    if (ImGui::Button("Cancel", ImVec2(-FLT_MIN, 0.0f))) {
+    if (!compact) {
+        ImGui::SameLine();
+    }
+    if (ImGui::Button(
+            "Cancel", ImVec2(compact ? -FLT_MIN : 90.0f, 0.0f))) {
         name_input_open_ = false;
         title_started_ = std::chrono::steady_clock::now()
             - std::chrono::milliseconds(120 * 1000 / 60);
     }
-#else
-    if (ImGui::Button("Start Game", ImVec2(120.0f, 0.0f))) {
-        if (name_family_[0] == '\0' || name_given_[0] == '\0'
-            || name_family_reading_[0] == '\0'
-            || name_given_reading_[0] == '\0'
-            || name_nickname_[0] == '\0') {
-            name_error_ = "Every field must contain a name.";
-        } else {
-            player_name_ = {
-                name_family_.data(),
-                name_given_.data(),
-                name_family_reading_.data(),
-                name_given_reading_.data(),
-                name_nickname_.data(),
-                name_nickname_.data(),
-            };
-            name_input_open_ = false;
-            start_new_game();
-        }
+    if (compact) {
+        imgui_->touch_drag_scroll();
+        ImGui::EndChild();
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Reset Defaults", ImVec2(130.0f, 0.0f))) {
-        open_name_input();
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Cancel", ImVec2(90.0f, 0.0f))) {
-        name_input_open_ = false;
-        title_started_ = std::chrono::steady_clock::now()
-            - std::chrono::milliseconds(120 * 1000 / 60);
-    }
-#endif
-#ifdef __ANDROID__
-    imgui_->touch_drag_scroll();
-    ImGui::EndChild();
-#endif
     ImGui::End();
 }
 

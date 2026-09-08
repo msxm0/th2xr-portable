@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>ToHeart2 XRATED</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #101014;
+    color: #d8d8e0;
+    font: 14px/1.5 system-ui, sans-serif;
+    overflow: hidden;
+  }
+  #canvas {
+    /* The engine matches its window to this box, so the canvas must cover
+       exactly the area the player can see.  These rules are the starting
+       point; once the script runs it pins the canvas to the visual viewport
+       in pixels, which is the only thing that stays correct while a phone's
+       address bar slides in and out. */
+    display: block;
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 100vw;
+    width: 100dvw;
+    height: 100vh;
+    height: 100dvh;
+    background: #000;
+    outline: none;
+  }
+  #overlay {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
+    background: #101014;
+    text-align: center;
+    z-index: 10;
+  }
+  #overlay.hidden { display: none; }
+  #start {
+    padding: 0.75rem 2rem;
+    font: inherit;
+    font-size: 1.1rem;
+    color: #101014;
+    background: #d8d8e0;
+    border: 0;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  #start:disabled { opacity: 0.4; cursor: default; }
+  #status { min-height: 1.5em; opacity: 0.75; }
+  #log {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    max-height: 30vh;
+    margin: 0;
+    padding: 0.5rem;
+    overflow-y: auto;
+    background: rgba(0, 0, 0, 0.8);
+    font-family: ui-monospace, monospace;
+    font-size: 12px;
+    white-space: pre-wrap;
+    display: none;
+  }
+  #log.visible { display: block; }
+</style>
+</head>
+<body>
+<canvas id="canvas" tabindex="-1" oncontextmenu="event.preventDefault()"></canvas>
+<div id="overlay">
+  <h1>ToHeart2 XRATED</h1>
+  <button id="start" disabled>Loading…</button>
+  <div id="status">Downloading engine…</div>
+</div>
+<pre id="log"></pre>
+<script>
+  // The browser only lets audio start from a user gesture, so the engine's
+  // main() is deferred (-sINVOKE_RUN=0) until the start button is clicked.
+  const canvas = document.getElementById('canvas');
+  const overlay = document.getElementById('overlay');
+  const startButton = document.getElementById('start');
+  const status = document.getElementById('status');
+  const log = document.getElementById('log');
+
+  function appendLog(text) {
+    log.textContent += text + '\n';
+    log.scrollTop = log.scrollHeight;
+  }
+
+
+  // Ctrl+` toggles the console output pane.
+  window.addEventListener('keydown', (event) => {
+    if (event.ctrlKey && event.key === '`') {
+      log.classList.toggle('visible');
+      event.preventDefault();
+    }
+  });
+
+  // Saves, config and the SQLite state database live under SDL's pref path,
+  // which is /libsdl/<org>/<app>/ on Emscripten.  Back that root with
+  // IndexedDB so it survives a page reload.
+  const PREF_ROOT = '/libsdl';
+
+  function flushStorage() {
+    if (Module.FS) {
+      Module.FS.syncfs(false, (error) => {
+        if (error) console.error('syncfs write failed', error);
+      });
+    }
+  }
+
+  var Module = {
+    canvas,
+    arguments: [],
+    print: appendLog,
+    printErr: appendLog,
+    setStatus: (text) => { if (text) status.textContent = text; },
+    preRun: [() => {
+      Module.FS.mkdirTree(PREF_ROOT);
+      Module.FS.mount(Module.IDBFS, {}, PREF_ROOT);
+    }],
+    onRuntimeInitialized: () => {
+      status.textContent = 'Loading saved data…';
+      Module.FS.syncfs(true, (error) => {
+        if (error) console.error('syncfs read failed', error);
+        status.textContent = 'Ready.';
+        startButton.textContent = 'Start';
+        startButton.disabled = false;
+      });
+    },
+    onAbort: (what) => {
+      overlay.classList.remove('hidden');
+      status.textContent = 'Aborted: ' + what;
+    },
+  };
+
+  startButton.addEventListener('click', () => {
+    startButton.disabled = true;
+    overlay.classList.add('hidden');
+    canvas.focus();
+    try {
+      Module.callMain(Module.arguments);
+    } catch (error) {
+      overlay.classList.remove('hidden');
+      status.textContent = 'Failed to start: ' + error;
+      throw error;
+    }
+  });
+
+  // Pin the canvas to the visual viewport - the part of the page the player
+  // can actually see.  Viewport units are not enough on a phone: while the
+  // address bar slides in and out the visual viewport moves and resizes
+  // under the layout, which both leaves the game the wrong size and shifts
+  // every touch, since SDL measures fingers against this box.  The engine
+  // reads the same box each frame and resizes its window to match.
+  let lastWidth = 0;
+  let lastHeight = 0;
+  let lastRatio = 0;
+
+  function syncViewport() {
+    const viewport = window.visualViewport;
+    const width = Math.round(viewport ? viewport.width : window.innerWidth);
+    const height = Math.round(viewport ? viewport.height : window.innerHeight);
+    const ratio = window.devicePixelRatio;
+    if (viewport) {
+      // A fixed element is positioned against the layout viewport, so undo
+      // the offset between the two while the page is zoomed or the bars are
+      // sliding.
+      canvas.style.left = Math.round(viewport.offsetLeft) + 'px';
+      canvas.style.top = Math.round(viewport.offsetTop) + 'px';
+    }
+    canvas.style.width = width + 'px';
+    canvas.style.height = height + 'px';
+    // The engine reads this every frame instead of measuring the canvas
+    // itself, which would flush layout once per frame on a phone.
+    window.__th2Viewport = { width: width, height: height };
+    if (width === lastWidth && height === lastHeight && ratio === lastRatio) {
+      return;
+    }
+    lastWidth = width;
+    lastHeight = height;
+    lastRatio = ratio;
+    // The engine picks the new box up on its own; this is for SDL's own
+    // resize handling and anything else listening.
+    window.dispatchEvent(new Event('resize'));
+  }
+
+  if (window.ResizeObserver) {
+    new ResizeObserver(syncViewport).observe(canvas);
+  }
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', syncViewport);
+    window.visualViewport.addEventListener('scroll', syncViewport);
+  }
+  window.addEventListener('resize', syncViewport);
+  window.addEventListener('scroll', syncViewport);
+  window.addEventListener('orientationchange', syncViewport);
+  document.addEventListener('fullscreenchange', syncViewport);
+  syncViewport();
+
+  // A device pixel ratio change fires no resize of its own - a foldable
+  // switching displays keeps the CSS viewport and only changes the ratio -
+  // and each resolution media query matches a single ratio, so re-arm it
+  // after every change.
+  function watchPixelRatio() {
+    try {
+      window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`)
+        .addEventListener('change', () => {
+          syncViewport();
+          watchPixelRatio();
+        }, { once: true });
+    } catch (error) {
+      // Older browsers without resolution media queries just miss this.
+    }
+  }
+  watchPixelRatio();
+
+  // Backstop for anything the events above miss.  syncViewport() only wakes
+  // the engine when the box or the ratio really changed, so this costs a
+  // pair of property reads twice a second.
+  setInterval(syncViewport, 500);
+
+  // Saves are written straight to the emulated filesystem, so push them into
+  // IndexedDB periodically and whenever the page is being hidden or closed.
+  setInterval(flushStorage, 10000);
+  window.addEventListener('pagehide', flushStorage);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushStorage();
+  });
+
+  window.onerror = (message) => {
+    overlay.classList.remove('hidden');
+    status.textContent = 'Error: ' + message;
+  };
+</script>
+{{{ SCRIPT }}}
+</body>
+</html>

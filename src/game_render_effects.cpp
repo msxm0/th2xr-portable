@@ -150,7 +150,7 @@ void Game::begin_transition(
     if (type < 0) {
         return;
     }
-    const int effective_frames = frames > 0 ? frames : 30;
+    const int effective_frames = effect_frames(frames);
     auto previous_pixels = capture_frame_pixels(true);
     auto previous = texture_from_surface(previous_pixels.get());
     Transition transition{
@@ -580,6 +580,10 @@ void Game::draw_active_transition()
     if (!transition_) {
         return;
     }
+    if (transition_->frames <= 0) {
+        // Instant: there is no frame of the old screen left to show.
+        return;
+    }
     const auto elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - transition_->started);
     const float progress = std::clamp(
@@ -644,7 +648,7 @@ void Game::draw_script_position()
 
 void Game::begin_background_fade(int red, int green, int blue, int frames)
 {
-    const int effective_frames = frames > 0 ? frames : 30;
+    const int effective_frames = effect_frames(frames);
     background_fade_ = BackgroundFade{
         background_brightness_,
         {
@@ -664,10 +668,13 @@ void Game::update_background_fade()
     }
     const auto elapsed = std::chrono::steady_clock::now()
         - background_fade_->started;
-    const float progress = std::clamp(
-        std::chrono::duration<float>(elapsed).count()
-            / std::chrono::duration<float>(background_fade_->duration).count(),
-        0.0f, 1.0f);
+    const auto duration =
+        std::chrono::duration<float>(background_fade_->duration).count();
+    const float progress = duration > 0.0f
+        ? std::clamp(
+              std::chrono::duration<float>(elapsed).count() / duration,
+              0.0f, 1.0f)
+        : 1.0f;
     for (std::size_t i = 0; i < background_brightness_.size(); ++i) {
         background_brightness_[i] = background_fade_->from[i]
             + (background_fade_->to[i] - background_fade_->from[i])

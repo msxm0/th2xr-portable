@@ -29,6 +29,67 @@
 #define localtime_r(timep, result) localtime_s(result, timep)
 #endif
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+
+// Browsers only grant fullscreen from a user gesture.  SDL's emscripten
+// backend asks emscripten to defer the request until the next event handler
+// it registered through the html5 API - but SDL 3.4 registers only keyboard
+// and wheel handlers there (pointer input goes through plain
+// addEventListener), so on a touch screen the deferred request never runs.
+// Ask the browser directly instead: SDL keeps its own state in sync from the
+// document-level fullscreenchange handler either way.
+EM_JS(void, th2_web_set_fullscreen, (int enable), {
+    var canvas = Module['canvas'] || document.getElementById('canvas');
+    if (!enable) {
+        if (document.fullscreenElement && document.exitFullscreen) {
+            document.exitFullscreen();
+        }
+        return;
+    }
+    if (!canvas || document.fullscreenElement) {
+        return;
+    }
+    var request = canvas.requestFullscreen || canvas.webkitRequestFullscreen;
+    if (!request) {
+        return;
+    }
+    // The game loop runs from requestAnimationFrame, so the tap that flipped
+    // the option is already over.  Chrome and Firefox still honour the
+    // request while the transient activation lasts; if it is refused, retry
+    // once from the next real input event.
+    var retry = function() {
+        window.removeEventListener('pointerdown', retry, true);
+        window.removeEventListener('keydown', retry, true);
+        if (!document.fullscreenElement) {
+            try {
+                var again = request.call(canvas);
+                if (again && again.catch) {
+                    again.catch(function() {});
+                }
+            } catch (error) {
+            }
+        }
+    };
+    var arm = function() {
+        window.addEventListener('pointerdown', retry, true);
+        window.addEventListener('keydown', retry, true);
+    };
+    try {
+        var result = request.call(canvas);
+        if (result && result.catch) {
+            result.catch(arm);
+        }
+    } catch (error) {
+        arm();
+    }
+});
+
+EM_JS(int, th2_web_fullscreen_active, (void), {
+    return document.fullscreenElement ? 1 : 0;
+});
+#endif
+
 namespace th2app {
 
 float Game::bgm_gain(int volume) const
@@ -113,7 +174,11 @@ void Game::apply_audio_gains()
 
 void Game::sync_window_config()
 {
-#ifndef __ANDROID__
+#ifdef __EMSCRIPTEN__
+    // The browser owns the window geometry; only the fullscreen state is
+    // ours to track, and that follows the document, not the SDL flags.
+    config_.fullscreen = th2_web_fullscreen_active() != 0;
+#elif !defined(__ANDROID__)
     if (!window_) {
         return;
     }
@@ -139,7 +204,11 @@ void Game::sync_window_config()
 
 void Game::toggle_fullscreen()
 {
-#ifndef __ANDROID__
+#if defined(__EMSCRIPTEN__)
+    config_.fullscreen = th2_web_fullscreen_active() == 0;
+    th2_web_set_fullscreen(config_.fullscreen ? 1 : 0);
+    th2::save_config(config_path_, config_);
+#elif !defined(__ANDROID__)
     config_.fullscreen =
         (SDL_GetWindowFlags(window_) & SDL_WINDOW_FULLSCREEN) == 0;
     SDL_SetWindowFullscreen(window_, config_.fullscreen);

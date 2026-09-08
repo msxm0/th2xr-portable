@@ -1,5 +1,6 @@
 #include "game.hpp"
 
+#include "data_source.hpp"
 #include "image.hpp"
 
 #include <SDL3/SDL_dialog.h>
@@ -8,6 +9,7 @@
 #include <SDL3/SDL_video.h>
 
 #include <algorithm>
+#include <functional>
 #include <fstream>
 #include <mutex>
 #include <stdexcept>
@@ -71,10 +73,16 @@ std::filesystem::path remembered_data_path_file()
 
 bool valid_game_data_directory(const std::filesystem::path& path)
 {
-    return std::filesystem::is_directory(path)
-        && std::filesystem::exists(path / "TOHEART2.EXE")
-        && std::filesystem::exists(path / "SDT.PAK")
-        && std::filesystem::exists(path / "GRP.PAK");
+#ifndef __EMSCRIPTEN__
+    // The browser build streams the archives from the server, so there is no
+    // local directory to inspect; th2::data_exists probes them over HTTP.
+    if (!std::filesystem::is_directory(path)) {
+        return false;
+    }
+#endif
+    return th2::data_exists(path / "TOHEART2.EXE")
+        && th2::data_exists(path / "SDT.PAK")
+        && th2::data_exists(path / "GRP.PAK");
 }
 
 std::optional<std::filesystem::path> load_remembered_data_path()
@@ -151,6 +159,15 @@ std::optional<std::filesystem::path> discover_game_data_path(
             remembered && valid_game_data_directory(*remembered)) {
             return *remembered;
         }
+#ifdef __EMSCRIPTEN__
+        // The browser build serves its data from the preloaded /game-data
+        // package; there is no native file picker to fall back on.
+        SDL_LogError(
+            SDL_LOG_CATEGORY_APPLICATION,
+            "No game data at %s. Rebuild with -DTH2_WEB_GAME_DATA=<dir>.",
+            default_path.string().c_str());
+        return std::nullopt;
+#else
         const auto executable = pick_game_executable();
         if (!executable) {
             return std::nullopt;
@@ -164,6 +181,7 @@ std::optional<std::filesystem::path> discover_game_data_path(
             SDL_LOG_CATEGORY_APPLICATION,
             "Selected executable is not in a valid game data directory: %s",
             executable->string().c_str());
+#endif
     }
     return std::nullopt;
 }
@@ -314,8 +332,19 @@ int scenario_number(std::string_view name)
 }
 
 std::vector<std::string> display_lines(
-    std::string_view source, std::size_t wrap_columns)
+    std::string_view source, float max_width,
+    const std::function<float(std::string_view)>& measure)
 {
+    // Appends one whole UTF-8 character, so a half-written multi-byte
+    // sequence is never measured.
+    const auto append_character = [&](std::string& line, std::size_t& at) {
+        line.push_back(source[at++]);
+        while (at < source.size()
+               && (static_cast<unsigned char>(source[at]) & 0xc0) == 0x80) {
+            line.push_back(source[at++]);
+        }
+    };
+
     std::vector<std::string> lines;
     std::string line;
     bool just_wrapped = false;
@@ -329,22 +358,26 @@ std::vector<std::string> display_lines(
             ++position;
             continue;
         }
-        line.push_back(source[position++]);
+        const auto previous_length = line.size();
+        append_character(line, position);
         just_wrapped = false;
-        // A leading separator after \k is visible immediately. The original
-        // renderer does not wrap until the next printable glyph establishes
-        // that the line is over width.
-        if (line.size() >= wrap_columns && line.back() != ' ') {
-            const auto space = line.find_last_of(' ');
-            if (space != std::string::npos && space > wrap_columns / 2) {
-                lines.push_back(line.substr(0, space));
-                line.erase(0, space + 1);
-            } else {
-                lines.push_back(line);
-                line.clear();
-            }
-            just_wrapped = line.empty();
+        // A trailing separator is allowed to overhang: the original renderer
+        // does not wrap until the next printable glyph is over width.
+        if (line.back() == ' ' || measure(line) <= max_width) {
+            continue;
         }
+        if (const auto space = line.find_last_of(' ');
+            space != std::string::npos && space > 0) {
+            lines.push_back(line.substr(0, space));
+            line.erase(0, space + 1);
+        } else {
+            // One word wider than the whole line; break it mid-word.
+            std::string overflow = line.substr(previous_length);
+            line.resize(previous_length);
+            lines.push_back(line);
+            line = std::move(overflow);
+        }
+        just_wrapped = line.empty();
     }
     if (!line.empty() || lines.empty()) {
         lines.push_back(line);

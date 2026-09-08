@@ -1,5 +1,7 @@
 #include "icon.hpp"
 
+#include "data_source.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
@@ -245,12 +247,7 @@ SurfacePtr decode_icon_dib(std::span<const std::uint8_t> data)
 
 SurfacePtr load_executable_icon(const std::filesystem::path& executable)
 {
-    std::ifstream input(executable, std::ios::binary);
-    if (!input) {
-        return {};
-    }
-    std::vector<std::uint8_t> file(
-        std::istreambuf_iterator<char>(input), {});
+    const std::vector<std::uint8_t> file = read_data_file(executable);
     if (file.size() < 0x40 || u16(file, 0) != 0x5a4d) {
         return {};
     }

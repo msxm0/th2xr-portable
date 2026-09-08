@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -77,8 +78,20 @@ Texture load_toned_texture(
     Surface* pixels = nullptr);
 th2::AudioClip load_audio(const th2::Archive& archive, std::string_view name);
 int scenario_number(std::string_view name);
+// Left edge of the message sidebar, from HistorySystemRectX[] in the
+// original's GM_AvgMsg.cpp.
+inline constexpr float sidebar_left_x = 776.0f;
+
+// Last line of message text starts above this.
+inline constexpr float message_bottom_y = 535.0f;
+
+// Slim scrollbar drawn in the left margin when the text does not fit.
+inline constexpr float message_scroll_x = 9.0f;
+inline constexpr float message_scroll_width = 8.0f;
+
 std::vector<std::string> display_lines(
-    std::string_view source, std::size_t wrap_columns);
+    std::string_view source, float max_width,
+    const std::function<float(std::string_view)>& measure);
 std::string interpret_newlines(std::string text);
 bool clip_texture_source(
     SDL_Texture* texture, SDL_FRect& source, SDL_FRect& destination);
@@ -98,6 +111,7 @@ public:
 #endif
     int run();
     int run_loop();
+    void iterate();
 private:
     static constexpr std::uint32_t save_version_ = 26;
     static constexpr std::uint32_t first_backlog_voice_save_version_ = 25;
@@ -379,6 +393,11 @@ private:
     void apply_audio_gains();
     void sync_window_config();
     void toggle_fullscreen();
+    // Keeps SDL's window in step with the page's canvas (browser only).
+    void sync_web_viewport();
+    // True when the ImGui panels should use the phone layout: full-screen
+    // window with a scrollable, full-width body.
+    bool compact_ui() const;
     void start_movie(int mode, int number, bool resume_script);
     void update_movie();
     void complete_movie();
@@ -443,6 +462,31 @@ private:
     std::string background_tone_curve_;
     bool running_ = true;
     bool app_active_ = true;
+    std::chrono::steady_clock::time_point next_frame_{};
+    // Last device pixel ratio pushed into SDL (browser only).
+    double web_pixel_ratio_ = 0.0;
+    // The finger currently standing in for the mouse, and where it was.
+    SDL_FingerID touch_mouse_finger_ = 0;
+    bool touch_mouse_active_ = false;
+    bool touch_mouse_dragging_ = false;
+    // Scripts already looked into while running the current one, and the
+    // last few parsed, so following the same destination again is free.
+    std::unordered_set<std::string> scanned_scripts_;
+    std::string scanned_from_;
+    std::unordered_map<
+        std::string, std::shared_ptr<const std::vector<std::uint8_t>>>
+        script_prefix_cache_;
+    // Set when a scan is due; it runs on the next frame rather than on the
+    // one the player's click landed on.
+    bool prefetch_scan_pending_ = false;
+    // A follow that was put off because the engine was busy animating.
+    bool prefetch_follow_pending_ = false;
+    std::chrono::steady_clock::time_point last_prefetch_scan_{};
+    // Event id that tells the loop to drop the hover highlights, queued
+    // behind the click a lifted finger produced.
+    Uint32 touch_clear_event_ = 0;
+    float touch_mouse_x_ = 0.0f;
+    float touch_mouse_y_ = 0.0f;
     bool waiting_for_input_ = false;
     std::optional<std::chrono::steady_clock::time_point> wake_time_;
     std::optional<AudioWait> audio_wait_;
@@ -451,6 +495,9 @@ private:
     std::optional<ScreenFlash> screen_flash_;
     std::optional<ShakeState> shake_;
     Texture shake_target_;
+    Texture pose_blend_target_;
+    // Set while a character animation has the message window hidden.
+    bool message_restore_after_animation_ = false;
     std::array<float, 3> background_brightness_{128.0f, 128.0f, 128.0f};
     std::chrono::steady_clock::time_point skip_next_time_{};
     std::optional<std::chrono::steady_clock::time_point> auto_next_time_;
@@ -488,6 +535,8 @@ private:
     };
     UiMode ui_mode_ = UiMode::title;
     UiMode save_return_mode_ = UiMode::game;
+    // Starts on the first item so the menu can be driven from the keyboard
+    // alone; a mouse moving off the items clears it, as the original does.
     int title_highlight_ = 0;
     bool title_extras_ = false;
     bool title_extras_transition_from_ = false;
@@ -540,9 +589,20 @@ private:
     int backlog_depth_ = 0;
     int backlog_voice_hover_ = -1;
     bool backlog_handle_dragging_ = false;
+    // First visible line when a page of text is taller than the screen.
+    int message_scroll_ = 0;
+    bool message_scroll_follow_ = true;
+    bool message_scroll_dragging_ = false;
+    // The backlog scrolls the same way, but starts at the top of an entry
+    // rather than following its end.
+    int backlog_scroll_ = 0;
+    bool backlog_scroll_dragging_ = false;
+    bool opacity_handle_hover_ = false;
+    bool opacity_handle_dragging_ = false;
     bool backlog_handle_hover_ = false;
     int sidebar_hover_ = -1;
     float sidebar_alpha_ = 0.0f;
+    std::chrono::steady_clock::time_point sidebar_alpha_updated_{};
     bool sidebar_mouse_near_ = false;
     bool suppress_sidebar_mouse_up_ = false;
     bool message_visible_ = true;
@@ -655,7 +715,10 @@ private:
     float choice_height(const Choice& choice) const;
     std::vector<std::string> choice_lines(
         const Choice& choice, int index) const;
-    std::size_t text_wrap_columns() const;
+    float message_text_width() const;
+    // Scales an effect's frame count by the effect speed setting; 0 makes
+    // it instant, which is what the original does while skipping too.
+    int effect_frames(int frames) const;
     float text_line_height() const;
     std::vector<std::string> display_lines(std::string_view source) const;
     float message_text_x() const;
@@ -702,7 +765,7 @@ private:
     static std::string base_tone_curve(int tone);
     std::vector<ToneCurveSpec> background_tone_curves() const;
     std::vector<ToneCurveSpec> character_tone_curves() const;
-    static int character_effect_frames(int frames);
+    int character_effect_frames(int frames) const;
     bool character_animation_active() const;
     void start_character_animation(
         int character_number, CharacterAnimation animation);
@@ -789,6 +852,7 @@ private:
     std::vector<std::uint8_t> build_save_bundle();
     void export_save_bundle(const std::string& selected_path);
     void import_save_bundle(const std::string& path);
+    void apply_save_bundle(const std::vector<std::uint8_t>& bundle);
     static void save_bundle_dialog_callback(
         void* userdata, const char* const* filelist, int);
     void show_save_bundle_export_dialog();
@@ -800,7 +864,26 @@ private:
     void draw_name_input();
     void open_backlog();
     void close_backlog();
+    // Starts background transfers for the assets the script is about to
+    // need, so their reads do not stall a frame (browser build; a no-op
+    // where reads come off a disk).
+    void prefetch_upcoming_assets();
+    int prefetch_event_assets(
+        const th2::Event& event, std::string_view script_name,
+        th2::PrefetchRank rank);
+    // Prefetches what a script loads when it starts, for the scripts the
+    // current one can reach.  Returns how many transfers it started.
+    int prefetch_script_start(const std::string& name, int budget);
+
     void handle_touch_actions();
+    // Turns one finger's events into the mouse press, motion and release the
+    // game's own UI is written against.
+    void push_touch_mouse_event(
+        const SDL_Event& event, int window_width, int window_height);
+    // Starts a drag if the touch landed on something draggable.
+    bool begin_touch_drag(float logical_x, float logical_y);
+    // Drops the hover highlights a lifted finger left behind.
+    void clear_pointer_highlights();
     bool backlog_older();
     bool backlog_newer();
     void execute_menu_item(int index);
@@ -926,10 +1009,31 @@ private:
         const BacklogEntry& entry, int voice_index) const;
     void draw_sidebar();
     void update_sidebar_hover(float x, float y);
-    bool handle_sidebar_click(float x, float y);
+    // Handles a press on the sidebar.  With activate_buttons false the
+    // buttons are left alone and only the draggable parts respond, which is
+    // what a touch press does: the buttons wait for the release.
+    bool handle_sidebar_click(float x, float y, bool activate_buttons = true);
     void set_backlog_from_sidebar_y(float y);
+    void set_message_alpha_from_sidebar_y(float y);
+    void finish_sidebar_drag();
     void handle_backlog_input(const SDL_Event& event);
     void draw_click_indicator();
+    std::size_t message_visible_lines() const;
+    int message_scroll_limit(std::size_t total_lines) const;
+    void draw_scrollbar(
+        std::size_t total_lines, int scroll, bool dragging);
+    int scroll_from_y(float y, std::size_t total_lines) const;
+    bool on_scrollbar(float x, float y) const;
+    // Alpha of the black wash under the message text, from the configured
+    // half tone.  The backlog shares it: the original shows the log in the
+    // same window over the same darkened background.
+    Uint8 message_backdrop_alpha() const;
+    bool handle_message_scroll_press(float x, float y);
+    void set_message_scroll_from_y(float y);
+    bool handle_backlog_scroll_press(float x, float y);
+    void set_backlog_scroll_from_y(float y);
+    std::string_view backlog_view_text() const;
+    std::vector<std::string> backlog_view_lines() const;
     void select_overlay();
     void begin_overlay();
     void select_sidebar();
@@ -940,7 +1044,17 @@ private:
     float imgui_display_scale() const;
     void present_frame();
     void reset_render_state();
+    // Hides the message window for a character animation, remembering to
+    // put it back when the animation ends.
+    void hide_message_for_animation();
     void ensure_shake_target();
+    // Cross-dissolves two character poses through a scratch target, the way
+    // the original blends the pair inside one sprite.  False when the
+    // renderer cannot do it, so the caller falls back.
+    bool ensure_pose_blend_target();
+    bool draw_pose_dissolve(
+        SDL_Texture* next, SDL_Texture* previous, float progress,
+        Uint8 brightness, int alpha, const SDL_FRect& destination);
     void draw_frame();
     void draw();
 };

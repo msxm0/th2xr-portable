@@ -205,13 +205,23 @@ std::vector<std::string> Game::choice_lines(
     return lines;
 }
 
-std::size_t Game::text_wrap_columns() const
+int Game::effect_frames(int frames) const
 {
-    if (font_.authentic()) {
-        return 60;
-    }
-    return static_cast<std::size_t>(std::clamp(
-        60 * 24 / std::max(config_.font_size, 1), 30, 80));
+    // AVG_EffCnt() reads a script's frame count the same way everywhere: -1
+    // means fifteen frames, -2 thirty, and anything else is the count
+    // itself, so a zero really is instant.  The effect-speed setting
+    // (Avg.wait in the original) scales all of them.
+    const int count = frames == -1 ? 15
+        : frames == -2 ? 30
+        : std::max(0, frames);
+    return count * std::clamp(config_.effect_speed, 0, 4);
+}
+
+// Text runs from message_text_x() to the same distance short of the sidebar,
+// so the gap on the right matches the one on the left.
+float Game::message_text_width() const
+{
+    return sidebar_left_x - 2.0f * message_text_x();
 }
 
 float Game::text_line_height() const
@@ -219,12 +229,20 @@ float Game::text_line_height() const
     if (font_.authentic()) {
         return 31.0f;
     }
-    return static_cast<float>(std::max(31, config_.font_size + 7));
+    // font_size + 7 is fine until the face's own line spacing outgrows it,
+    // which it does at large sizes and would overlap the next line.
+    return std::max(
+        static_cast<float>(std::max(31, config_.font_size + 7)),
+        font_.line_height());
 }
 
 std::vector<std::string> Game::display_lines(std::string_view source) const
 {
-    return th2app::display_lines(source, text_wrap_columns());
+    // The script's own line breaks are left exactly as written; this only
+    // decides where a line too long for the area has to be broken.
+    return th2app::display_lines(
+        source, message_text_width(),
+        [this](std::string_view text) { return font_.text_width(text); });
 }
 
 float Game::message_text_x() const

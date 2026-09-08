@@ -6,10 +6,6 @@
 namespace th2 {
 namespace {
 
-constexpr std::size_t header_size = 2 * sizeof(std::uint16_t)
-    + sizeof(std::uint32_t)
-    + Scenario::block_count * sizeof(std::uint32_t);
-
 std::uint16_t read_u16(const std::uint8_t* bytes)
 {
     return static_cast<std::uint16_t>(bytes[0])
@@ -28,7 +24,7 @@ std::uint32_t read_u32(const std::uint8_t* bytes)
 
 Scenario::Scenario(std::span<const std::uint8_t> bytes)
 {
-    if (bytes.size() < header_size) {
+    if (bytes.size() < Scenario::header_size) {
         throw std::runtime_error("truncated scenario header");
     }
     if (read_u16(bytes.data()) != 'L' || read_u16(bytes.data() + 2) != 'F') {
@@ -43,7 +39,7 @@ Scenario::Scenario(std::span<const std::uint8_t> bytes)
     for (std::size_t index = 0; index < blocks_.size(); ++index) {
         blocks_[index] = read_u32(bytes.data() + 8 + index * sizeof(std::uint32_t));
     }
-    bytecode_.assign(bytes.begin() + header_size, bytes.end());
+    bytecode_.assign(bytes.begin() + Scenario::header_size, bytes.end());
 
     for (const auto address : blocks_) {
         if (address > bytecode_.size()) {

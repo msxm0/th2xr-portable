@@ -41,7 +41,14 @@ Compared to the original engine, we have:
 
  ## Known Issues
 
-  * On Android, there is only one modern font, bundled with the app.
+  * On Android and in the browser there is no fontconfig, so the modern font
+    can only be one of the three that ship with the build: Liberation Serif,
+    Roboto and Ubuntu. Noto Sans and Noto Sans JP ship alongside them as
+    fallbacks for the glyphs those three lack - the scripts use stars, music
+    notes and fullwidth punctuation, and only the Japanese font covers all of
+    them. They live in `android/app/src/main/assets/fonts`, which the Android
+    build packages as assets and the web build preloads; their licences are
+    in `licenses/fonts`.
   * On Android, when the app is left in the background for a while, either the audio, visuals, or both can break. The app doesn't crash, just becomes invisible or inaudible. Swipe away the app from recents and relaunch to fix, then load your autosave.
 
 
@@ -107,6 +114,34 @@ folder that contains `TOHEART2.EXE`
 data is imported into internal storage.
 Be patient, the copy takes a few seconds.
 
+## Web (LAN server)
+
+The engine also builds to WebAssembly and runs in a browser, which is handy
+for playing on a machine that cannot run the native build. The game data stays
+on the server and the engine streams from it, so nothing has to be copied to
+the client:
+
+```bash
+source /path/to/emsdk/emsdk_env.sh
+make web-deps                                 # once: cross-compile the libraries
+make web                                      # build build/web/
+make serve-web GAME_DATA_DIR=/path/to/game-data WEB_PORT=8080
+```
+
+Then open `http://<server-ip>:8080/toheart2.html` on any machine on the
+network and click Start. Saves and config live in the browser's IndexedDB
+storage, per browser and per origin.
+
+The streaming relies on WebAssembly JSPI, so the client needs **Chrome or
+Edge 137+, or Firefox 153+**. Safari does not support it yet.
+
+`serve-web.py` is a convenience, not a requirement: nothing is computed
+server-side, so nginx, Apache, or any static server that honours range
+requests can host `build/web` alongside the game data at `/game-data/`. See
+[HACKING.md](HACKING.md) for a sample nginx config.
+
+Build details and browser-specific behaviour are in [HACKING.md](HACKING.md).
+
 ## In-Game
 
 ### Touch controls
@@ -150,6 +185,27 @@ Open with the android back button, then "Side Bar Configuration".
 On small screens the panel and the player-name entry
 screen are full-size with drag-to-scroll. 
 
+### Message window opacity
+
+The lower track on the in-game sidebar dims the background while text is on
+screen, as in the original: drag its handle, or use the "Background
+half-tone" slider in the configuration panel. Both write the same setting.
+The top of the bar leaves the art untouched and the bottom is the darkest
+setting, which still shows about a quarter of it.
+
+### Effect speed
+
+"Effect speed" in the configuration panel matches the original's setting:
+Instant, Normal, Slow, Slowest. It scales scene transitions and background
+fades alike, and Instant removes them entirely.
+
+### Long pages
+
+At large font sizes a page of text can be taller than the screen. The
+message area then scrolls to keep the newest line in view, and a slim bar
+appears in the left margin which you can drag to read back; the next line of
+dialogue returns it to the bottom.
+
 ### Save and config location
 
 On desktop, saves, config, and profiles are stored in your system user data directory:
@@ -162,6 +218,9 @@ On desktop, saves, config, and profiles are stored in your system user data dire
 
 The engine creates `save/`, `profile/`, and `logs/` subdirectories there.
 You can copy these folders between machines or desktop installs to transfer your progress.
+
+In the browser they live in IndexedDB instead, tied to the address you load
+the page from; clearing site data for that origin deletes them.
 
 On Android these are stored in private app data.
 To get saves in and out, use the import/export saves function in 

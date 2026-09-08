@@ -559,6 +559,9 @@ void Game::draw_title()
 
 void Game::activate_title_item()
 {
+    if (title_highlight_ < 0) {
+        return;
+    }
     play_se(
         -1, !title_extras_ && title_highlight_ == 0 ? 9111 : 9104,
         false, 255);

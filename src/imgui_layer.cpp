@@ -1,8 +1,11 @@
 #include "imgui_layer.hpp"
 
 #include <imgui.h>
+#ifdef TH2_IMGUI_TOUCH
+#include <imgui_internal.h>  // ClearActiveID, for drag-to-scroll on touch
+#endif
 
-#ifndef __ANDROID__
+#ifdef TH2_USE_FONTCONFIG
 #include <fontconfig/fontconfig.h>
 #endif
 
@@ -12,13 +15,14 @@
 #include <stdexcept>
 #include <vector>
 
+
 namespace th2 {
 namespace {
 
 std::string find_imgui_font_path()
 {
-#ifdef __ANDROID__
-    return TH2_ANDROID_IMGUI_FONT_PATH;
+#ifdef TH2_BUNDLED_IMGUI_FONT_PATH
+    return TH2_BUNDLED_IMGUI_FONT_PATH;
 #else
     if (!FcInit()) {
         return {};
@@ -159,18 +163,31 @@ ImGuiLayer::~ImGuiLayer()
 void ImGuiLayer::process_event(const SDL_Event& event)
 {
     auto& io = ImGui::GetIO();
-#ifdef __ANDROID__
-    // SDL mouse/touch coordinates are in window pixels, but present_frame()
-    // renders ImGui with SDL_SetRenderScale(display_scale_). Divide by that
-    // scale so ImGui's internal coordinates match the rendered UI.
-    const float inv_scale = 1.0f / display_scale_;
-    const auto mouse_x = [&](float x) { return x * inv_scale; };
-    const auto mouse_y = [&](float y) { return y * inv_scale; };
-#else
-    // Desktop: SDL mouse coordinates already match the ImGui logical
-    // coordinate system set in new_frame().
-    const auto mouse_x = [](float x) { return x; };
-    const auto mouse_y = [](float y) { return y; };
+    // SDL reports mouse coordinates in window points, while ImGui's
+    // coordinate system is the window's pixel size divided by
+    // display_scale_ (see new_frame()). Converting points -> pixels ->
+    // ImGui units keeps the two aligned everywhere: on Android, where a
+    // point is a pixel, this is the old 1/display_scale_; on desktop, where
+    // display_scale_ is the pixel density, it is the identity; in the
+    // browser on a phone whose device pixel ratio exceeds the scale cap it
+    // is the ratio between the two.
+    const float density = window_ ? SDL_GetWindowPixelDensity(window_) : 1.0f;
+    const float point_scale =
+        (density > 0.0f ? density : 1.0f) / display_scale_;
+    const auto mouse_x = [&](float x) { return x * point_scale; };
+    const auto mouse_y = [&](float y) { return y * point_scale; };
+#ifdef TH2_IMGUI_TOUCH
+    // Touches reach ImGui through on_touch_*; the mouse events the game
+    // synthesizes from the same fingers would be the second copy.
+    const bool from_touch =
+        (event.type == SDL_EVENT_MOUSE_MOTION
+         && event.motion.which == SDL_TOUCH_MOUSEID)
+        || ((event.type == SDL_EVENT_MOUSE_BUTTON_DOWN
+             || event.type == SDL_EVENT_MOUSE_BUTTON_UP)
+            && event.button.which == SDL_TOUCH_MOUSEID);
+    if (from_touch) {
+        return;
+    }
 #endif
     if (event.type == SDL_EVENT_MOUSE_MOTION) {
         io.AddMouseSourceEvent(
@@ -412,7 +429,7 @@ void ImGuiLayer::render()
 
 void ImGuiLayer::touch_drag_scroll()
 {
-#ifdef __ANDROID__
+#ifdef TH2_IMGUI_TOUCH
     auto& io = ImGui::GetIO();
     if (ImGui::GetScrollMaxY() <= 0.0f
         || !ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)) {
@@ -420,15 +437,28 @@ void ImGuiLayer::touch_drag_scroll()
         return;
     }
 
-    if (touch_down_ && !touch_scroll_active_
-        && !ImGui::IsAnyItemHovered()
-        && !ImGui::IsAnyItemActive()) {
-        touch_scroll_active_ = true;
-    }
-
     if (!touch_down_) {
         touch_scroll_active_ = false;
+        touch_drag_distance_ = 0.0f;
         return;
+    }
+
+    if (!touch_scroll_active_) {
+        if (!ImGui::IsAnyItemHovered() && !ImGui::IsAnyItemActive()) {
+            // Started on empty space: scroll straight away.
+            touch_scroll_active_ = true;
+        } else {
+            // Started on a widget.  Nearly the whole panel is widgets on a
+            // phone, so a plain "not on an item" rule leaves nowhere to drag
+            // from.  Let the touch keep the widget until it has clearly
+            // travelled vertically, then take it over for scrolling - the
+            // sliders here are horizontal, so this costs them nothing.
+            touch_drag_distance_ += io.MouseDelta.y;
+            if (std::abs(touch_drag_distance_) > 10.0f) {
+                ImGui::ClearActiveID();
+                touch_scroll_active_ = true;
+            }
+        }
     }
 
     if (touch_scroll_active_ && io.MouseDelta.y != 0.0f) {
@@ -439,7 +469,7 @@ void ImGuiLayer::touch_drag_scroll()
 
 void ImGuiLayer::on_touch_down(float normalized_x, float normalized_y)
 {
-#ifdef __ANDROID__
+#ifdef TH2_IMGUI_TOUCH
     auto& io = ImGui::GetIO();
     int pixel_width = 0;
     int pixel_height = 0;
@@ -448,7 +478,15 @@ void ImGuiLayer::on_touch_down(float normalized_x, float normalized_y)
     io.AddMousePosEvent(
         normalized_x * pixel_width / display_scale_,
         normalized_y * pixel_height / display_scale_);
+    if (!touch_down_) {
+        // A finger is a held button as far as ImGui is concerned.  Without
+        // it nothing that needs a press-drag-release works on a phone -
+        // scrollbars, sliders, drag handles - because the tap gesture only
+        // ever produced a click after the finger was already gone.
+        io.AddMouseButtonEvent(0, true);
+    }
     touch_down_ = true;
+    touch_drag_distance_ = 0.0f;
 #endif
 }
 
@@ -456,7 +494,7 @@ void ImGuiLayer::on_touch_motion(
     float normalized_x, float normalized_y,
     float normalized_dx, float normalized_dy)
 {
-#ifdef __ANDROID__
+#ifdef TH2_IMGUI_TOUCH
     auto& io = ImGui::GetIO();
     int pixel_width = 0;
     int pixel_height = 0;
@@ -472,7 +510,7 @@ void ImGuiLayer::on_touch_motion(
 
 void ImGuiLayer::on_touch_up(float normalized_x, float normalized_y)
 {
-#ifdef __ANDROID__
+#ifdef TH2_IMGUI_TOUCH
     auto& io = ImGui::GetIO();
     int pixel_width = 0;
     int pixel_height = 0;
@@ -481,7 +519,22 @@ void ImGuiLayer::on_touch_up(float normalized_x, float normalized_y)
     io.AddMousePosEvent(
         normalized_x * pixel_width / display_scale_,
         normalized_y * pixel_height / display_scale_);
+    if (touch_down_) {
+        io.AddMouseButtonEvent(0, false);
+    }
     touch_down_ = false;
+#endif
+}
+
+void ImGuiLayer::on_touch_cancel()
+{
+#ifdef TH2_IMGUI_TOUCH
+    if (touch_down_) {
+        ImGui::GetIO().AddMouseButtonEvent(0, false);
+    }
+    touch_down_ = false;
+    touch_scroll_active_ = false;
+    touch_drag_distance_ = 0.0f;
 #endif
 }
 

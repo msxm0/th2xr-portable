@@ -20,6 +20,8 @@ int main()
     source.window_height = 900;
     source.font_family = "Test Sans";
     source.font_size = 31;
+    source.effect_speed = 2;
+    source.message_half_tone = 96;
     source.character_voice_volume[3] = 17;
     source.character_voice_muted[3] = true;
     th2::save_config(path, source);
@@ -38,6 +40,8 @@ int main()
         || loaded.window_height != 900
         || loaded.font_family != "Test Sans"
         || loaded.font_size != 31
+        || loaded.effect_speed != 2
+        || loaded.message_half_tone != 96
         || loaded.character_voice_volume[3] != 17
         || !loaded.character_voice_muted[3]) {
         return 1;

@@ -37,6 +37,7 @@ void Game::open_backlog()
     play_se(-1, 9012, false, 140);
     ui_mode_ = UiMode::backlog;
     backlog_voice_hover_ = -1;
+    backlog_scroll_ = 0;
     backlog_depth_ = std::min(
         1, static_cast<int>(backlog_.size()));
 }
@@ -48,11 +49,181 @@ void Game::close_backlog()
     ui_mode_ = UiMode::game;
 }
 
+bool Game::begin_touch_drag(float logical_x, float logical_y)
+{
+    // Only the widgets you drag take the press.  Everything else waits for
+    // the release, so pressing a button and sliding off it does nothing,
+    // which is how a touch UI is expected to behave.
+    if (config_open_ || name_input_open_ || imgui_->wants_mouse()) {
+        return false;  // the panel on top owns this touch.
+    }
+    if (ui_mode_ == UiMode::game || ui_mode_ == UiMode::backlog) {
+        handle_sidebar_click(logical_x, logical_y, false);
+        if (backlog_handle_dragging_ || opacity_handle_dragging_) {
+            return true;
+        }
+    }
+    if (ui_mode_ == UiMode::game
+        && handle_message_scroll_press(logical_x, logical_y)) {
+        return true;
+    }
+    if (ui_mode_ == UiMode::backlog
+        && handle_backlog_scroll_press(logical_x, logical_y)) {
+        return true;
+    }
+    return false;
+}
+
+void Game::push_touch_mouse_event(
+    const SDL_Event& event, int window_width, int window_height)
+{
+    // The game's own UI is written against a mouse: sliders and scroll
+    // handles drag, buttons and choices highlight under the cursor, and
+    // clicks act.  SDL can synthesize that from touches, but its synthesis
+    // fires for gestures too and ran alongside our own tap handling, which
+    // counted every tap twice - so it is off (see the
+    // SDL_HINT_TOUCH_MOUSE_EVENTS hint in main()) and we synthesize here
+    // instead, with touch manners rather than mouse ones: the press only
+    // reaches things you can drag, and a click happens on release, and only
+    // if the finger stayed put.
+    if (SDL_GetHintBoolean(SDL_HINT_TOUCH_MOUSE_EVENTS, true)) {
+        return;  // SDL is synthesizing them already; ours would be a second.
+    }
+    const auto finger = event.tfinger.fingerID;
+    if (event.type == SDL_EVENT_FINGER_DOWN) {
+        if (touch_mouse_active_) {
+            return;  // a second finger; gestures own it, not the cursor.
+        }
+        touch_mouse_active_ = true;
+        touch_mouse_finger_ = finger;
+        touch_mouse_dragging_ = false;
+    } else if (!touch_mouse_active_ || finger != touch_mouse_finger_) {
+        return;
+    }
+
+    const float x = event.tfinger.x * static_cast<float>(window_width);
+    const float y = event.tfinger.y * static_cast<float>(window_height);
+    const bool ending = event.type == SDL_EVENT_FINGER_UP
+        || event.type == SDL_EVENT_FINGER_CANCELED;
+
+    if (event.type != SDL_EVENT_FINGER_CANCELED) {
+        // Motion first: it drives a drag in progress, and otherwise moves
+        // the highlight under the finger.
+        SDL_Event motion{};
+        motion.type = SDL_EVENT_MOUSE_MOTION;
+        motion.motion.which = SDL_TOUCH_MOUSEID;
+        motion.motion.state = ending ? 0 : SDL_BUTTON_LMASK;
+        motion.motion.x = x;
+        motion.motion.y = y;
+        motion.motion.xrel = x - touch_mouse_x_;
+        motion.motion.yrel = y - touch_mouse_y_;
+        SDL_PushEvent(&motion);
+    }
+    touch_mouse_x_ = x;
+    touch_mouse_y_ = y;
+
+    const auto [logical_x, logical_y] =
+        logical_coordinates(x, y, window_width, window_height);
+    if (event.type == SDL_EVENT_FINGER_DOWN) {
+        touch_mouse_dragging_ = begin_touch_drag(logical_x, logical_y);
+        if (touch_mouse_dragging_) {
+            // The handle owns the finger now; without this the same drag
+            // would still read as a backlog swipe and page the log while
+            // the slider moved.
+            touch_input_.claim_touch();
+        }
+        return;
+    }
+    if (!ending) {
+        return;
+    }
+
+    touch_mouse_active_ = false;
+    if (touch_mouse_dragging_) {
+        // The drag was started here rather than by a press event, so end it
+        // here too; a drag never counts as a click.
+        touch_mouse_dragging_ = false;
+        finish_sidebar_drag();
+        suppress_sidebar_mouse_up_ = false;
+    } else if (event.type != SDL_EVENT_FINGER_CANCELED
+               && !touch_input_.last_touch_was_gesture()
+               && !touch_input_.last_touch_moved()) {
+        // A tap: a still finger lifted from where it landed, and not part of
+        // a swipe.  Deliver it as a whole click where it was released.
+        for (const bool down : {true, false}) {
+            SDL_Event button{};
+            button.type = down
+                ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
+            button.button.button = SDL_BUTTON_LEFT;
+            button.button.clicks = 1;
+            button.button.down = down;
+            button.button.which = SDL_TOUCH_MOUSEID;
+            button.button.x = x;
+            button.button.y = y;
+            SDL_PushEvent(&button);
+        }
+    }
+
+    // A touch that ends on the sidebar leaves it up: it only fades once a
+    // finger lands somewhere else.  Everywhere else the cursor goes away, so
+    // the bar starts fading and whatever the finger was over stops being
+    // hovered.
+    if (logical_x < sidebar_left_x) {
+        SDL_Event away{};
+        away.type = SDL_EVENT_MOUSE_MOTION;
+        away.motion.which = SDL_TOUCH_MOUSEID;
+        away.motion.x = -1.0f;
+        away.motion.y = -1.0f;
+        away.motion.xrel = -1.0f - touch_mouse_x_;
+        away.motion.yrel = -1.0f - touch_mouse_y_;
+        SDL_PushEvent(&away);
+        touch_mouse_x_ = -1.0f;
+        touch_mouse_y_ = -1.0f;
+    }
+    // The highlights themselves always let go, but not before the click
+    // above has been handled: the map and the backlog answer a click from
+    // whatever was last hovered.  Queueing the clear behind them keeps that
+    // order no matter which frame the events come out in.
+    if (touch_clear_event_ == 0) {
+        touch_clear_event_ = SDL_RegisterEvents(1);
+    }
+    if (touch_clear_event_ != 0) {
+        SDL_Event clear{};
+        clear.type = touch_clear_event_;
+        SDL_PushEvent(&clear);
+    } else {
+        clear_pointer_highlights();
+    }
+}
+
+void Game::clear_pointer_highlights()
+{
+    // A finger that has lifted is not hovering anything, so nothing should
+    // stay lit under it.  The sidebar's fade is deliberately not part of
+    // this: the bar itself stays up until a touch lands off it.
+    sidebar_hover_ = -1;
+    backlog_handle_hover_ = false;
+    opacity_handle_hover_ = false;
+    backlog_voice_hover_ = -1;
+    title_highlight_ = -1;
+    menu_highlight_ = -1;
+    save_hover_ = -1;
+    map_hover_ = -1;
+}
+
 void Game::handle_touch_actions()
 {
     using Action = th2::TouchAction;
     const auto action = touch_input_.poll_action();
     if (action == Action::None) {
+        return;
+    }
+    // While an ImGui panel is up it owns the touch: a drag over it scrolls
+    // the panel rather than paging the backlog, and the swipe shortcuts
+    // belong to the game underneath.  Taps still go through so ImGui sees
+    // the click, and the back button still closes the panel.
+    if ((config_open_ || name_input_open_)
+        && action != Action::Tap && action != Action::MenuToggle) {
         return;
     }
 
@@ -105,64 +276,12 @@ void Game::handle_touch_actions()
             play_se(-1, 9104, false, 255);
         }
         break;
-    case Action::Tap: {
-        // Re-inject the tap as a full left-button click.  Many handlers
-        // (movie skip, menus, title) act on mouse-down, while the normal
-        // text-advance handler acts on mouse-up.  Coordinates are
-        // normalized, so convert to window pixels; the event loop maps
-        // them to logical 800x600 coordinates on the next frame.
-        int window_width = 0;
-        int window_height = 0;
-        SDL_GetWindowSize(window_, &window_width, &window_height);
-        const auto [logical_x, logical_y] = logical_coordinates(
-            touch_input_.tap_x() * window_width,
-            touch_input_.tap_y() * window_height,
-            window_width, window_height);
-        // Sidebar buttons need to work on touch too, but we must not
-        // double-handle them for desktop mice (they fire on mouse-down).
-        if (handle_sidebar_click(logical_x, logical_y)) {
-            break;
-        }
-        if (ui_mode_ == UiMode::backlog) {
-            if (backlog_depth_ > 0
-                && backlog_depth_ <= static_cast<int>(backlog_.size())) {
-                const auto& entry = backlog_[
-                    backlog_.size()
-                    - static_cast<std::size_t>(backlog_depth_)];
-                for (int i = 0;
-                     i < static_cast<int>(entry.voices.size()); ++i) {
-                    for (const auto& rect : backlog_voice_rects(entry, i)) {
-                        if (logical_x >= rect.x
-                            && logical_x < rect.x + rect.w
-                            && logical_y >= rect.y
-                            && logical_y < rect.y + rect.h) {
-                            replay_backlog_voice(entry.voices[i]);
-                            backlog_voice_hover_ = i;
-                            return;
-                        }
-                    }
-                }
-            }
-            break;
-        }
-        SDL_Event down{};
-        down.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
-        down.button.button = SDL_BUTTON_LEFT;
-        down.button.clicks = 1;
-        down.button.which = SDL_TOUCH_MOUSEID;
-        down.button.x = touch_input_.tap_x() * window_width;
-        down.button.y = touch_input_.tap_y() * window_height;
-        SDL_PushEvent(&down);
-        SDL_Event up{};
-        up.type = SDL_EVENT_MOUSE_BUTTON_UP;
-        up.button.button = SDL_BUTTON_LEFT;
-        up.button.clicks = 1;
-        up.button.which = SDL_TOUCH_MOUSEID;
-        up.button.x = down.button.x;
-        up.button.y = down.button.y;
-        SDL_PushEvent(&up);
+    case Action::Tap:
+        // Nothing to do: taps reach the game as a synthesized press and
+        // release (see push_touch_mouse_event), the same way a mouse click
+        // would, so the sidebar, the backlog and the text handlers have all
+        // already seen this one.
         break;
-    }
     default:
         break;
     }
@@ -175,6 +294,7 @@ bool Game::backlog_older()
     }
     play_se(-1, 9012, false, 140);
     ++backlog_depth_;
+    backlog_scroll_ = 0;
     ui_mode_ = UiMode::backlog;
     return true;
 }
@@ -185,6 +305,7 @@ bool Game::backlog_newer()
         return false;
     }
     play_se(-1, 9012, false, 140);
+    backlog_scroll_ = 0;
     if (backlog_depth_ > 1) {
         --backlog_depth_;
     } else {

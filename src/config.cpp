@@ -57,9 +57,16 @@ GameConfig load_config(const std::filesystem::path& path)
         } else if (key == "auto_page_ms") {
             config.auto_page_ms =
                 parse_int(value, config.auto_page_ms, 500, 15000);
+        } else if (key == "effect_speed") {
+            config.effect_speed = parse_int(value, config.effect_speed, 0, 4);
         } else if (key == "text_speed_ms") {
             config.text_speed_ms =
                 parse_int(value, config.text_speed_ms, 0, 100);
+        } else if (key == "message_half_tone") {
+            config.message_half_tone = parse_int(
+                value, config.message_half_tone,
+                GameConfig::min_message_half_tone,
+                GameConfig::max_message_half_tone);
         } else if (key == "auto_skip_read") {
             config.auto_skip_read = parse_bool(value);
         } else if (key == "skip_unread") {
@@ -133,6 +140,8 @@ void save_config(const std::filesystem::path& path, const GameConfig& config)
            << "auto_line_ms=" << config.auto_line_ms << '\n'
            << "auto_page_ms=" << config.auto_page_ms << '\n'
            << "text_speed_ms=" << config.text_speed_ms << '\n'
+           << "effect_speed=" << config.effect_speed << '\n'
+           << "message_half_tone=" << config.message_half_tone << '\n'
            << "auto_skip_read=" << config.auto_skip_read << '\n'
            << "skip_unread=" << config.skip_unread << '\n'
             << "wheel_opens_backlog=" << config.wheel_opens_backlog << '\n'

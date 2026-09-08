@@ -64,6 +64,11 @@ void Game::handle_title_input(const SDL_Event& event)
     } else if (event.type == SDL_EVENT_MOUSE_MOTION) {
         const float x = event.motion.x;
         const float y = event.motion.y;
+        // GM_Title.cpp recomputes the highlight from the cursor every frame
+        // (select = MUS_GetMouseNoEx(...), -1 when it is over no item) and
+        // draws every item unhighlighted first, so moving off the menu drops
+        // the highlight instead of leaving it behind.
+        title_highlight_ = -1;
         if (x >= 306.0f && x < 494.0f) {
             for (int i = 0; i < 5; ++i) {
                 if (title_item_disabled(i)) continue;
@@ -90,7 +95,9 @@ void Game::handle_title_input(const SDL_Event& event)
             }
         }
     }
-    if (title_highlight_ != previous_highlight) {
+    // The original only plays the cursor sound on arriving at an item, not
+    // on leaving one (GM_Title.cpp guards it with select != -1).
+    if (title_highlight_ != previous_highlight && title_highlight_ >= 0) {
         play_se(-1, 9108, false, 255);
     }
 }
@@ -117,11 +124,11 @@ void Game::activate_cg_gallery_item()
         omake_cg_phase_started_ = std::chrono::steady_clock::now();
         play_se(-1, 9104, false, 255);
     } else if (omake_highlight_ == 12) {
-        begin_transition(1, 8, 128, false);
+        begin_transition(1, 7, 128, false);
         omake_page_ = (omake_page_ + page_count - 1) % page_count;
         play_se(-1, 9104, false, 255);
     } else if (omake_highlight_ == 13) {
-        begin_transition(1, 8, 128, false);
+        begin_transition(1, 7, 128, false);
         omake_page_ = (omake_page_ + 1) % page_count;
         play_se(-1, 9104, false, 255);
     } else if (omake_highlight_ == 14) {

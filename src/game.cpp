@@ -1,5 +1,11 @@
 #include "game.hpp"
 
+#include "data_source.hpp"
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+
 #include "icon.hpp"
 #include "image.hpp"
 
@@ -24,6 +30,16 @@ extern "C" {
 namespace th2app {
 
 namespace {
+
+#ifdef __EMSCRIPTEN__
+// Blocks the frame loop until the browser is ready to paint again.  JSPI
+// suspends the whole call stack on the await, the same mechanism the
+// streaming archive reads rely on, so the loop stays shaped like the native
+// one instead of becoming a callback.
+EM_ASYNC_JS(void, wait_for_animation_frame, (void), {
+    await new Promise(requestAnimationFrame);
+});
+#endif
 
 std::filesystem::path ensure_parent_directory(std::filesystem::path path)
 {
@@ -95,6 +111,18 @@ Game::Game(
     if (window_ && config_.window_x >= 0 && config_.window_y >= 0) {
         SDL_SetWindowPosition(window_, config_.window_x, config_.window_y);
     }
+#ifdef __EMSCRIPTEN__
+    // The page sizes the canvas to the viewport, and the saved desktop window
+    // size means nothing here, so match the window to the page.  That makes
+    // SDL scale the backing store by the device pixel ratio without touching
+    // the canvas CSS; later browser resizes are handled by SDL itself,
+    // because the window is resizable and the canvas is sized by CSS.
+    if (window_) {
+        SDL_SetWindowSize(
+            window_, EM_ASM_INT({ return window.innerWidth; }),
+            EM_ASM_INT({ return window.innerHeight; }));
+    }
+#endif
     if (window_) {
         SDL_PropertiesID renderer_properties = SDL_CreateProperties();
         SDL_SetStringProperty(
@@ -127,7 +155,11 @@ Game::Game(
         SDL_SetWindowIcon(window_, icon.get());
     }
     SDL_Log("SDL window and renderer created");
-#ifndef __ANDROID__
+#ifdef __EMSCRIPTEN__
+    // Fullscreen in a browser needs a user gesture, so it cannot be restored
+    // at startup; the page starts windowed and the option starts off with it.
+    config_.fullscreen = false;
+#elif !defined(__ANDROID__)
     if (config_.fullscreen) {
         SDL_SetWindowFullscreen(window_, true);
     }
@@ -138,6 +170,33 @@ Game::Game(
     last_anime4k_wanted_ = config_.anime4k;
     imgui_ = std::make_unique<th2::ImGuiLayer>(window_, renderer_);
     SDL_Log("ImGui layer initialized");
+    // Every one of these is a separate archive entry, and in the browser a
+    // separate network round trip.  Asking for them all up front turns a
+    // queue of thirty waits into thirty transfers running at once; the loads
+    // below then find the bytes waiting for them.
+    static constexpr std::array startup_textures{
+        "sys0100.tga", "sys0110.tga", "sys0111.tga", "sys0000.tga",
+        "sys0001.tga", "sys0011.tga", "sys0010.tga", "sys0200.tga",
+        "sys0300.tga", "sys0201.tga", "sys0202.tga", "sys0210.tga",
+        "sys0230.tga", "sys0250.tga", "sys0350.tga", "sys0251.tga",
+        "sys0203.tga", "t0000.tga", "t0010.tga", "t1000.tga", "t1100.tga",
+        "t2000.tga", "t2001.tga", "t2010.tga", "t2020.tga", "t2021.tga",
+        "t2100.tga", "t3000.tga", "t0001.tga",
+        "f0052.bmp",  // the title screen's transition mask
+    };
+    for (const auto* asset : startup_textures) {
+        if (const auto* entry = graphics_.find(asset)) {
+            graphics_.prefetch(*entry);
+        }
+    }
+    // The interface sounds are played by menus rather than by the script, so
+    // the lookahead never sees them coming; there are only a handful.
+    for (const int sound : {9002, 9012, 9014, 9015, 9104, 9107, 9108, 9111}) {
+        if (const auto* entry =
+                se_archive_.find(std::format("SE_{:04d}.WAV", sound))) {
+            se_archive_.prefetch(*entry);
+        }
+    }
     auto try_load = [&](std::string_view name) -> Texture {
         const auto* entry = graphics_.find(name);
         if (!entry) return {};
@@ -252,379 +311,473 @@ int Game::run_loop()
     SDL_Log(
         "Window size: %dx%d (points), %dx%d (pixels), display scale %.2f",
         dbg_w, dbg_h, dbg_pw, dbg_ph, SDL_GetWindowDisplayScale(window_));
-    constexpr auto frame_duration = std::chrono::nanoseconds(
-        1'000'000'000 / 60);
-    auto next_frame = std::chrono::steady_clock::now();
+    next_frame_ = std::chrono::steady_clock::now();
     while (running_) {
-        int window_width = 800;
-        int window_height = 600;
-        SDL_GetWindowSize(window_, &window_width, &window_height);
-        SDL_Event event;
-        while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_EVENT_QUIT) {
-                running_ = false;
-                continue;
-            }
-            if (!gamepad_input_.process_event(event)) {
-                continue;
-            }
-            if (event.type == SDL_EVENT_WILL_ENTER_BACKGROUND) {
-                app_active_ = false;
-                SDL_Log("App entered background");
-                // Persist the system-save flags immediately. On Android the
-                // process may be killed while in the background before the
-                // destructor runs.
-                sync_game_flags();
-                continue;
-            }
-            if (event.type == SDL_EVENT_DID_ENTER_FOREGROUND) {
-                app_active_ = true;
-                SDL_Log("App entered foreground");
-                reset_render_state();
-                continue;
-            }
-            if (event.type == SDL_EVENT_RENDER_TARGETS_RESET) {
-                SDL_Log("Render targets reset");
-                reset_render_state();
-                continue;
-            }
-            if (event.type == SDL_EVENT_RENDER_DEVICE_RESET) {
-                SDL_Log("Render device reset");
-                reset_render_state();
-                continue;
-            }
-            if (event.type == SDL_EVENT_RENDER_DEVICE_LOST) {
-                SDL_Log("Render device lost");
-                continue;
-            }
-#ifndef __ANDROID__
-            if (event.type == SDL_EVENT_WINDOW_MOVED
-                || event.type == SDL_EVENT_WINDOW_RESIZED
-                || event.type == SDL_EVENT_WINDOW_RESTORED
-                || event.type == SDL_EVENT_WINDOW_MAXIMIZED) {
-                sync_window_config();
-            }
+        iterate();
+#ifdef __EMSCRIPTEN__
+        wait_for_animation_frame();
 #endif
-            imgui_->process_event(event);
-            touch_input_.process_event(event);
-            if (event.type == SDL_EVENT_FINGER_DOWN) {
-                imgui_->on_touch_down(
-                    event.tfinger.x, event.tfinger.y);
-            } else if (event.type == SDL_EVENT_FINGER_MOTION) {
-                imgui_->on_touch_motion(
-                    event.tfinger.x, event.tfinger.y,
-                    event.tfinger.dx, event.tfinger.dy);
-            } else if (event.type == SDL_EVENT_FINGER_UP) {
-                imgui_->on_touch_up(
-                    event.tfinger.x, event.tfinger.y);
-            }
-            convert_event_to_logical_coordinates(
-                event, window_width, window_height);
-            if (config_.show_script_position
-                && imgui_->wants_mouse()
-                && (event.type == SDL_EVENT_MOUSE_MOTION
-                    || event.type == SDL_EVENT_MOUSE_BUTTON_DOWN
-                    || event.type == SDL_EVENT_MOUSE_BUTTON_UP
-                    || event.type == SDL_EVENT_MOUSE_WHEEL)) {
-                continue;
-            }
-            if (event.type == SDL_EVENT_KEY_DOWN && is_alt_enter(event.key)) {
-                toggle_fullscreen();
-                continue;
-            }
-            if (clock_state_) {
-                continue;
-            }
-            if (calendar_state_) {
-                const bool dismiss =
-                    event.type == SDL_EVENT_MOUSE_BUTTON_DOWN
-                    || event.type == SDL_EVENT_KEY_DOWN;
-                const float frame = static_cast<float>(
-                    std::chrono::duration<double>(
-                        std::chrono::steady_clock::now()
-                        - calendar_state_->started).count() * 60.0);
-                if (dismiss && !calendar_state_->dismissing
-                    && frame >= 16.0f) {
-                    calendar_state_->dismissing = true;
-                    calendar_state_->started =
-                        std::chrono::steady_clock::now();
-                }
-                continue;
-            }
-            if (movie_) {
-                const bool skip_key = event.type == SDL_EVENT_KEY_DOWN
-                    && (event.key.key == SDLK_ESCAPE
-                        || is_confirm_key(event.key.key));
-                const bool skip_mouse = event.type
-                    == SDL_EVENT_MOUSE_BUTTON_DOWN;
-                const bool locked = (movie_mode_ == 0
-                        && runtime_.game_flag(98) == 0)
-                    || (movie_mode_ == 1
-                        && runtime_.game_flag(80) == 0)
-                    || (movie_mode_ == 2
-                        && runtime_.game_flag(99) == 0);
-                if ((skip_key || skip_mouse) && !locked) {
-                    const int skipped_mode = movie_mode_;
-                    movie_.reset();
-                    movie_bytes_.clear();
-                    movie_mode_ = -1;
-                    if (skipped_mode != 3) {
-                        bgm_.stop();
-                        bgm_track_ = -1;
-                    }
-                    if (movie_resume_script_) {
-                        movie_resume_script_ = false;
-                        advance();
-                    } else if (skipped_mode == 3
-                               && runtime_.game_flag(98) != 0) {
-                        start_movie(0, 0, false);
-                    } else {
-                        title_started_ = std::chrono::steady_clock::now();
-                    }
-                }
-                continue;
-            }
-            if (config_open_ || name_input_open_) {
-                if (config_open_ && event.type == SDL_EVENT_KEY_DOWN
-                    && gamepad_input_.last_event_was_gamepad()) {
-                    config_gamepad_focus_requested_ = true;
-                }
-                if (event.type == SDL_EVENT_KEY_DOWN
-                    && event.key.key == SDLK_ESCAPE && config_open_) {
-                    play_se(-1, 9107, false, 255);
-                    close_config();
-                }
-                continue;
-            }
-            if (transition_ || background_fade_) {
-                continue;
-            }
+    }
+    SDL_Log("Main loop exited cleanly");
+    return 0;
+}
 
-            // UI mode routing
-            if (ui_mode_ == UiMode::title) {
-                handle_title_input(event);
-                continue;
-            }
-            if (ui_mode_ == UiMode::cg_gallery) {
-                handle_cg_gallery_input(event);
-                continue;
-            }
-            if (ui_mode_ == UiMode::music_room) {
-                handle_music_room_input(event);
-                continue;
-            }
-            if (ui_mode_ == UiMode::replay_gallery) {
-                handle_replay_gallery_input(event);
-                continue;
-            }
-            if (ui_mode_ == UiMode::system_menu) {
-                handle_system_menu_input(event);
-                continue;
-            }
-            if (ui_mode_ == UiMode::save || ui_mode_ == UiMode::load) {
-                handle_save_load_input(event);
-                continue;
-            }
-            if (ui_mode_ == UiMode::map) {
-                handle_map_input(event);
-                continue;
-            }
-            if (ui_mode_ == UiMode::backlog) {
-                handle_backlog_input(event);
-                continue;
-            }
+#ifdef __EMSCRIPTEN__
+// Reads the box the canvas actually occupies, which is what SDL measures
+// touches against, plus the device pixel ratio.
+EM_JS(void, th2_web_canvas_box, (int* out_width, int* out_height,
+                                 double* out_ratio), {
+    // The page publishes the box it pinned the canvas to; measuring it here
+    // instead would flush layout on every frame.  Fall back to measuring for
+    // pages that do not (someone hosting the engine with their own shell).
+    var box = window.__th2Viewport;
+    var width;
+    var height;
+    if (box) {
+        width = box.width;
+        height = box.height;
+    } else {
+        var canvas = Module['canvas'] || document.getElementById('canvas');
+        var rect = canvas ? canvas.getBoundingClientRect() : null;
+        width = rect && rect.width > 0 ? rect.width : window.innerWidth;
+        height = rect && rect.height > 0 ? rect.height : window.innerHeight;
+    }
+    HEAP32[out_width >> 2] = Math.round(width);
+    HEAP32[out_height >> 2] = Math.round(height);
+    HEAPF64[out_ratio >> 3] = window.devicePixelRatio;
+});
+#endif
 
-            // Message window hidden - any input restores it
-            if (!message_visible_) {
-                if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN
-                    || event.type == SDL_EVENT_KEY_DOWN) {
-                    message_visible_ = true;
+void Game::sync_web_viewport()
+{
+#ifdef __EMSCRIPTEN__
+    // SDL only learns about a browser resize from the window's resize event,
+    // and only refreshes the device pixel ratio while handling one.  On a
+    // phone that is not enough: a URL bar sliding away, a fold, or a display
+    // change can leave SDL sized to the old canvas, which both stops the
+    // game rescaling and skews touch coordinates, because finger positions
+    // arrive normalized against the real canvas and are scaled back up by
+    // the window size SDL believes in.  Measure it ourselves every frame and
+    // push the truth into SDL when it drifts.
+    int width = 0;
+    int height = 0;
+    double ratio = 1.0;
+    th2_web_canvas_box(&width, &height, &ratio);
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    int current_width = 0;
+    int current_height = 0;
+    SDL_GetWindowSize(window_, &current_width, &current_height);
+    if (width == current_width && height == current_height
+        && ratio == web_pixel_ratio_) {
+        return;
+    }
+    web_pixel_ratio_ = ratio;
+    // SDL_SetWindowSize always reaches the emscripten backend, which rereads
+    // the pixel ratio and resizes the canvas backing store, so this also
+    // covers a ratio change that kept the same CSS size.
+    SDL_SetWindowSize(window_, width, height);
+#endif
+}
+
+void Game::iterate()
+{
+    sync_web_viewport();
+    // The lookahead scan runs here rather than at the end of advance(), so
+    // its cost lands on an idle frame instead of the one the player's click
+    // is already busy with.  It is throttled because skipping advances the
+    // script far faster than the network can answer anyway.
+    if (prefetch_scan_pending_ || prefetch_follow_pending_) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_prefetch_scan_ >= std::chrono::milliseconds(50)) {
+            prefetch_scan_pending_ = false;
+            last_prefetch_scan_ = now;
+            prefetch_upcoming_assets();
+        }
+    }
+    int window_width = 800;
+    int window_height = 600;
+    SDL_GetWindowSize(window_, &window_width, &window_height);
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+        if (event.type == SDL_EVENT_QUIT) {
+            running_ = false;
+            continue;
+        }
+        if (touch_clear_event_ != 0 && event.type == touch_clear_event_) {
+            clear_pointer_highlights();
+            continue;
+        }
+        if (!gamepad_input_.process_event(event)) {
+            continue;
+        }
+        if (event.type == SDL_EVENT_WILL_ENTER_BACKGROUND) {
+            app_active_ = false;
+            SDL_Log("App entered background");
+            // Persist the system-save flags immediately. On Android the
+            // process may be killed while in the background before the
+            // destructor runs.
+            sync_game_flags();
+            continue;
+        }
+        if (event.type == SDL_EVENT_DID_ENTER_FOREGROUND) {
+            app_active_ = true;
+            SDL_Log("App entered foreground");
+            reset_render_state();
+            continue;
+        }
+        if (event.type == SDL_EVENT_RENDER_TARGETS_RESET) {
+            SDL_Log("Render targets reset");
+            reset_render_state();
+            continue;
+        }
+        if (event.type == SDL_EVENT_RENDER_DEVICE_RESET) {
+            SDL_Log("Render device reset");
+            reset_render_state();
+            continue;
+        }
+        if (event.type == SDL_EVENT_RENDER_DEVICE_LOST) {
+            SDL_Log("Render device lost");
+            continue;
+        }
+#ifndef __ANDROID__
+        if (event.type == SDL_EVENT_WINDOW_MOVED
+            || event.type == SDL_EVENT_WINDOW_RESIZED
+            || event.type == SDL_EVENT_WINDOW_RESTORED
+            || event.type == SDL_EVENT_WINDOW_MAXIMIZED) {
+            sync_window_config();
+        }
+        // Fullscreen can also be left behind our back (Escape in a browser,
+        // the window manager on the desktop); keep the option in step.
+        if (event.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN
+            || event.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN) {
+            config_.fullscreen =
+                event.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN;
+        }
+#endif
+        // A fullscreen change or a lost focus eats the touches that were
+        // down, and the finger that triggered it never reports a lift.
+        if (event.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN
+            || event.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN
+            || event.type == SDL_EVENT_WINDOW_FOCUS_LOST
+            || event.type == SDL_EVENT_WINDOW_HIDDEN) {
+            touch_input_.reset();
+            imgui_->on_touch_cancel();
+        }
+        imgui_->process_event(event);
+        touch_input_.process_event(event);
+        if (event.type == SDL_EVENT_FINGER_DOWN) {
+            imgui_->on_touch_down(
+                event.tfinger.x, event.tfinger.y);
+        } else if (event.type == SDL_EVENT_FINGER_MOTION) {
+            imgui_->on_touch_motion(
+                event.tfinger.x, event.tfinger.y,
+                event.tfinger.dx, event.tfinger.dy);
+        } else if (event.type == SDL_EVENT_FINGER_UP
+                   || event.type == SDL_EVENT_FINGER_CANCELED) {
+            imgui_->on_touch_up(
+                event.tfinger.x, event.tfinger.y);
+        }
+        if (event.type == SDL_EVENT_FINGER_DOWN
+            || event.type == SDL_EVENT_FINGER_MOTION
+            || event.type == SDL_EVENT_FINGER_UP
+            || event.type == SDL_EVENT_FINGER_CANCELED) {
+            push_touch_mouse_event(event, window_width, window_height);
+        }
+        convert_event_to_logical_coordinates(
+            event, window_width, window_height);
+        if (config_.show_script_position
+            && imgui_->wants_mouse()
+            && (event.type == SDL_EVENT_MOUSE_MOTION
+                || event.type == SDL_EVENT_MOUSE_BUTTON_DOWN
+                || event.type == SDL_EVENT_MOUSE_BUTTON_UP
+                || event.type == SDL_EVENT_MOUSE_WHEEL)) {
+            continue;
+        }
+        if (event.type == SDL_EVENT_KEY_DOWN && is_alt_enter(event.key)) {
+            toggle_fullscreen();
+            continue;
+        }
+        if (clock_state_) {
+            continue;
+        }
+        if (calendar_state_) {
+            const bool dismiss =
+                event.type == SDL_EVENT_MOUSE_BUTTON_DOWN
+                || event.type == SDL_EVENT_KEY_DOWN;
+            const float frame = static_cast<float>(
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now()
+                    - calendar_state_->started).count() * 60.0);
+            if (dismiss && !calendar_state_->dismissing
+                && frame >= 16.0f) {
+                calendar_state_->dismissing = true;
+                calendar_state_->started =
+                    std::chrono::steady_clock::now();
+            }
+            continue;
+        }
+        if (movie_) {
+            const bool skip_key = event.type == SDL_EVENT_KEY_DOWN
+                && (event.key.key == SDLK_ESCAPE
+                    || is_confirm_key(event.key.key));
+            const bool skip_mouse = event.type
+                == SDL_EVENT_MOUSE_BUTTON_DOWN;
+            const bool locked = (movie_mode_ == 0
+                    && runtime_.game_flag(98) == 0)
+                || (movie_mode_ == 1
+                    && runtime_.game_flag(80) == 0)
+                || (movie_mode_ == 2
+                    && runtime_.game_flag(99) == 0);
+            if ((skip_key || skip_mouse) && !locked) {
+                const int skipped_mode = movie_mode_;
+                movie_.reset();
+                movie_bytes_.clear();
+                movie_mode_ = -1;
+                if (skipped_mode != 3) {
+                    bgm_.stop();
+                    bgm_track_ = -1;
                 }
-                continue;
-            }
-
-            if (event.type == SDL_EVENT_KEY_DOWN) {
-                if (event.key.key == SDLK_PAGEUP) {
-                    open_backlog();
-                } else if (choosing_) {
-                    if (is_confirm_key(event.key.key)) {
-                        choice_selected_ = choice_highlight_;
-                        manual_advance();
-                    } else if (event.key.key == SDLK_UP) {
-                        if (choice_highlight_ > 0) {
-                            --choice_highlight_;
-                        }
-                    } else if (event.key.key == SDLK_DOWN) {
-                        if (choice_highlight_ + 1
-                            < static_cast<int>(choices_.size())) {
-                            ++choice_highlight_;
-                        }
-                    }
+                if (movie_resume_script_) {
+                    movie_resume_script_ = false;
+                    advance();
+                } else if (skipped_mode == 3
+                           && runtime_.game_flag(98) != 0) {
+                    start_movie(0, 0, false);
                 } else {
-                    if (event.key.key == SDLK_ESCAPE) {
-                        open_system_menu();
-                    } else if (event.key.key == SDLK_F8
-                               && gamepad_input_.last_event_was_gamepad()) {
-                        skip_mode_ = !skip_mode_;
-                        if (skip_mode_) auto_mode_ = false;
-                    } else if (event.key.key == SDLK_F9
-                               && gamepad_input_.last_event_was_gamepad()) {
-                        auto_mode_ = !auto_mode_;
-                        if (auto_mode_) skip_mode_ = false;
-                    } else if (event.key.key == SDLK_F10
-                               && gamepad_input_.last_event_was_gamepad()) {
-                        message_visible_ = !message_visible_;
-                    } else if (event.key.key == SDLK_F5
-                               && !replay_mode_) {
-                        save_snapshot_ = capture_frame_pixels();
-                        save(0);
-                    } else if (event.key.key == SDLK_F7
-                               && !replay_mode_) {
-                        save_snapshot_ = capture_frame_pixels();
-                        open_save_load(UiMode::load);
-                    } else if (event.key.key == SDLK_F11) {
-                        toggle_fullscreen();
-                    } else if (is_confirm_key(event.key.key)) {
-                        manual_advance();
+                    title_started_ = std::chrono::steady_clock::now();
+                }
+            }
+            continue;
+        }
+        if (config_open_ || name_input_open_) {
+            if (config_open_ && event.type == SDL_EVENT_KEY_DOWN
+                && gamepad_input_.last_event_was_gamepad()) {
+                config_gamepad_focus_requested_ = true;
+            }
+            if (event.type == SDL_EVENT_KEY_DOWN
+                && event.key.key == SDLK_ESCAPE && config_open_) {
+                play_se(-1, 9107, false, 255);
+                close_config();
+            }
+            continue;
+        }
+        if (transition_ || background_fade_) {
+            continue;
+        }
+
+        // UI mode routing
+        if (ui_mode_ == UiMode::title) {
+            handle_title_input(event);
+            continue;
+        }
+        if (ui_mode_ == UiMode::cg_gallery) {
+            handle_cg_gallery_input(event);
+            continue;
+        }
+        if (ui_mode_ == UiMode::music_room) {
+            handle_music_room_input(event);
+            continue;
+        }
+        if (ui_mode_ == UiMode::replay_gallery) {
+            handle_replay_gallery_input(event);
+            continue;
+        }
+        if (ui_mode_ == UiMode::system_menu) {
+            handle_system_menu_input(event);
+            continue;
+        }
+        if (ui_mode_ == UiMode::save || ui_mode_ == UiMode::load) {
+            handle_save_load_input(event);
+            continue;
+        }
+        if (ui_mode_ == UiMode::map) {
+            handle_map_input(event);
+            continue;
+        }
+        if (ui_mode_ == UiMode::backlog) {
+            handle_backlog_input(event);
+            continue;
+        }
+
+        // Message window hidden - any input restores it
+        if (!message_visible_) {
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN
+                || event.type == SDL_EVENT_KEY_DOWN) {
+                message_visible_ = true;
+            }
+            continue;
+        }
+
+        if (event.type == SDL_EVENT_KEY_DOWN) {
+            if (event.key.key == SDLK_PAGEUP) {
+                open_backlog();
+            } else if (choosing_) {
+                if (is_confirm_key(event.key.key)) {
+                    choice_selected_ = choice_highlight_;
+                    manual_advance();
+                } else if (event.key.key == SDLK_UP) {
+                    if (choice_highlight_ > 0) {
+                        --choice_highlight_;
+                    }
+                } else if (event.key.key == SDLK_DOWN) {
+                    if (choice_highlight_ + 1
+                        < static_cast<int>(choices_.size())) {
+                        ++choice_highlight_;
                     }
                 }
-            } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
-                if (event.button.button == SDL_BUTTON_RIGHT) {
+            } else {
+                if (event.key.key == SDLK_ESCAPE) {
                     open_system_menu();
-                } else if (event.button.button == SDL_BUTTON_LEFT) {
-                    if (event.button.which != SDL_TOUCH_MOUSEID
-                        && handle_sidebar_click(event.button.x, event.button.y)) {
-                        suppress_sidebar_mouse_up_ = true;
-                        continue;
-                    }
-                }
-            } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
-                if (event.button.button == SDL_BUTTON_LEFT) {
-                    if (suppress_sidebar_mouse_up_) {
-                        suppress_sidebar_mouse_up_ = false;
-                        backlog_handle_dragging_ = false;
-                        continue;
-                    }
-                    if (choosing_) {
-                        const float mouse_y = event.button.y;
-                        float y = choice_y_start();
-                        for (int i = 0;
-                             i < static_cast<int>(choices_.size()); ++i) {
-                            const float height =
-                                choice_height(choices_[i]);
-                            if (mouse_y >= y && mouse_y < y + height) {
-                                choice_selected_ = i;
-                                manual_advance();
-                                break;
-                            }
-                            y += choice_height(choices_[i]);
-                        }
-                    } else {
-                        manual_advance();
-                    }
-                }
-                backlog_handle_dragging_ = false;
-            } else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
-                if (event.wheel.y > 0
-                    && config_.wheel_opens_backlog) {
-                    open_backlog();
-                } else if (event.wheel.y < 0) {
+                } else if (event.key.key == SDLK_F8
+                           && gamepad_input_.last_event_was_gamepad()) {
+                    skip_mode_ = !skip_mode_;
+                    if (skip_mode_) auto_mode_ = false;
+                } else if (event.key.key == SDLK_F9
+                           && gamepad_input_.last_event_was_gamepad()) {
+                    auto_mode_ = !auto_mode_;
+                    if (auto_mode_) skip_mode_ = false;
+                } else if (event.key.key == SDLK_F10
+                           && gamepad_input_.last_event_was_gamepad()) {
+                    message_visible_ = !message_visible_;
+                } else if (event.key.key == SDLK_F5
+                           && !replay_mode_) {
+                    save_snapshot_ = capture_frame_pixels();
+                    save(0);
+                } else if (event.key.key == SDLK_F7
+                           && !replay_mode_) {
+                    save_snapshot_ = capture_frame_pixels();
+                    open_save_load(UiMode::load);
+                } else if (event.key.key == SDLK_F11) {
+                    toggle_fullscreen();
+                } else if (is_confirm_key(event.key.key)) {
                     manual_advance();
                 }
-            } else if (event.type == SDL_EVENT_MOUSE_MOTION) {
-                if (backlog_handle_dragging_) {
-                    set_backlog_from_sidebar_y(event.motion.y);
+            }
+        } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+            if (event.button.button == SDL_BUTTON_RIGHT) {
+                open_system_menu();
+            } else if (event.button.button == SDL_BUTTON_LEFT) {
+                if (handle_sidebar_click(event.button.x, event.button.y)) {
+                    suppress_sidebar_mouse_up_ = true;
                     continue;
                 }
-                update_sidebar_hover(event.motion.x, event.motion.y);
+                if (handle_message_scroll_press(
+                        event.button.x, event.button.y)) {
+                    suppress_sidebar_mouse_up_ = true;
+                    continue;
+                }
+            }
+        } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+            if (event.button.button == SDL_BUTTON_LEFT) {
+                if (suppress_sidebar_mouse_up_) {
+                    suppress_sidebar_mouse_up_ = false;
+                    finish_sidebar_drag();
+                    continue;
+                }
                 if (choosing_) {
-                    const float mouse_y = event.motion.y;
+                    const float mouse_y = event.button.y;
                     float y = choice_y_start();
                     for (int i = 0;
                          i < static_cast<int>(choices_.size()); ++i) {
                         const float height =
                             choice_height(choices_[i]);
                         if (mouse_y >= y && mouse_y < y + height) {
-                            choice_highlight_ = i;
+                            choice_selected_ = i;
+                            manual_advance();
                             break;
                         }
-                        y += height;
+                        y += choice_height(choices_[i]);
                     }
+                } else {
+                    manual_advance();
                 }
-            } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP
-                       && event.button.button == SDL_BUTTON_LEFT) {
-                backlog_handle_dragging_ = false;
             }
+            finish_sidebar_drag();
+        } else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
+            if (event.wheel.y > 0
+                && config_.wheel_opens_backlog) {
+                open_backlog();
+            } else if (event.wheel.y < 0) {
+                manual_advance();
+            }
+        } else if (event.type == SDL_EVENT_MOUSE_MOTION) {
+            if (backlog_handle_dragging_) {
+                set_backlog_from_sidebar_y(event.motion.y);
+                continue;
+            }
+            if (opacity_handle_dragging_) {
+                set_message_alpha_from_sidebar_y(event.motion.y);
+                continue;
+            }
+            if (message_scroll_dragging_) {
+                set_message_scroll_from_y(event.motion.y);
+                continue;
+            }
+            update_sidebar_hover(event.motion.x, event.motion.y);
+            if (choosing_) {
+                const float mouse_y = event.motion.y;
+                float y = choice_y_start();
+                for (int i = 0;
+                     i < static_cast<int>(choices_.size()); ++i) {
+                    const float height =
+                        choice_height(choices_[i]);
+                    if (mouse_y >= y && mouse_y < y + height) {
+                        choice_highlight_ = i;
+                        break;
+                    }
+                    y += height;
+                }
+            }
+        } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP
+                   && event.button.button == SDL_BUTTON_LEFT) {
+            finish_sidebar_drag();
         }
-        handle_touch_actions();
-        process_save_bundle_dialog();
+    }
+    handle_touch_actions();
+    process_save_bundle_dialog();
 
-        if (!app_active_) {
-            // Pause the loop while the app is in the background so we
-            // don't keep rendering to a surface that may be destroyed.
-            SDL_Delay(50);
-            continue;
+    if (!app_active_) {
+        // Pause the loop while the app is in the background so we
+        // don't keep rendering to a surface that may be destroyed.
+#ifndef __EMSCRIPTEN__
+        SDL_Delay(50);
+#endif
+        return;
+    }
+    const bool control_held =
+        !config_open_ && !name_input_open_
+        && ((SDL_GetModState() & SDL_KMOD_CTRL) != 0
+            || touch_input_.skip_held()
+            || gamepad_input_.ctrl_skip_held());
+    if (movie_) {
+        movie_->set_speed(control_held ? 4.0 : 1.0);
+    } else if (control_held && ui_mode_ == UiMode::title) {
+        title_started_ -= std::chrono::milliseconds(50);
+        if (title_exit_started_) {
+            *title_exit_started_ -= std::chrono::milliseconds(50);
         }
-        const bool control_held =
-            !config_open_ && !name_input_open_
-            && ((SDL_GetModState() & SDL_KMOD_CTRL) != 0
-                || touch_input_.skip_held()
-                || gamepad_input_.ctrl_skip_held());
-        if (movie_) {
-            movie_->set_speed(control_held ? 4.0 : 1.0);
-        } else if (control_held && ui_mode_ == UiMode::title) {
-            title_started_ -= std::chrono::milliseconds(50);
-            if (title_exit_started_) {
-                *title_exit_started_ -= std::chrono::milliseconds(50);
-            }
-        } else if (control_held && ui_mode_ == UiMode::game) {
-            const auto now = std::chrono::steady_clock::now();
-            if (now >= skip_next_time_) {
-                skip(true);
-                skip_next_time_ = now + std::chrono::milliseconds(40);
-            }
-        } else if (wake_time_
-                   && std::chrono::steady_clock::now() >= *wake_time_) {
-            wake_time_.reset();
-            advance();
+    } else if (control_held && ui_mode_ == UiMode::game) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= skip_next_time_) {
+            skip(true);
+            skip_next_time_ = now + std::chrono::milliseconds(40);
         }
-        if (soak_) {
-            soak_->step();
-        }
-        update_audio();
-        update_movie();
-        update_map();
-        update_playback_modes();
-        update_title();
-        if (soak_) {
-            update_transition();
-            update_background_fade();
-            update_screen_flash();
-            update_shake();
-            update_background_scroll();
-            update_character_animations();
-            update_clock_calendar();
-            update_sakura();
-            retire_soak_gpu_work();
-            next_frame = std::chrono::steady_clock::now();
-            continue;
-        }
-        ensure_upscaler();
-        int output_width = 800;
-        int output_height = 600;
-        SDL_GetRenderOutputSize(
-            renderer_, &output_width, &output_height);
-        const float scale_x = output_width / 800.0f;
-        const float scale_y = output_height / 600.0f;
-        const float framebuffer_scale = std::min(scale_x, scale_y);
-        const float display_scale = imgui_display_scale();
-        imgui_->new_frame(window_, display_scale);
-        font_.configure(
-            config_.authentic_font, config_.font_family,
-            config_.font_size, framebuffer_scale);
-        draw_config();
-        draw_name_input();
-        draw();
+    } else if (wake_time_
+               && std::chrono::steady_clock::now() >= *wake_time_) {
+        wake_time_.reset();
+        advance();
+    }
+    if (soak_) {
+        soak_->step();
+    }
+    update_audio();
+    update_movie();
+    update_map();
+    update_playback_modes();
+    update_title();
+    if (soak_) {
         update_transition();
         update_background_fade();
         update_screen_flash();
@@ -633,16 +786,50 @@ int Game::run_loop()
         update_character_animations();
         update_clock_calendar();
         update_sakura();
-        next_frame += frame_duration;
-        const auto now = std::chrono::steady_clock::now();
-        if (next_frame > now) {
-            std::this_thread::sleep_until(next_frame);
-        } else if (now - next_frame > frame_duration * 4) {
-            next_frame = now;
-        }
+        retire_soak_gpu_work();
+        next_frame_ = std::chrono::steady_clock::now();
+        return;
     }
-    SDL_Log("Main loop exited cleanly");
-    return 0;
+    ensure_upscaler();
+    int output_width = 800;
+    int output_height = 600;
+    SDL_GetRenderOutputSize(
+        renderer_, &output_width, &output_height);
+    const float scale_x = output_width / 800.0f;
+    const float scale_y = output_height / 600.0f;
+    const float framebuffer_scale = std::min(scale_x, scale_y);
+    const float display_scale = imgui_display_scale();
+    imgui_->new_frame(window_, display_scale);
+    font_.configure(
+        config_.authentic_font, config_.font_family,
+        config_.font_size, framebuffer_scale);
+    draw_config();
+    draw_name_input();
+    draw();
+    update_transition();
+    update_background_fade();
+    update_screen_flash();
+    update_shake();
+    update_background_scroll();
+    update_character_animations();
+    update_clock_calendar();
+    update_sakura();
+#ifdef __EMSCRIPTEN__
+    // run_loop() paces the browser build with requestAnimationFrame; there is
+    // no thread to sleep on.  All animation is wall-clock driven, so a display
+    // refresh above 60 Hz simply renders more often.
+    next_frame_ = std::chrono::steady_clock::now();
+#else
+    constexpr auto frame_duration = std::chrono::nanoseconds(
+        1'000'000'000 / 60);
+    next_frame_ += frame_duration;
+    const auto now = std::chrono::steady_clock::now();
+    if (next_frame_ > now) {
+        std::this_thread::sleep_until(next_frame_);
+    } else if (now - next_frame_ > frame_duration * 4) {
+        next_frame_ = now;
+    }
+#endif
 }
 
 void Game::draw()
@@ -720,9 +907,13 @@ int main(int argc, char** argv)
         // Keep the Android back button as an SDL key event instead of letting
         // the OS finish the activity.
         SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
+#endif
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
         // We handle touch gestures ourselves; don't let SDL synthesize mouse
         // events from finger input, which otherwise causes a "tap" on release
-        // to leave the backlog/Advance text.
+        // to leave the backlog/Advance text.  In the browser it also made
+        // every tap count twice: once for SDL's synthetic click and once for
+        // the click handle_touch_actions() re-injects for the tap gesture.
         SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
 #endif
         av_log_set_level(AV_LOG_ERROR);   // suppress warnings, keep errors
@@ -737,6 +928,19 @@ int main(int argc, char** argv)
         data = *discovered_data;
         SDL_Log("Game data path: %s", data.string().c_str());
         SDL_Log("Game files found, starting engine");
+
+        // Opening an archive reads its header and then its directory, and in
+        // the browser each of those is a round trip - a dozen of them in a
+        // row before the title screen can appear.  One chunk per archive
+        // covers both, and asking for them all here lets them travel at the
+        // same time.
+        // SDT.PAK and FNT.PAK are small enough that the first read pulls
+        // them in whole, so they are not listed here.
+        for (const auto* archive : {
+                 "GRP.PAK", "bak.pak", "bgm.PAK", "SE.PAK", "voice.pak",
+                 "mov.pak"}) {
+            th2::data_prefetch_chunk(data / archive, 0, 1 << 20);
+        }
 
         return Game(data, scenario, soak_directory, soak_runs).run();
     } catch (const std::exception& error) {

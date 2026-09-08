@@ -11,6 +11,10 @@
 #ifdef __ANDROID__
 #include <jni.h>
 #endif
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <cstdlib>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -50,9 +54,12 @@ void Game::push_backlog()
 void Game::open_system_menu()
 {
     if (choosing_) return;
-    play_se(-1, 9104, false, 255);
+    // AVG_GoConfig(0): its own sound, and an open that runs for
+    // AVG_EffCnt(-1) frames, so it follows the effect speed setting and is
+    // instant only when that is set to instant.
+    play_se(-1, 9002, false, 150);
     save_snapshot_ = capture_frame_pixels();
-    begin_transition(1, 12, 128, false);
+    begin_transition(1, 15, 128, false);
     ui_mode_ = UiMode::system_menu;
     menu_highlight_ = 4;
 }
@@ -233,7 +240,10 @@ void Game::update_title()
 
 void Game::close_system_menu()
 {
-    begin_transition(1, 12, 128, false);
+    // AVG_ControlConfigWindow takes its cmax = AVG_EffCnt(-1) once and uses
+    // it for CNF_CLOSE as well as CNF_OPEN, so closing runs as long as
+    // opening.
+    begin_transition(1, 15, 128, false);
     ui_mode_ = UiMode::game;
 }
 
@@ -500,6 +510,60 @@ std::vector<std::uint8_t> Game::build_save_bundle()
     return bundle;
 }
 
+#ifdef __EMSCRIPTEN__
+namespace {
+
+// Browsers have no native file dialogs, so a download and an <input
+// type="file"> stand in for them.  Both still count as a user gesture here
+// because the ImGui button press happened a frame earlier, well inside the
+// transient activation window.
+
+EM_JS(void, web_offer_download,
+    (const char* name, const void* data, int size), {
+    const blob = new Blob([HEAPU8.slice(data, data + size)],
+        {type: "application/octet-stream"});
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = UTF8ToString(name);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+});
+
+// Returns a malloc'd buffer holding the picked file, or null if cancelled.
+// Suspends the wasm stack (JSPI) until the user answers the dialog.
+EM_ASYNC_JS(void*, web_pick_file, (const char* accept, int* size_out), {
+    const file = await new Promise((resolve) => {
+        const input = document.createElement("input");
+        input.type = "file";
+        input.accept = UTF8ToString(accept);
+        input.style.display = "none";
+        document.body.appendChild(input);
+        input.addEventListener("change", () => {
+            resolve(input.files && input.files[0] ? input.files[0] : null);
+            input.remove();
+        });
+        input.addEventListener("cancel", () => {
+            resolve(null);
+            input.remove();
+        });
+        input.click();
+    });
+    if (!file) {
+        return 0;
+    }
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const buffer = _malloc(bytes.length);
+    HEAPU8.set(bytes, buffer);
+    HEAP32[size_out >> 2] = bytes.length;
+    return buffer;
+});
+
+}  // namespace
+#endif
+
 void Game::export_save_bundle(const std::string& selected_path)
 {
     std::string path = selected_path;
@@ -515,7 +579,11 @@ void Game::export_save_bundle(const std::string& selected_path)
 
 void Game::import_save_bundle(const std::string& path)
 {
-    const auto bundle = read_sdl_file(path);
+    apply_save_bundle(read_sdl_file(path));
+}
+
+void Game::apply_save_bundle(const std::vector<std::uint8_t>& bundle)
+{
     constexpr std::string_view magic = "TH2SAVES";
     if (bundle.size() < magic.size() + 12
         || !std::equal(magic.begin(), magic.end(), bundle.begin())) {
@@ -622,7 +690,21 @@ void Game::show_save_bundle_export_dialog()
     save_bundle_dialog_.error.clear();
     save_bundle_dialog_.action = SaveBundleAction::export_bundle;
     save_bundle_status_ = "Waiting for export location...";
-#ifdef __ANDROID__
+#ifdef __EMSCRIPTEN__
+    // Nothing to wait for: the browser takes the bytes straight away.
+    save_bundle_dialog_.active = false;
+    try {
+        const auto bundle = build_save_bundle();
+        web_offer_download(
+            "toheart2-saves.th2saves", bundle.data(),
+            static_cast<int>(bundle.size()));
+        save_bundle_status_ = std::format(
+            "Downloaded save bundle ({} bytes).", bundle.size());
+    } catch (const std::exception& error) {
+        save_bundle_status_ =
+            std::string("Export failed: ") + error.what();
+    }
+#elif defined(__ANDROID__)
     android_save_bundle_export_dialog_ = &save_bundle_dialog_;
     auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
     jclass activity_class =
@@ -675,6 +757,25 @@ void Game::show_save_bundle_import_dialog()
     save_bundle_dialog_.error.clear();
     save_bundle_dialog_.action = SaveBundleAction::import_bundle;
     save_bundle_status_ = "Waiting for bundle selection...";
+#ifdef __EMSCRIPTEN__
+    save_bundle_dialog_.active = false;
+    int size = 0;
+    auto* data = static_cast<std::uint8_t*>(
+        web_pick_file(".th2saves", &size));
+    if (!data) {
+        save_bundle_status_ = "Import cancelled.";
+        return;
+    }
+    const std::vector<std::uint8_t> bundle(data, data + size);
+    std::free(data);
+    try {
+        apply_save_bundle(bundle);
+    } catch (const std::exception& error) {
+        save_bundle_status_ =
+            std::string("Import failed: ") + error.what();
+    }
+    return;
+#else
     static constexpr SDL_DialogFileFilter filters[] = {
         {"ToHeart2 saves", "th2saves"},
         {"All files", "*"},
@@ -682,6 +783,7 @@ void Game::show_save_bundle_import_dialog()
     SDL_ShowOpenFileDialog(
         save_bundle_dialog_callback, &save_bundle_dialog_, window_,
         filters, std::size(filters), nullptr, false);
+#endif
 }
 
 void Game::process_save_bundle_dialog()

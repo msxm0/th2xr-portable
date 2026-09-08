@@ -6,6 +6,13 @@
 #include <memory>
 #include <string>
 
+// Platforms where touch is a first-class input: SDL's synthetic touch-mouse
+// events are turned off there (see the SDL_HINT_TOUCH_MOUSE_EVENTS hint in
+// main()) and ImGui is fed from finger events instead.
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
+#define TH2_IMGUI_TOUCH 1
+#endif
+
 namespace th2 {
 
 class ImGuiLayer {
@@ -27,13 +34,18 @@ public:
     // touch screens. Call once per frame inside the scrollable region.
     void touch_drag_scroll();
 
-    // Direct touch feed for ImGui (position only). Used on Android where SDL
-    // touch-to-mouse synthesis is disabled.
+    // Direct touch feed for ImGui, used on the platforms where SDL's
+    // touch-to-mouse synthesis is disabled (Android, browser).  A finger
+    // down is a held left button, so press-drag-release widgets - the
+    // scrollbar above all - behave the way they do under a mouse.
     void on_touch_down(float normalized_x, float normalized_y);
     void on_touch_motion(
         float normalized_x, float normalized_y,
         float normalized_dx, float normalized_dy);
     void on_touch_up(float normalized_x, float normalized_y);
+
+    // Forget a touch that never lifted (focus loss, fullscreen change).
+    void on_touch_cancel();
 
 private:
     void apply_mobile_style(float scale);
@@ -42,6 +54,7 @@ private:
     SDL_Renderer* renderer_;
     bool touch_scroll_active_ = false;
     bool touch_down_ = false;
+    float touch_drag_distance_ = 0.0f;
     std::uint64_t last_frame_ticks_ = 0;
     std::string imgui_font_path_;
     float display_scale_ = 1.0f;

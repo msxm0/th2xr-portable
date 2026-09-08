@@ -2,13 +2,17 @@
 #
 # Usage:
 #   make desktop          # configure and build via CMake preset (does not test)
+#   make web-deps         # build the wasm dependencies (once, needs emsdk)
+#   make web              # build the browser engine into build/web
+#   make serve-web        # serve build/web on the LAN
 #   make run              # build and run the desktop executable
 #   make android          # build the Android debug APK
 #   make install-android  # install the debug APK on a connected device
 #   make test             # build and run the desktop test suite
 #   make clean            # remove all build artifacts
 
-.PHONY: all desktop run android install-android test clean clean-desktop clean-android logcat
+.PHONY: all desktop run android install-android test clean clean-desktop \
+	clean-android logcat web web-deps serve-web
 
 # Default target builds both desktop and Android.
 all: desktop android
@@ -37,6 +41,28 @@ test: desktop
 # Remove the preset and manual build trees.
 clean-desktop:
 	rm -rf build/
+
+# -----------------------------------------------------------------------------
+# Web (WebAssembly) build
+# -----------------------------------------------------------------------------
+
+WEB_BUILD_DIR := build/web
+WEB_PORT ?= 8080
+
+# Build the dependencies for wasm32-emscripten (one-off; needs emsdk on PATH).
+web-deps:
+	./ci/build-wasm-third-party.sh
+
+# Configure and build the browser engine.  The game data is not bundled; it
+# is streamed from the server at run time.
+web:
+	cmake --preset web
+	cmake --build --preset web
+
+# Serve the engine and the game data over the LAN.
+serve-web:
+	./tools/serve-web.py --port $(WEB_PORT) --directory $(WEB_BUILD_DIR) \
+		--game-data $(GAME_DATA_DIR)
 
 # -----------------------------------------------------------------------------
 # Android build

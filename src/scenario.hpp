@@ -11,6 +11,10 @@ namespace th2 {
 class Scenario {
 public:
     static constexpr std::size_t block_count = 256;
+    // Signature, declared size and the block table, ahead of the bytecode.
+    static constexpr std::size_t header_size =
+        2 * sizeof(std::uint16_t) + sizeof(std::uint32_t)
+        + block_count * sizeof(std::uint32_t);
 
     explicit Scenario(std::span<const std::uint8_t> bytes);
 

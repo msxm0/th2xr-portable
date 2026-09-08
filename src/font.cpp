@@ -1,16 +1,20 @@
 #include "font.hpp"
 
 #include <SDL3_ttf/SDL_ttf.h>
-#ifndef __ANDROID__
+#ifdef TH2_USE_FONTCONFIG
 #include <fontconfig/fontconfig.h>
 #endif
 #include <iconv.h>
 
 #include <algorithm>
 #include <array>
+#include <ranges>
+#include <utility>
+#include <vector>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <span>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -185,83 +189,104 @@ struct GameFont::Modern {
         }
     };
 
+    // A face plus, on Android, the buffer it was opened from: SDL_ttf reads
+    // from that memory for as long as the font is open.
+    struct Face {
+        TTF_Font* font = nullptr;
+#ifdef __ANDROID__
+        std::unique_ptr<void, decltype(&SDL_free)> data{nullptr, &SDL_free};
+#endif
+        Face() = default;
+        Face(const Face&) = delete;
+        Face& operator=(const Face&) = delete;
+        Face(Face&& other) noexcept { *this = std::move(other); }
+        Face& operator=(Face&& other) noexcept
+        {
+            close();
+            font = std::exchange(other.font, nullptr);
+#ifdef __ANDROID__
+            data = std::move(other.data);
+#endif
+            return *this;
+        }
+        ~Face() { close(); }
+        void close()
+        {
+            if (font) {
+                TTF_CloseFont(font);
+                font = nullptr;
+            }
+#ifdef __ANDROID__
+            data.reset();
+#endif
+        }
+    };
+
     TTF_Font* font = nullptr;
+    Face primary;
+    // Consulted, in order, for glyphs the chosen font does not have - the
+    // music note the script uses for singing, most visibly.
+    std::vector<Face> fallbacks;
     std::string family;
     int logical_size = 0;
     float scale = 0.0f;
     std::unordered_map<
         std::string, std::unique_ptr<SDL_Texture, TextureDeleter>> textures;
-#ifdef __ANDROID__
-    std::unique_ptr<void, decltype(&SDL_free)> font_data_{nullptr, &SDL_free};
+
+#ifdef TH2_BUNDLED_FONT_PATH
+    // Without fontconfig the choice of font is the set of files that ship
+    // with the app, so the family names the options list offers map straight
+    // onto them.
+    static std::string bundled_font_path(std::string_view family)
+    {
+        for (const auto& [name, path] : GameFont::bundled_fonts()) {
+            if (family == name) {
+                return std::string(path);
+            }
+        }
+        return TH2_BUNDLED_FONT_PATH;
+    }
 #endif
 
-    ~Modern()
+    // Resolves a family name (or a path) to a font file.
+    static std::string resolve_path(std::string_view family)
     {
-        if (font) {
-            TTF_CloseFont(font);
+        std::string path(family);
+        if (std::filesystem::is_regular_file(path)) {
+            return path;
         }
+#ifdef TH2_BUNDLED_FONT_PATH
+        return bundled_font_path(family);
+#else
+        FcPattern* pattern = FcNameParse(
+            reinterpret_cast<const FcChar8*>(path.c_str()));
+        if (!pattern) {
+            throw std::runtime_error("cannot parse font family");
+        }
+        FcConfigSubstitute(nullptr, pattern, FcMatchPattern);
+        FcDefaultSubstitute(pattern);
+        FcResult result = FcResultNoMatch;
+        FcPattern* match = FcFontMatch(nullptr, pattern, &result);
+        FcPatternDestroy(pattern);
+        FcChar8* matched_path = nullptr;
+        if (!match
+            || FcPatternGetString(match, FC_FILE, 0, &matched_path)
+                != FcResultMatch) {
+            if (match) {
+                FcPatternDestroy(match);
+            }
+            throw std::runtime_error(
+                "font family not found: " + std::string(family));
+        }
+        path = reinterpret_cast<const char*>(matched_path);
+        FcPatternDestroy(match);
+        return path;
+#endif
     }
 
-    void open(
-        std::string_view requested_family, int requested_size,
-        float requested_scale)
+    static Face open_face(const std::string& path, float size)
     {
-        static const bool initialized = [] {
-            if (!TTF_Init()) {
-                throw std::runtime_error(SDL_GetError());
-            }
-#ifndef __ANDROID__
-            if (!FcInit()) {
-                throw std::runtime_error("fontconfig initialization failed");
-            }
-#endif
-            return true;
-        }();
-        (void)initialized;
-        if (font && family == requested_family
-            && logical_size == requested_size
-            && std::abs(scale - requested_scale) < 0.01f) {
-            return;
-        }
-        if (font) {
-            TTF_CloseFont(font);
-            font = nullptr;
-        }
-#ifdef __ANDROID__
-        font_data_.reset();
-#endif
-        textures.clear();
-
-        std::string path(requested_family);
-        if (!std::filesystem::is_regular_file(path)) {
-#ifdef __ANDROID__
-            path = TH2_ANDROID_FONT_PATH;
-#else
-            FcPattern* pattern = FcNameParse(
-                reinterpret_cast<const FcChar8*>(path.c_str()));
-            if (!pattern) {
-                throw std::runtime_error("cannot parse font family");
-            }
-            FcConfigSubstitute(nullptr, pattern, FcMatchPattern);
-            FcDefaultSubstitute(pattern);
-            FcResult result = FcResultNoMatch;
-            FcPattern* match = FcFontMatch(nullptr, pattern, &result);
-            FcPatternDestroy(pattern);
-            FcChar8* matched_path = nullptr;
-            if (!match
-                || FcPatternGetString(
-                       match, FC_FILE, 0, &matched_path) != FcResultMatch) {
-                if (match) {
-                    FcPatternDestroy(match);
-                }
-                throw std::runtime_error(
-                    "font family not found: " + std::string(requested_family));
-            }
-            path = reinterpret_cast<const char*>(matched_path);
-            FcPatternDestroy(match);
-#endif
-        }
-
+        Face face;
 #ifdef __ANDROID__
         std::size_t font_data_size = 0;
         void* font_data = SDL_LoadFile(path.c_str(), &font_data_size);
@@ -277,27 +302,98 @@ struct GameFont::Modern {
                 std::string("SDL_IOFromConstMem failed for ") + path + ": "
                 + SDL_GetError());
         }
-        // TTF_OpenFontIO takes ownership of the IO stream and (with closeio=true)
-        // will free the const memory reference; we still need to free font_data
-        // because SDL_IOFromConstMem does not copy it. Keep the data alive by
-        // storing it in the Modern object.
-        font_data_ = std::unique_ptr<void, decltype(&SDL_free)>(
+        // TTF_OpenFontIO takes the stream, but not the memory behind it, so
+        // the buffer is kept alongside the face.
+        face.data = std::unique_ptr<void, decltype(&SDL_free)>(
             font_data, &SDL_free);
-        font = TTF_OpenFontIO(font_io, true, requested_size * requested_scale);
-        if (!font) {
-            font_data_.reset();
-            throw std::runtime_error(
-                std::string("TTF_OpenFontIO failed for ") + path + ": "
-                + SDL_GetError());
-        }
+        face.font = TTF_OpenFontIO(font_io, true, size);
 #else
-        font = TTF_OpenFont(path.c_str(), requested_size * requested_scale);
-        if (!font) {
+        face.font = TTF_OpenFont(path.c_str(), size);
+#endif
+        if (!face.font) {
             throw std::runtime_error(
-                std::string("TTF_OpenFont failed for ") + path + ": "
+                std::string("cannot open font ") + path + ": "
                 + SDL_GetError());
         }
+        return face;
+    }
+
+    // The families tried, in order, for a glyph the chosen font is missing.
+    static std::vector<std::string> fallback_paths(const std::string& primary)
+    {
+        std::vector<std::string> paths;
+        // The scripts reach past Latin for the odd symbol - stars and music
+        // notes as speech decoration, fullwidth punctuation standing in for
+        // swearing - and only a Japanese font carries the whole set.
+#ifdef TH2_BUNDLED_FONT_PATH
+        const std::array<std::string_view, 3> candidates{
+            TH2_BUNDLED_IMGUI_FONT_PATH,     // Noto Sans
+            "fonts/NotoSansJP-Variable.ttf",  // symbols and fullwidth forms
+            TH2_BUNDLED_FONT_PATH,           // Liberation Serif
+        };
+#else
+        // fontconfig substitutes rather than failing, so several spellings
+        // of the Japanese font are tried; the duplicates it resolves to the
+        // same file as an earlier entry are dropped below.
+        const std::array<std::string_view, 4> candidates{
+            "Noto Sans", "Noto Sans CJK JP", "Noto Sans JP",
+            "Liberation Serif"};
 #endif
+        for (const auto candidate : candidates) {
+            try {
+                auto path = resolve_path(candidate);
+                if (path != primary
+                    && std::ranges::find(paths, path) == paths.end()) {
+                    paths.push_back(std::move(path));
+                }
+            } catch (const std::exception&) {
+                // A fallback that is not installed is simply not used.
+            }
+        }
+        return paths;
+    }
+
+    void open(
+        std::string_view requested_family, int requested_size,
+        float requested_scale)
+    {
+        static const bool initialized = [] {
+            if (!TTF_Init()) {
+                throw std::runtime_error(SDL_GetError());
+            }
+#ifdef TH2_USE_FONTCONFIG
+            if (!FcInit()) {
+                throw std::runtime_error("fontconfig initialization failed");
+            }
+#endif
+            return true;
+        }();
+        (void)initialized;
+        if (font && family == requested_family
+            && logical_size == requested_size
+            && std::abs(scale - requested_scale) < 0.01f) {
+            return;
+        }
+        // The fallbacks must outlive the font that refers to them, so the
+        // whole set is torn down together.
+        font = nullptr;
+        primary.close();
+        fallbacks.clear();
+        textures.clear();
+
+        const auto path = resolve_path(requested_family);
+        const float pixel_size = requested_size * requested_scale;
+        primary = open_face(path, pixel_size);
+        for (const auto& fallback : fallback_paths(path)) {
+            try {
+                auto face = open_face(fallback, pixel_size);
+                if (TTF_AddFallbackFont(primary.font, face.font)) {
+                    fallbacks.push_back(std::move(face));
+                }
+            } catch (const std::exception&) {
+            }
+        }
+        font = primary.font;
         TTF_SetFontHinting(font, TTF_HINTING_LIGHT_SUBPIXEL);
         family = requested_family;
         logical_size = requested_size;
@@ -435,12 +531,54 @@ float GameFont::text_width(std::string_view text) const
     }
 }
 
+float GameFont::line_height() const
+{
+    if (authentic_) {
+        return 0.0f;
+    }
+    try {
+        modern_->open(family_, font_size_, framebuffer_scale_);
+        return static_cast<float>(TTF_GetFontLineSkip(modern_->font))
+            / framebuffer_scale_;
+    } catch (const std::exception&) {
+        return 0.0f;
+    }
+}
+
+float GameFont::ascent() const
+{
+    if (authentic_) {
+        return 0.0f;
+    }
+    try {
+        modern_->open(family_, font_size_, framebuffer_scale_);
+        return static_cast<float>(TTF_GetFontAscent(modern_->font))
+            / framebuffer_scale_;
+    } catch (const std::exception&) {
+        return 0.0f;
+    }
+}
+
+std::span<const GameFont::BundledFont> GameFont::bundled_fonts()
+{
+    // Files under android/app/src/main/assets/fonts, which the Android build
+    // packages as assets and the web build preloads at /fonts.
+    static constexpr std::array<BundledFont, 3> fonts{{
+        {"Liberation Serif", "fonts/LiberationSerif-Regular.ttf"},
+        {"Roboto", "fonts/Roboto-Variable.ttf"},
+        {"Ubuntu", "fonts/Ubuntu-Regular.ttf"},
+    }};
+    return fonts;
+}
+
 const std::vector<std::string>& GameFont::system_families()
 {
     static const std::vector<std::string> families = [] {
         std::vector<std::string> result;
-#ifdef __ANDROID__
-        result.emplace_back("Liberation Serif");
+#ifndef TH2_USE_FONTCONFIG
+        for (const auto& font : bundled_fonts()) {
+            result.emplace_back(font.family);
+        }
 #else
         if (!FcInit()) {
             return result;

@@ -119,9 +119,13 @@ bool Game::handle(const th2::Event& event)
             number(event, 2), number(event, 3),
             number(event, 4), number(event, 5) + 3);
     } else if (name == "WaitFrame") {
+        // AVG_EffCnt4 counts these in 30fps units (cnt * Avg.frame / 30
+        // frames, i.e. cnt/30 seconds at any frame rate), unlike the effect
+        // durations, which are 60fps based.  The values in the scripts agree:
+        // 15, 30, 60, 90, 120 are half a second through five seconds.
         const int frames = std::max<std::int32_t>(0, number(event, 0));
         wake_time_ = std::chrono::steady_clock::now()
-            + std::chrono::milliseconds(frames * 1000 / 60);
+            + std::chrono::milliseconds(frames * 1000 / 30);
     } else if (name == "WaitTime") {
         const auto now = static_cast<std::uint32_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -232,7 +236,7 @@ bool Game::handle(const th2::Event& event)
                     character->locate;
                 animation.from_alpha = animation.to_alpha =
                     character->alpha;
-                message_visible_ = false;
+                hide_message_for_animation();
                 start_character_animation(
                     character_number, std::move(animation));
             }
@@ -249,7 +253,7 @@ bool Game::handle(const th2::Event& event)
                 character_staged_[character_index(character_number)] = true;
                 return true;
             }
-            message_visible_ = false;
+            hide_message_for_animation();
             CharacterAnimation animation;
             animation.kind = CharacterAnimationKind::pose;
             animation.type = number(event, 2) < 0 ? 0 : number(event, 2);
@@ -266,7 +270,7 @@ bool Game::handle(const th2::Event& event)
         }
     } else if (name == "CL") {
         if (auto* character = characters_.find(number(event, 0))) {
-            message_visible_ = false;
+            hide_message_for_animation();
             CharacterAnimation animation;
             animation.kind = CharacterAnimationKind::locate;
             animation.frames = name == "CL" ? number(event, 2) : -1;
@@ -279,6 +283,7 @@ bool Game::handle(const th2::Event& event)
         }
     } else if (name == "SetMessage2") {
         push_backlog();
+        message_scroll_follow_ = true;
         message_.set(th2::substitute_player_name(
             text(event, 0), player_name_,
             runtime_.flag(213) != 0));
@@ -726,6 +731,10 @@ void Game::advance(bool skipping)
             }
         }
     }
+    // The interpreter has stopped for now, which is exactly when there is
+    // time to fetch what it will ask for next.  The scan itself happens on
+    // the next frame (see iterate()); this only asks for it.
+    prefetch_scan_pending_ = true;
     // Autosave after advancing past a block end, if enabled and enough time has passed.
     if (just_advanced_past_block_end_) {
         just_advanced_past_block_end_ = false;

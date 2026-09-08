@@ -15,6 +15,16 @@ if(ANDROID)
     set(ENV{PKG_CONFIG_PATH} "${CMAKE_SOURCE_DIR}/third_party/ffmpeg-android/lib/pkgconfig")
 endif()
 
+if(EMSCRIPTEN)
+    # The engine relies on C++ exceptions, which emcc leaves disabled by
+    # default.  Native wasm exception handling needs to be on for every
+    # translation unit, so set it globally before any target is defined.
+    add_compile_options(-fwasm-exceptions)
+    add_link_options(-fwasm-exceptions)
+    # Dependencies come from ci/build-wasm-third-party.sh, which installs
+    # into the Emscripten sysroot, so the finds below need no extra hints.
+endif()
+
 find_package(SDL3 CONFIG REQUIRED)
 find_package(PkgConfig REQUIRED)
 if(ANDROID)
@@ -54,18 +64,25 @@ else()
         add_library(SQLite3::SQLite3 ALIAS SQLite::SQLite3)
     endif()
 endif()
-if(WIN32)
+if(EMSCRIPTEN)
+    # No SDL_GPU backend in the browser: the anime4k upscaler compiles in but
+    # reports itself unavailable at runtime, so no SPIR-V is built.
+elseif(WIN32)
     find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED
         HINTS "${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows/tools/glslang")
 else()
     find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
 endif()
 
-if(NOT ANDROID)
+if(ANDROID)
+    find_package(SDL3_ttf CONFIG REQUIRED)
+elseif(EMSCRIPTEN)
+    pkg_check_modules(SDL3_TTF REQUIRED IMPORTED_TARGET sdl3-ttf)
+    # Static SDL3_ttf does not pull in its own dependency.
+    pkg_check_modules(FREETYPE REQUIRED IMPORTED_TARGET freetype2)
+else()
     pkg_check_modules(SDL3_TTF REQUIRED IMPORTED_TARGET sdl3-ttf)
     pkg_check_modules(FONTCONFIG REQUIRED IMPORTED_TARGET fontconfig)
-else()
-    find_package(SDL3_ttf CONFIG REQUIRED)
 endif()
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
     libavformat libavcodec libavutil libswscale libswresample)
@@ -90,9 +107,17 @@ if(ANDROID)
     link_directories(${FFMPEG_LIBRARY_DIRS})
 endif()
 
+add_library(th2_data
+    src/data_source.cpp
+)
+target_include_directories(th2_data PUBLIC src)
+target_compile_options(th2_data PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>)
+
 add_library(th2_archive
     src/archive.cpp
 )
+target_link_libraries(th2_archive PUBLIC th2_data)
 target_include_directories(th2_archive PUBLIC src)
 target_compile_options(th2_archive PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>>)
@@ -140,7 +165,7 @@ add_library(th2_config
     src/player_name.cpp
 )
 target_include_directories(th2_config PUBLIC src)
-target_link_libraries(th2_config PUBLIC SQLite3::SQLite3)
+target_link_libraries(th2_config PUBLIC SQLite3::SQLite3 th2_data)
 target_compile_options(th2_config PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>)
 
 add_library(th2_soak
@@ -158,6 +183,9 @@ add_library(imgui
 target_include_directories(imgui PUBLIC third_party/imgui)
 target_compile_options(imgui PRIVATE -w)
 
+# Developer command line tools and the conformance generator run on the
+# build host, so they are skipped for the browser build.
+if(NOT EMSCRIPTEN)
 add_executable(th2-archive-info
     src/archive_info.cpp
 )
@@ -202,8 +230,9 @@ add_custom_command(
     VERBATIM)
 add_custom_target(th2-conformance ALL
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/conformance/999999999.SDT")
+endif()
 
-if(BUILD_TESTING)
+if(BUILD_TESTING AND NOT EMSCRIPTEN)
     add_executable(th2-scenario-test
         src/scenario_test.cpp
     )
@@ -255,6 +284,7 @@ if(BUILD_TESTING)
 
 endif()
 
+if(NOT EMSCRIPTEN)
 add_executable(th2-sdl-smoke
     src/sdl_smoke.cpp
     src/image.cpp
@@ -266,6 +296,7 @@ add_executable(th2-image-info
     src/image.cpp
 )
 target_link_libraries(th2-image-info PRIVATE SDL3::SDL3 th2_archive)
+endif()
 
 if(ANDROID)
     add_library(toheart2 SHARED
@@ -279,6 +310,7 @@ if(ANDROID)
         src/game_map.cpp
         src/game_media.cpp
         src/game_omake_input.cpp
+        src/game_prefetch.cpp
         src/gamepad_input.cpp
         src/game_render_effects.cpp
         src/game_render_main.cpp
@@ -309,6 +341,7 @@ else()
         src/game_map.cpp
         src/game_media.cpp
         src/game_omake_input.cpp
+        src/game_prefetch.cpp
         src/gamepad_input.cpp
         src/game_render_effects.cpp
         src/game_render_main.cpp
@@ -329,6 +362,7 @@ else()
 endif()
 set(ANIME4K_SHADER_DIR "shaders/anime4k")
 set(ANIME4K_SHADERS apply)
+if(NOT EMSCRIPTEN)
 foreach(SHADER IN LISTS ANIME4K_SHADERS)
     add_custom_command(
         OUTPUT "${ANIME4K_SHADER_DIR}/${SHADER}.frag.spv"
@@ -371,24 +405,27 @@ if(ANDROID)
     add_custom_target(anime4k-shaders-android DEPENDS ${ANDROID_SHADER_ASSET_OUTPUTS})
     add_dependencies(toheart2 anime4k-shaders-android)
 endif()
-if(ANDROID)
+endif()
+target_compile_definitions(toheart2 PRIVATE
+    TH2_ANIME4K_SHADER_DIR="${ANIME4K_SHADER_DIR}"
+    TH2_VERSION="${TH2_VERSION}")
+if(ANDROID OR EMSCRIPTEN)
+    # No fontconfig on these platforms; the fonts ship with the app.
     target_compile_definitions(toheart2 PRIVATE
-        TH2_ANIME4K_SHADER_DIR="${ANIME4K_SHADER_DIR}"
-        TH2_VERSION="${TH2_VERSION}"
-        TH2_ANDROID_FONT_PATH="fonts/LiberationSerif-Regular.ttf"
-        TH2_ANDROID_IMGUI_FONT_PATH="fonts/NotoSans-Regular.ttf")
+        TH2_BUNDLED_FONT_PATH="fonts/LiberationSerif-Regular.ttf"
+        TH2_BUNDLED_IMGUI_FONT_PATH="fonts/NotoSans-Regular.ttf")
 else()
-    target_compile_definitions(toheart2 PRIVATE
-        TH2_ANIME4K_SHADER_DIR="${ANIME4K_SHADER_DIR}"
-        TH2_VERSION="${TH2_VERSION}")
+    target_compile_definitions(toheart2 PRIVATE TH2_USE_FONTCONFIG=1)
 endif()
 
+if(NOT EMSCRIPTEN)
 add_executable(th2-anime4k-test
     src/anime4k.cpp
     src/anime4k_test.cpp
 )
 add_dependencies(th2-anime4k-test anime4k-shaders)
 target_link_libraries(th2-anime4k-test PRIVATE SDL3::SDL3)
+endif()
 if(ANDROID)
     target_link_libraries(toheart2 PRIVATE
         SDL3::SDL3 SDL3_ttf::SDL3_ttf th2_runtime th2_soak)
@@ -396,6 +433,10 @@ if(ANDROID)
     target_link_options(toheart2 PRIVATE
         "-Wl,-z,max-page-size=16384"
         "-Wl,-z,common-page-size=16384")
+elseif(EMSCRIPTEN)
+    target_link_libraries(toheart2 PRIVATE
+        SDL3::SDL3 PkgConfig::SDL3_TTF PkgConfig::FREETYPE
+        th2_runtime th2_soak)
 else()
     target_link_libraries(toheart2 PRIVATE
         SDL3::SDL3 PkgConfig::SDL3_TTF PkgConfig::FONTCONFIG th2_runtime th2_soak)
@@ -403,14 +444,48 @@ endif()
 target_link_libraries(toheart2 PRIVATE th2_audio th2_character th2_config imgui)
 target_link_libraries(toheart2 PRIVATE PkgConfig::FFMPEG ZSTD::ZSTD)
 
+if(EMSCRIPTEN)
+    set_target_properties(toheart2 PROPERTIES SUFFIX ".html")
+    target_link_options(toheart2 PRIVATE
+        -sUSE_SDL=0
+        -sALLOW_MEMORY_GROWTH=1
+        -sINITIAL_MEMORY=268435456
+        -sMAXIMUM_MEMORY=2147483648
+        -sSTACK_SIZE=4194304
+        -sFORCE_FILESYSTEM=1
+        -sEXIT_RUNTIME=0
+        -sINVOKE_RUN=0
+        -sENVIRONMENT=web
+        -sMIN_WEBGL_VERSION=2
+        -sMAX_WEBGL_VERSION=2
+        -sGL_ENABLE_GET_PROC_ADDRESS=1
+        -sASSERTIONS=1
+        -sEXPORTED_RUNTIME_METHODS=callMain,FS,IDBFS
+        # web_pick_file() allocates the picked file from JS.
+        -sEXPORTED_FUNCTIONS=_main,_malloc,_free
+        # The game data is several gigabytes, so it is streamed from the
+        # server with HTTP range requests instead of being packaged.  JSPI
+        # suspends the wasm stack across each fetch, which keeps the engine's
+        # synchronous file reads working unchanged.
+        -sJSPI
+        -lidbfs.js
+        "SHELL:--shell-file ${CMAKE_CURRENT_SOURCE_DIR}/web/shell.html"
+        # SHELL: keeps CMake from collapsing the repeated --preload-file flags.
+        "SHELL:--preload-file ${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/assets/fonts@/fonts")
+    set_property(TARGET toheart2 APPEND PROPERTY LINK_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/web/shell.html")
+endif()
+
+if(NOT EMSCRIPTEN)
 add_executable(th2-video-test
     src/video_test.cpp
     src/video.cpp
 )
 target_link_libraries(th2-video-test PRIVATE
     th2_archive SDL3::SDL3 PkgConfig::FFMPEG)
+endif()
 
-if(BUILD_TESTING)
+if(BUILD_TESTING AND NOT EMSCRIPTEN)
     add_executable(th2-character-test
         src/character_test.cpp
     )
@@ -460,7 +535,7 @@ if(BUILD_TESTING)
         src/icon.cpp
         src/icon_test.cpp
     )
-    target_link_libraries(th2-icon-test PRIVATE SDL3::SDL3)
+    target_link_libraries(th2-icon-test PRIVATE SDL3::SDL3 th2_data)
     add_test(
         NAME executable-icon
         COMMAND th2-icon-test

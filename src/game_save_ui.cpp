@@ -10,6 +10,7 @@
 #include <zstd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -451,7 +452,7 @@ void Game::handle_system_menu_input(const SDL_Event& event)
             close_system_menu();
         } else if (is_confirm_key(event.key.key)) {
             const int item = menu_highlight_;
-            if (enabled(item)) {
+            if (item >= 0 && enabled(item)) {
                 play_se(-1, 9014, false, 255);
                 close_system_menu();
                 execute_menu_item(item);
@@ -480,6 +481,9 @@ void Game::handle_system_menu_input(const SDL_Event& event)
         }
     } else if (event.type == SDL_EVENT_MOUSE_MOTION) {
         const float mx = event.motion.x; const float my = event.motion.y;
+        // Same rule as the title menu: the highlight is whatever the cursor
+        // is over, and nothing when it is over none of them.
+        menu_highlight_ = -1;
         for (int i = 0; i < 5; ++i) {
             if (mx >= dst_x[i] && mx < dst_x[i] + dst_w[i]
                 && my >= dst_y[i] && my < dst_y[i] + dst_h[i]
@@ -489,7 +493,7 @@ void Game::handle_system_menu_input(const SDL_Event& event)
             }
         }
     }
-    if (menu_highlight_ != previous_highlight) {
+    if (menu_highlight_ != previous_highlight && menu_highlight_ >= 0) {
         play_se(-1, 9108, false, 255);
     }
 }
@@ -608,7 +612,7 @@ void Game::draw_backlog()
     }
 
     SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 128);
+    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, message_backdrop_alpha());
     const SDL_FRect game_area{0.0f, 0.0f, 800.0f, 600.0f};
     SDL_RenderFillRect(renderer_, &game_area);
 
@@ -622,7 +626,12 @@ void Game::draw_backlog()
 
     const float x = message_text_x();
     float y = message_text_y();
-    for (const auto& line : display_lines(selected)) {
+    const auto lines = display_lines(selected);
+    backlog_scroll_ = std::clamp(
+        backlog_scroll_, 0, message_scroll_limit(lines.size()));
+    for (std::size_t index = static_cast<std::size_t>(backlog_scroll_);
+         index < lines.size(); ++index) {
+        const auto& line = lines[index];
         if (authentic) {
             font_.draw_authentic_shadow(renderer_, x, y, line);
         } else {
@@ -630,10 +639,11 @@ void Game::draw_backlog()
         }
         font_.draw(renderer_, x, y, line, 255, 144, 32);
         y += text_line_height();
-        if (y > 535.0f) {
+        if (y > message_bottom_y) {
             break;
         }
     }
+    draw_scrollbar(lines.size(), backlog_scroll_, backlog_scroll_dragging_);
     if (entry && backlog_voice_hover_ >= 0
         && backlog_voice_hover_
             < static_cast<int>(entry->voices.size())) {
@@ -641,7 +651,8 @@ void Game::draw_backlog()
         for (const auto& rect :
              backlog_voice_rects(*entry, backlog_voice_hover_)) {
             const auto line = static_cast<std::size_t>(
-                (rect.y - message_text_y()) / text_line_height());
+                (rect.y - message_text_y()) / text_line_height())
+                + static_cast<std::size_t>(backlog_scroll_);
             if (line >= lines.size()) {
                 continue;
             }
@@ -670,6 +681,21 @@ void Game::draw_backlog()
     }
 }
 
+std::string_view Game::backlog_view_text() const
+{
+    if (backlog_depth_ > 0
+        && backlog_depth_ <= static_cast<int>(backlog_.size())) {
+        return backlog_[
+            backlog_.size() - static_cast<std::size_t>(backlog_depth_)].text;
+    }
+    return message_.visible();
+}
+
+std::vector<std::string> Game::backlog_view_lines() const
+{
+    return display_lines(backlog_view_text());
+}
+
 std::vector<SDL_FRect> Game::backlog_voice_rects(
     const Game::BacklogEntry& entry, int voice_index) const
 {
@@ -682,7 +708,8 @@ std::vector<SDL_FRect> Game::backlog_voice_rects(
     const auto start = std::min(voice.start, entry.text.size());
     const auto end = std::clamp(voice.end, start, entry.text.size());
     std::size_t source_cursor = 0;
-    float y = message_text_y();
+    float y = message_text_y()
+        - static_cast<float>(backlog_scroll_) * text_line_height();
     for (const auto& line : display_lines(entry.text)) {
         auto line_start =
             std::string_view(entry.text).find(line, source_cursor);
@@ -710,14 +737,47 @@ std::vector<SDL_FRect> Game::backlog_voice_rects(
     return result;
 }
 
+// The lower track in sys0000.tga sets how opaque the message backdrop is.
+// Its artwork is a preview of the effect: transparent at the top, solid at
+// the bottom, so the handle position maps straight onto the alpha.
+namespace {
+constexpr float opacity_track_top = 492.0f;
+constexpr float opacity_track_height = 98.0f;
+// sys0001.tga row 9 (y=257, 6 px tall) is the flat handle this bar uses;
+// the 30 px capsule at the top of the sheet belongs to the scrollbar.
+constexpr float opacity_handle_source_y = 257.0f;
+constexpr float opacity_handle_height = 6.0f;
+
+// GM_AvgMsg.cpp positions this handle at RectY[9] + (128 - half_tone), so
+// the top of the track is the untouched background and the bottom is the
+// darkest setting.
+float opacity_handle_y(int half_tone)
+{
+    const int offset = std::clamp(
+        th2::GameConfig::max_message_half_tone - half_tone, 0,
+        static_cast<int>(opacity_track_height - opacity_handle_height));
+    return opacity_track_top + static_cast<float>(offset);
+}
+}  // namespace
+
 void Game::draw_sidebar()
 {
     if (!ui_sidebar_track_ || !ui_sidebar_btns_) return;
 
+    // Fade by elapsed time rather than by frame, the same way the sakura
+    // petals step: the browser build renders at the display refresh rate,
+    // which is often not 60 Hz.  A stall is clamped so the fade cannot jump.
+    const auto now = std::chrono::steady_clock::now();
+    const float steps = std::clamp(
+        static_cast<float>(
+            std::chrono::duration<double>(now - sidebar_alpha_updated_).count()
+            * 60.0),
+        0.0f, 8.0f);
+    sidebar_alpha_updated_ = now;
     switch (config_.sidebar_mode) {
     case 0:
         sidebar_alpha_ = std::clamp(
-            sidebar_alpha_ + (sidebar_mouse_near_ ? 24.0f : -24.0f),
+            sidebar_alpha_ + steps * (sidebar_mouse_near_ ? 24.0f : -24.0f),
             64.0f, 255.0f);
         break;
     case 1:
@@ -725,7 +785,7 @@ void Game::draw_sidebar()
         break;
     case 2:
         sidebar_alpha_ = std::clamp(
-            sidebar_alpha_ + (sidebar_mouse_near_ ? 32.0f : -32.0f),
+            sidebar_alpha_ + steps * (sidebar_mouse_near_ ? 32.0f : -32.0f),
             0.0f, 255.0f);
         break;
     default:
@@ -759,6 +819,18 @@ void Game::draw_sidebar()
         const SDL_FRect hdl_dst{776.0f, handle_y, 22.0f, 30.0f};
         SDL_RenderTexture(renderer_, ui_sidebar_btns_.get(),
                           &hdl_src, &hdl_dst);
+    }
+
+    {
+        const float state = opacity_handle_dragging_ ? 3.0f
+            : opacity_handle_hover_ ? 2.0f : 1.0f;
+        const SDL_FRect src{
+            state * 22.0f, opacity_handle_source_y,
+            22.0f, opacity_handle_height};
+        const SDL_FRect dst{
+            776.0f, opacity_handle_y(config_.message_half_tone),
+            22.0f, opacity_handle_height};
+        SDL_RenderTexture(renderer_, ui_sidebar_btns_.get(), &src, &dst);
     }
 
     struct SBBtn { int y; int source_y; int h; };
@@ -797,6 +869,7 @@ void Game::update_sidebar_hover(float x, float y)
 {
     sidebar_mouse_near_ = x >= 776.0f;
     backlog_handle_hover_ = false;
+    opacity_handle_hover_ = false;
     const int previous_hover = sidebar_hover_;
     sidebar_hover_ = -1;
     if (config_.sidebar_mode == 3) {
@@ -813,6 +886,9 @@ void Game::update_sidebar_hover(float x, float y)
         backlog_handle_hover_ =
             y >= handle_y && y < handle_y + 30.0f;
     }
+    opacity_handle_hover_ =
+        y >= opacity_track_top
+        && y < opacity_track_top + opacity_track_height;
     static constexpr std::array button_y{
         271, 312, 353, 376, 399, 422, 445, 468,
     };
@@ -833,7 +909,7 @@ void Game::update_sidebar_hover(float x, float y)
     }
 }
 
-bool Game::handle_sidebar_click(float x, float y)
+bool Game::handle_sidebar_click(float x, float y, bool activate_buttons)
 {
     if (config_.sidebar_mode == 3) {
         return false;
@@ -846,6 +922,12 @@ bool Game::handle_sidebar_click(float x, float y)
         set_backlog_from_sidebar_y(y);
         return true;
     }
+    if (y >= opacity_track_top
+        && y < opacity_track_top + opacity_track_height) {
+        opacity_handle_dragging_ = true;
+        set_message_alpha_from_sidebar_y(y);
+        return true;
+    }
 
     struct Hitbox { int y; int h; };
     static constexpr Hitbox buttons[] = {
@@ -855,6 +937,9 @@ bool Game::handle_sidebar_click(float x, float y)
     for (int i = 0; i < static_cast<int>(std::size(buttons)); ++i) {
         if (y < buttons[i].y || y >= buttons[i].y + buttons[i].h) {
             continue;
+        }
+        if (!activate_buttons) {
+            return true;
         }
         switch (i) {
         case 0:
@@ -901,8 +986,36 @@ bool Game::handle_sidebar_click(float x, float y)
     return true;
 }
 
+void Game::set_message_alpha_from_sidebar_y(float y)
+{
+    // Dragging the handle counts as being on the bar: without this the fade
+    // keeps running while the finger works the slider, because the motion
+    // handler goes straight to the drag and never updates the hover.
+    sidebar_mouse_near_ = true;
+    const int travel = static_cast<int>(
+        opacity_track_height - opacity_handle_height);
+    const int offset = std::clamp(
+        static_cast<int>(std::lround(
+            y - opacity_track_top - opacity_handle_height / 2.0f)),
+        0, travel);
+    config_.message_half_tone =
+        th2::GameConfig::max_message_half_tone - offset;
+}
+
+void Game::finish_sidebar_drag()
+{
+    backlog_handle_dragging_ = false;
+    message_scroll_dragging_ = false;
+    backlog_scroll_dragging_ = false;
+    if (opacity_handle_dragging_) {
+        opacity_handle_dragging_ = false;
+        th2::save_config(config_path_, config_);
+    }
+}
+
 void Game::set_backlog_from_sidebar_y(float y)
 {
+    sidebar_mouse_near_ = true;  // see set_message_alpha_from_sidebar_y()
     if (backlog_.empty()) {
         backlog_depth_ = 0;
         ui_mode_ = UiMode::game;
@@ -921,6 +1034,7 @@ void Game::set_backlog_from_sidebar_y(float y)
             (1.0f - ratio) * static_cast<float>(backlog_.size()))),
         0, static_cast<int>(backlog_.size()));
     backlog_voice_hover_ = -1;
+    backlog_scroll_ = 0;
     ui_mode_ = backlog_depth_ == 0 ? UiMode::game : UiMode::backlog;
 }
 
@@ -950,12 +1064,25 @@ void Game::handle_backlog_input(const SDL_Event& event)
             close_backlog();
             return;
         }
-        if (event.button.which != SDL_TOUCH_MOUSEID
-            && handle_sidebar_click(event.button.x, event.button.y)) {
+        if (handle_sidebar_click(event.button.x, event.button.y)) {
+            suppress_sidebar_mouse_up_ = true;
+            return;
+        }
+        if (handle_backlog_scroll_press(event.button.x, event.button.y)) {
+            suppress_sidebar_mouse_up_ = true;
             return;
         }
     } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
         if (event.button.button == SDL_BUTTON_LEFT) {
+            // A press on the sidebar scroll handle or one of its buttons
+            // switches to backlog mode, so its release arrives here rather
+            // than in the game-mode handler.  Releasing a scroll drag or a
+            // scroll button must not count as a click on the backlog.
+            if (suppress_sidebar_mouse_up_) {
+                suppress_sidebar_mouse_up_ = false;
+                finish_sidebar_drag();
+                return;
+            }
             if (backlog_voice_hover_ >= 0
                 && backlog_depth_ > 0
                 && backlog_depth_
@@ -972,7 +1099,7 @@ void Game::handle_backlog_input(const SDL_Event& event)
             }
             close_backlog();
         }
-        backlog_handle_dragging_ = false;
+        finish_sidebar_drag();
     } else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
         if (event.wheel.y > 0) {
             backlog_older();
@@ -982,6 +1109,14 @@ void Game::handle_backlog_input(const SDL_Event& event)
     } else if (event.type == SDL_EVENT_MOUSE_MOTION) {
         if (backlog_handle_dragging_) {
             set_backlog_from_sidebar_y(event.motion.y);
+            return;
+        }
+        if (opacity_handle_dragging_) {
+            set_message_alpha_from_sidebar_y(event.motion.y);
+            return;
+        }
+        if (backlog_scroll_dragging_) {
+            set_backlog_scroll_from_y(event.motion.y);
             return;
         }
         update_sidebar_hover(event.motion.x, event.motion.y);

@@ -34,6 +34,18 @@
       "description": "Release build with tests and strict compiler warnings",
       "inherits": "desktop-release",
       "binaryDir": "${sourceDir}/build/ci"
+    },
+    {
+      "name": "web",
+      "displayName": "Web (WebAssembly)",
+      "description": "Emscripten release build; needs emsdk on PATH",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/web",
+      "toolchainFile": "$env{EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "BUILD_TESTING": "OFF"
+      }
     }
   ],
   "buildPresets": [
@@ -50,6 +62,11 @@
     {
       "name": "ci",
       "configurePreset": "ci",
+      "jobs": 0
+    },
+    {
+      "name": "web",
+      "configurePreset": "web",
       "jobs": 0
     }
   ],

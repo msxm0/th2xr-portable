@@ -150,9 +150,10 @@ std::vector<ToneCurveSpec> Game::character_tone_curves() const
     return result;
 }
 
-int Game::character_effect_frames(int frames)
+int Game::character_effect_frames(int frames) const
 {
-    return frames < 0 ? 15 : std::max(frames, 0);
+    // Character animations go through AVG_EffCnt() as well.
+    return effect_frames(frames);
 }
 
 bool Game::character_animation_active() const
@@ -181,6 +182,18 @@ void Game::start_character_animation(
     character_animations_[index] = std::move(animation);
 }
 
+void Game::hide_message_for_animation()
+{
+    // GM_AvgChar.cpp closes the message window for the duration of a
+    // character animation and reopens it when the animation ends, through a
+    // flag that remembers whether it was up (the win_flag around
+    // AVG_CloseWindow / AVG_OpenWindow).  Without the reopening the text
+    // stays gone until the script happens to print the next line, which
+    // leaves the screen bare if it waits for input first.
+    message_restore_after_animation_ |= message_visible_;
+    message_visible_ = false;
+}
+
 void Game::update_character_animations()
 {
     bool resume = false;
@@ -203,6 +216,10 @@ void Game::update_character_animations()
         }
         resume |= animation.blocking;
         animation = {};
+    }
+    if (message_restore_after_animation_ && !character_animation_active()) {
+        message_restore_after_animation_ = false;
+        message_visible_ = true;
     }
     if (resume) {
         advance();
@@ -239,7 +256,7 @@ void Game::set_character(const th2::Event& event)
         : number(event, 3) == -2 ? -1
         : number(event, 3) < 0 ? 0 : number(event, 3);
     if (animation_type != 3) {
-        message_visible_ = false;
+        hide_message_for_animation();
     }
     CharacterAnimation animation;
     animation.from_locate = previous ? previous->locate : locate;
