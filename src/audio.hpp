@@ -33,8 +33,12 @@ public:
     AudioDecoder& operator=(const AudioDecoder&) = delete;
 
     // Decodes until the budget is spent or the input ends, and returns true
-    // once there is nothing left.  A zero budget decodes the rest in one go.
+    // once there is nothing left.  A budget that has already run out does
+    // nothing: an exhausted budget must not read as "no limit", or a caller
+    // that is out of time ends up decoding the whole file.
     bool decode(std::chrono::nanoseconds budget);
+    // The whole of what is left, however long that takes.
+    bool decode_all();
     bool done() const { return done_; }
 
     // The format is known as soon as the decoder exists, so a stream can be

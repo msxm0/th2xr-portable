@@ -365,7 +365,7 @@ void Game::update_audio_decode()
     // A channel playing ahead of its own decoder comes first: falling behind
     // there is an audible dropout, not merely a slower read-ahead.
     const auto feed = [&](th2::AudioChannel& channel) {
-        if (channel.starving() && remaining() > std::chrono::nanoseconds::zero()) {
+        if (channel.starving()) {
             channel.decoder()->decode(remaining());
         }
     };
@@ -391,6 +391,9 @@ void Game::update_audio_decode()
            && remaining() > std::chrono::nanoseconds::zero()) {
         auto& request = audio_decode_queue_.front();
         try {
+            // Building the decoder reads the file, which on a streaming
+            // build can suspend, so the budget has to be re-read after it
+            // rather than assumed to be the one the loop tested.
             auto decoder = audio_decoder(
                 *request.archive, request.name, request.rank);
             if (decoder->decode(remaining())) {

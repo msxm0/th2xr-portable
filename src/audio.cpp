@@ -203,16 +203,23 @@ AudioDecoder::AudioDecoder(std::vector<std::uint8_t> bytes)
 
 AudioDecoder::~AudioDecoder() = default;
 
+bool AudioDecoder::decode_all()
+{
+    return decode(std::chrono::nanoseconds::max());
+}
+
 bool AudioDecoder::decode(std::chrono::nanoseconds budget)
 {
     if (done_) {
         return true;
     }
+    if (budget <= std::chrono::nanoseconds::zero()) {
+        return false;  // Out of time, not unlimited.
+    }
     auto& state = *state_;
     const auto started = std::chrono::steady_clock::now();
     const auto spent = [&] {
-        return budget > std::chrono::nanoseconds::zero()
-            && std::chrono::steady_clock::now() - started >= budget;
+        return std::chrono::steady_clock::now() - started >= budget;
     };
 
     while (!state.drained) {
@@ -269,7 +276,7 @@ bool AudioDecoder::decode(std::chrono::nanoseconds budget)
 
 AudioClip AudioDecoder::take()
 {
-    decode(std::chrono::nanoseconds::zero());
+    decode_all();
     return std::move(clip_);
 }
 
