@@ -953,13 +953,15 @@ bool Game::handle_sidebar_click(float x, float y, bool activate_buttons)
         case 2:
             if (replay_mode_) break;
             play_se(-1, 9104, false, 255);
-            save_snapshot_ = capture_frame_pixels();
+            save_snapshot_ = capture_frame_thumbnail(
+    save_thumbnail_width, save_thumbnail_height);
             open_save_load(UiMode::save);
             break;
         case 3:
             if (replay_mode_) break;
             play_se(-1, 9104, false, 255);
-            save_snapshot_ = capture_frame_pixels();
+            save_snapshot_ = capture_frame_thumbnail(
+    save_thumbnail_width, save_thumbnail_height);
             open_save_load(UiMode::load);
             break;
         case 4:

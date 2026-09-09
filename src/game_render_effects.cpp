@@ -58,6 +58,53 @@ Surface Game::capture_frame_pixels(bool art_only)
     return Surface(converted);
 }
 
+Surface Game::capture_frame_thumbnail(int width, int height)
+{
+    Texture small(SDL_CreateTexture(
+        renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET,
+        width, height));
+    if (!small) {
+        throw std::runtime_error(SDL_GetError());
+    }
+    SDL_Texture* art = upscaler_->art_target();
+    SDL_ScaleMode art_scale = SDL_SCALEMODE_LINEAR;
+    SDL_GetTextureScaleMode(art, &art_scale);
+    // Linear, because this is a big reduction; nearest would alias badly.
+    SDL_SetTextureScaleMode(art, SDL_SCALEMODE_LINEAR);
+    // A straight copy, not a blend.  The art target carries no useful alpha,
+    // so blending it over an empty target yields a black thumbnail - which
+    // reading the pixels back directly never did.
+    SDL_BlendMode art_blend = SDL_BLENDMODE_BLEND;
+    SDL_GetTextureBlendMode(art, &art_blend);
+    SDL_SetTextureBlendMode(art, SDL_BLENDMODE_NONE);
+
+    SDL_Texture* previous_target = SDL_GetRenderTarget(renderer_);
+    float scale_x = 1.0f;
+    float scale_y = 1.0f;
+    SDL_GetRenderScale(renderer_, &scale_x, &scale_y);
+    SDL_SetRenderTarget(renderer_, small.get());
+    SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
+    const bool drawn = SDL_RenderTexture(renderer_, art, nullptr, nullptr);
+    SDL_Surface* raw = drawn
+        ? SDL_RenderReadPixels(renderer_, nullptr) : nullptr;
+    SDL_SetRenderTarget(renderer_, previous_target);
+    SDL_SetRenderScale(renderer_, scale_x, scale_y);
+    SDL_SetTextureScaleMode(art, art_scale);
+    SDL_SetTextureBlendMode(art, art_blend);
+    if (!raw) {
+        throw std::runtime_error(SDL_GetError());
+    }
+    Surface captured(raw);
+    if (raw->format == SDL_PIXELFORMAT_RGBA32) {
+        return captured;
+    }
+    Surface converted(SDL_ConvertSurface(raw, SDL_PIXELFORMAT_RGBA32));
+    if (!converted) {
+        throw std::runtime_error(SDL_GetError());
+    }
+    return converted;
+}
+
 Texture Game::capture_frame_texture()
 {
     SDL_Texture* source = upscaler_->art_target();

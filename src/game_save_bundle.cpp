@@ -58,7 +58,8 @@ void Game::open_system_menu()
     // AVG_EffCnt(-1) frames, so it follows the effect speed setting and is
     // instant only when that is set to instant.
     play_se(-1, 9002, false, 150);
-    save_snapshot_ = capture_frame_pixels();
+    save_snapshot_ = capture_frame_thumbnail(
+    save_thumbnail_width, save_thumbnail_height);
     begin_transition(1, 15, 128, false, EffectTiming::menu);
     ui_mode_ = UiMode::system_menu;
     menu_highlight_ = 4;

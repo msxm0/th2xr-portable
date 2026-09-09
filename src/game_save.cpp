@@ -84,13 +84,12 @@ std::filesystem::path Game::metadata_path(int slot) const
 void Game::save_preview(int slot)
 {
     if (save_snapshot_) {
-        Surface thumbnail(SDL_CreateSurface(160, 120, SDL_PIXELFORMAT_RGBA32));
-        if (thumbnail
-            && SDL_BlitSurfaceScaled(
-                save_snapshot_.get(), nullptr, thumbnail.get(), nullptr,
-                SDL_SCALEMODE_LINEAR)) {
-            SDL_SaveBMP(thumbnail.get(), thumbnail_path(slot).string().c_str());
-        }
+        // Captured straight to thumbnail size on the GPU.  That size comes
+        // from the art target, which is fixed, so it does not vary with the
+        // window or the display's pixel ratio - and the save screen scales
+        // whatever it loads into its slot anyway.
+        SDL_SaveBMP(
+            save_snapshot_.get(), thumbnail_path(slot).string().c_str());
     }
     std::ofstream metadata(metadata_path(slot));
     if (metadata) {

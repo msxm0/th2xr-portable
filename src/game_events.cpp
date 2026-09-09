@@ -753,7 +753,8 @@ void Game::advance(bool skipping)
             if (last_save_time_.time_since_epoch().count() == 0
                 || now - last_save_time_ >= minimum_interval) {
                 if (!save_snapshot_) {
-                    save_snapshot_ = capture_frame_pixels();
+                    save_snapshot_ = capture_frame_thumbnail(
+    save_thumbnail_width, save_thumbnail_height);
                 }
                 perform_autosave();
                 // Refresh the save snapshot so the next autosave has an

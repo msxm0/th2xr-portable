@@ -17,12 +17,13 @@ namespace th2 {
 // through, and SDL hands out the GL name behind a texture.  This runs the
 // blend there instead, with no readback at all.
 //
-// It is best-effort by design: if the context, the shader or the texture
-// handles are not what it expects, available() is false and the caller keeps
-// the CPU path.
+// It is best-effort by design: if the renderer is not a GL one, or the
+// shader or the texture handles are not what it expects, available() is
+// false and the caller keeps the CPU path.  That covers the browser and
+// Android today, and anything else SDL draws through GL.
 class GlPatternTransition {
 public:
-    GlPatternTransition();
+    explicit GlPatternTransition(SDL_Renderer* renderer);
     ~GlPatternTransition();
 
     GlPatternTransition(const GlPatternTransition&) = delete;

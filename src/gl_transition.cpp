@@ -1,16 +1,22 @@
 #include "gl_transition.hpp"
 
+// Built where SDL draws through GLES and the headers are known to exist.
+// Nothing here depends on the canvas size: the quad is in clip space and the
+// textures are sampled with normalised coordinates, so it behaves the same
+// on a phone screen as on a desktop one.
 #ifdef __EMSCRIPTEN__
+#define TH2_GL_TRANSITION 1
 #include <GLES3/gl3.h>
 #endif
 
 #include <SDL3/SDL_log.h>
 
 #include <string>
+#include <string_view>
 
 namespace th2 {
 
-#ifdef __EMSCRIPTEN__
+#ifdef TH2_GL_TRANSITION
 
 namespace {
 
@@ -166,9 +172,30 @@ struct GlPatternTransition::Impl {
     }
 };
 
-GlPatternTransition::GlPatternTransition()
-    : impl_(std::make_unique<Impl>())
+namespace {
+
+// SDL only guarantees these calls are meaningful when it is itself drawing
+// through GL or GLES.  With the GPU renderer (Vulkan, D3D12, Metal) the
+// context does not exist and the texture handles mean nothing.
+bool renderer_uses_gl(SDL_Renderer* renderer)
 {
+    const char* name = SDL_GetRendererName(renderer);
+    if (!name) {
+        return false;
+    }
+    const std::string_view driver(name);
+    return driver == "opengl" || driver == "opengles2"
+        || driver == "opengles";
+}
+
+}  // namespace
+
+GlPatternTransition::GlPatternTransition(SDL_Renderer* renderer)
+    : impl_(renderer_uses_gl(renderer) ? std::make_unique<Impl>() : nullptr)
+{
+    if (!impl_) {
+        SDL_Log("pattern wipe shader: renderer is not GL, keeping the CPU blend");
+    }
 }
 
 GlPatternTransition::~GlPatternTransition() = default;
@@ -224,11 +251,11 @@ bool GlPatternTransition::draw(
     return glGetError() == GL_NO_ERROR;
 }
 
-#else  // Desktop keeps the CPU path; SDL_GPU is the route to a shader there.
+#else  // No GL headers here; SDL_GPU is the route to a shader instead.
 
 struct GlPatternTransition::Impl {};
 
-GlPatternTransition::GlPatternTransition() = default;
+GlPatternTransition::GlPatternTransition(SDL_Renderer*) {}
 GlPatternTransition::~GlPatternTransition() = default;
 bool GlPatternTransition::available() const { return false; }
 

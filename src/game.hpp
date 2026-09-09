@@ -769,6 +769,12 @@ private:
     // SDL_RenderReadPixels is a pipeline sync: it waits for everything
     // queued to finish, which at high DPI cost 20-40ms a wipe.
     Texture capture_frame_texture();
+    // The save file only keeps a small thumbnail, so scaling on the GPU and
+    // reading that back moves a fraction of the pixels through what is still
+    // a pipeline sync.
+    Surface capture_frame_thumbnail(int width, int height);
+    static constexpr int save_thumbnail_width = 160;
+    static constexpr int save_thumbnail_height = 120;
     Texture texture_from_surface(SDL_Surface* surface);
     void retire_soak_gpu_work(bool force = false);
     std::vector<std::uint8_t> load_transition_mask(

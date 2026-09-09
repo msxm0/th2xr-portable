@@ -332,7 +332,8 @@ void Game::execute_menu_item(int index)
 void Game::open_save_load(UiMode mode)
 {
     if (!save_snapshot_) {
-        save_snapshot_ = capture_frame_pixels();
+        save_snapshot_ = capture_frame_thumbnail(
+    save_thumbnail_width, save_thumbnail_height);
     }
     save_return_mode_ =
         ui_mode_ == UiMode::title ? UiMode::title : UiMode::game;

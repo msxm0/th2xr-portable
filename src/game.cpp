@@ -645,11 +645,13 @@ void Game::iterate()
                     message_visible_ = !message_visible_;
                 } else if (event.key.key == SDLK_F5
                            && !replay_mode_) {
-                    save_snapshot_ = capture_frame_pixels();
+                    save_snapshot_ = capture_frame_thumbnail(
+    save_thumbnail_width, save_thumbnail_height);
                     save(0);
                 } else if (event.key.key == SDLK_F7
                            && !replay_mode_) {
-                    save_snapshot_ = capture_frame_pixels();
+                    save_snapshot_ = capture_frame_thumbnail(
+    save_thumbnail_width, save_thumbnail_height);
                     open_save_load(UiMode::load);
                 } else if (event.key.key == SDLK_F11) {
                     toggle_fullscreen();
@@ -799,7 +801,7 @@ void Game::iterate()
         // Built on the first drawn frame, once the renderer's context is
         // current.  If the shader will not build, available() stays false
         // and every wipe keeps the CPU blend.
-        gl_transition_ = std::make_unique<th2::GlPatternTransition>();
+        gl_transition_ = std::make_unique<th2::GlPatternTransition>(renderer_);
         SDL_Log(
             "pattern wipes: %s",
             gl_transition_->available() ? "GPU shader" : "CPU blend");

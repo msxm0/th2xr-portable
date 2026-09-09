@@ -591,7 +591,8 @@ void Game::activate_title_item()
         begin_title_exit(true);
         break;
     case 1:
-        save_snapshot_ = capture_frame_pixels();
+        save_snapshot_ = capture_frame_thumbnail(
+    save_thumbnail_width, save_thumbnail_height);
         open_save_load(UiMode::load);
         break;
     case 2:
