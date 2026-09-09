@@ -217,6 +217,16 @@ int Game::effect_frames(int frames) const
     return count * std::clamp(config_.effect_speed, 0, 4);
 }
 
+// Every frame count a script passes is authored in 30fps units: AVG_EffCnt2,
+// AVG_EffCnt3 and AVG_EffCnt4 all return cnt * Avg.frame / 30, and AVG_EffCnt
+// lands on the same duration at the default effect speed.  Audio fades go
+// through AVG_EffCnt3 and AVG_EffCnt4 (GM_Avg.cpp:2335, 2371, 2410), which
+// the effect-speed setting does not scale.
+std::chrono::milliseconds Game::audio_fade_duration(int frames)
+{
+    return std::chrono::milliseconds(std::max(0, frames) * 1000 / 30);
+}
+
 // Text runs from message_text_x() to the same distance short of the sidebar,
 // so the gap on the right matches the one on the left.
 float Game::message_text_width() const
@@ -276,6 +286,21 @@ std::size_t Game::utf8_character_count(std::string_view text)
         text.begin(), text.end(), [](unsigned char byte) {
             return (byte & 0xc0) != 0x80;
         });
+}
+
+// AVG_ControlSelectWindow types the options out at the message speed
+// (SelectWindow.cnt += AVG_MsgCnt()) and clips each one with
+// DSP_SetTextCount(cnt - j*4), so each option starts four characters after
+// the one above it.  Returns how many characters of this option to show.
+int Game::choice_reveal_count(int index) const
+{
+    if (config_.text_speed_ms <= 0 || !choice_reveal_started_) {
+        return std::numeric_limits<int>::max();
+    }
+    const auto elapsed = std::chrono::duration<float, std::milli>(
+        std::chrono::steady_clock::now() - *choice_reveal_started_).count();
+    return static_cast<int>(elapsed / static_cast<float>(config_.text_speed_ms))
+        - index * 4;
 }
 
 void Game::start_text_reveal(std::size_t start)

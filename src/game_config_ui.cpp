@@ -144,9 +144,11 @@ void Game::draw_config()
                     0, 100, "%d ms/character");
                 {
                     // The original offers these four multipliers on every
-                    // effect duration (Avg.wait).
+                    // effect duration (Avg.wait).  Its normal setting, and
+                    // ours, is 2 - Avg.wait starts at MES_NORMAL - so 1 is
+                    // the fast one, not the default.
                     static constexpr std::array labels{
-                        "Instant", "Normal", "Slow", "Slowest"};
+                        "Instant", "Fast", "Normal", "Slow"};
                     const auto& speeds = th2::GameConfig::effect_speeds;
                     int current = 1;
                     for (int i = 0; i < static_cast<int>(speeds.size()); ++i) {

@@ -86,12 +86,15 @@ bool Game::handle(const th2::Event& event)
             number(event, 0), number(event, 1), number(event, 2),
             number(event, 3));
     } else if (name == "F") {
+        // AVG_SetFlash runs two AVG_ColtrolFade legs, both counted by
+        // AVG_EffCnt, so the effect-speed setting scales them like any other
+        // effect.
         screen_flash_ = ScreenFlash{
             std::clamp(number(event, 0), 0, 255),
             std::clamp(number(event, 1), 0, 255),
             std::clamp(number(event, 2), 0, 255),
-            std::max(1, number(event, 3)),
-            std::max(1, number(event, 4)),
+            std::max(1, effect_frames(number(event, 3))),
+            std::max(1, effect_frames(number(event, 4))),
             std::chrono::steady_clock::now(),
         };
     } else if (name == "Q" || name == "SetShake") {
@@ -102,7 +105,9 @@ bool Game::handle(const th2::Event& event)
         shake_ = ShakeState{
             number(event, 0),
             number(event, 1),
-            std::max(0, number(event, 2)),
+            // AVG_EffCnt4: the script's count is in 30fps units.  Zero still
+            // means an endless shake, which AVG_ControlShake never retires.
+            std::max(0, number(event, 2)) * 2,
             number(event, 3),
             event.arguments.size() > 4 && number(event, 4) >= 0
                 ? number(event, 4) : 256,
@@ -334,7 +339,7 @@ bool Game::handle(const th2::Event& event)
         const int fade = number(event, 1) < 0 ? 0 : number(event, 1);
         if (music < 0) {
             bgm_.fade_to(
-                0.0f, std::chrono::milliseconds(fade * 1000 / 60), true);
+                0.0f, audio_fade_duration(fade), true);
             bgm_track_ = -1;
         } else {
             const int loop = number(event, 2) < 0 ? 1 : number(event, 2);
@@ -344,20 +349,20 @@ bool Game::handle(const th2::Event& event)
                 bgm_.set_gain(0.0f);
                 bgm_.fade_to(
                     bgm_gain(volume),
-                    std::chrono::milliseconds(fade * 1000 / 60));
+                    audio_fade_duration(fade));
             }
         }
     } else if (name == "MS") {
         const int fade = number(event, 0) < 0 ? 0 : number(event, 0);
         bgm_.fade_to(
-            0.0f, std::chrono::milliseconds(fade * 1000 / 60), true);
+            0.0f, audio_fade_duration(fade), true);
         bgm_track_ = -1;
     } else if (name == "MV") {
         bgm_volume_ = number(event, 0);
         const int fade = number(event, 1) < 0 ? 0 : number(event, 1);
         bgm_.fade_to(
             bgm_gain(bgm_volume_),
-            std::chrono::milliseconds(fade * 1000 / 60));
+            audio_fade_duration(fade));
     } else if (name == "MW") {
         if (bgm_.fading()) {
             audio_wait_ = AudioWait{AudioWaitKind::bgm, 0};
@@ -375,7 +380,7 @@ bool Game::handle(const th2::Event& event)
         if (channel >= 0 && static_cast<std::size_t>(channel) < se_channels_.size()) {
             const int fade = number(event, 1) < 0 ? 0 : number(event, 1);
             se_channels_[channel].fade_to(
-                0.0f, std::chrono::milliseconds(fade * 1000 / 60), true);
+                0.0f, audio_fade_duration(fade), true);
             se_sound_[channel] = -1;
         }
     } else if (name == "SEV") {
@@ -385,7 +390,7 @@ bool Game::handle(const th2::Event& event)
             const int fade = number(event, 2) < 0 ? 0 : number(event, 2);
             se_channels_[channel].fade_to(
                 se_gain(se_volume_[channel]),
-                std::chrono::milliseconds(fade * 1000 / 60));
+                audio_fade_duration(fade));
         }
     } else if (name == "SEW") {
         const auto channel = number(event, 0);
@@ -410,7 +415,7 @@ bool Game::handle(const th2::Event& event)
         if (channel >= 0 && static_cast<std::size_t>(channel) < voice_channels_.size()) {
             const int fade = number(event, 0) < 0 ? 0 : number(event, 0);
             voice_channels_[channel].fade_to(
-                0.0f, std::chrono::milliseconds(fade * 1000 / 60), true);
+                0.0f, audio_fade_duration(fade), true);
             voice_sound_[channel] = -1;
         }
     } else if (name == "VW") {
@@ -432,6 +437,7 @@ bool Game::handle(const th2::Event& event)
         choice_result_register_ =
             std::get<th2::RegisterTarget>(event.arguments.at(0)).index;
         choosing_ = true;
+        choice_reveal_started_ = std::chrono::steady_clock::now();
         choice_highlight_ = 0;
         choice_selected_ = -1;
     } else if (name == "SetMapEvent") {

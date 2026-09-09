@@ -302,7 +302,7 @@ void Game::play_se(int channel, int sound, bool loop, int volume, int fade,
         if (fade > 0) {
             se_channels_[channel].fade_to(
                 se_gain(volume),
-                std::chrono::milliseconds(fade * 1000 / 60));
+                audio_fade_duration(fade));
         }
         se_sound_[channel] = sound;
         se_loop_[channel] = loop;

@@ -923,14 +923,27 @@ void Game::draw_frame()
         float y = choice_y_start();
         for (int i = 0; i < static_cast<int>(choices_.size()); ++i) {
             const auto highlighted = i == choice_highlight_;
+            int budget = choice_reveal_count(i);
             for (const auto& line : choice_lines(choices_[i], i)) {
-                font_.draw(
-                    renderer_, 34.0f, y + 2.0f, line, 0, 0, 0);
-                font_.draw(
-                    renderer_, 32.0f, y, line,
-                    highlighted ? 255 : 128,
-                    highlighted ? 255 : 128,
-                    highlighted ? 255 : 128);
+                const auto count = static_cast<int>(
+                    utf8_character_count(line));
+                // The line keeps its slot whether or not it has arrived yet,
+                // so the options do not slide up the screen as they type.
+                if (budget > 0) {
+                    const std::string_view shown = budget >= count
+                        ? std::string_view(line)
+                        : std::string_view(line).substr(
+                            0, utf8_prefix_bytes(
+                                line, static_cast<std::size_t>(budget)));
+                    font_.draw(
+                        renderer_, 34.0f, y + 2.0f, shown, 0, 0, 0);
+                    font_.draw(
+                        renderer_, 32.0f, y, shown,
+                        highlighted ? 255 : 128,
+                        highlighted ? 255 : 128,
+                        highlighted ? 255 : 128);
+                }
+                budget -= count;
                 y += text_line_height();
             }
         }

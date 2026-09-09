@@ -519,6 +519,8 @@ private:
     };
     bool choosing_ = false;
     std::vector<Choice> choices_;
+    std::optional<std::chrono::steady_clock::time_point>
+        choice_reveal_started_;
     int choice_highlight_ = 0;
     int choice_selected_ = -1;
     int choice_result_register_ = -1;
@@ -722,6 +724,7 @@ private:
     // Scales an effect's frame count by the effect speed setting; 0 makes
     // it instant, which is what the original does while skipping too.
     int effect_frames(int frames) const;
+    static std::chrono::milliseconds audio_fade_duration(int frames);
     float text_line_height() const;
     std::vector<std::string> display_lines(std::string_view source) const;
     float message_text_x() const;
@@ -729,6 +732,7 @@ private:
     static std::size_t utf8_prefix_bytes(
         std::string_view text, std::size_t characters);
     static std::size_t utf8_character_count(std::string_view text);
+    int choice_reveal_count(int index) const;
     void start_text_reveal(std::size_t start);
     bool finish_text_reveal();
     void skip(bool force_unread = false);
