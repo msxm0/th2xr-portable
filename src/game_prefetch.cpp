@@ -72,6 +72,20 @@ int Game::prefetch_event_assets(
         return 1;
     };
 
+    // Audio needs decoding as well as fetching, and decoding reads the bytes,
+    // so the decode is only worth queuing once they have landed.  Scans
+    // repeat while the player reads, so an asset fetched by one scan gets its
+    // decode queued by the next.
+    const auto request_audio = [&](const th2::Archive& archive,
+                                   std::string_view asset) {
+        const int requested = request(archive, asset);
+        if (const auto* entry = archive.find(asset);
+            entry && archive.resident(*entry)) {
+            request_audio_decode(archive, asset, rank);
+        }
+        return requested;
+    };
+
     const auto& name = event.instruction.name;
     if (name == "C" || name == "CW" || name == "CP") {
         // Character sprites: a pose change is one archive entry, and a scene
@@ -85,6 +99,16 @@ int Game::prefetch_event_assets(
             graphics_, th2::character_asset_name(*character, *pose));
     }
     if (name == "B" || name == "BT" || name == "BC" || name == "BCT") {
+        // A pattern wipe needs its mask prepared as well as its background
+        // fetched, and preparing one is an LZS decompress plus a walk over
+        // every pixel - too much for the frame the wipe starts on.
+        if (const auto* change = literal(event, 0);
+            change && *change >= 0x80) {
+            request(graphics_, std::format("f0{:03d}.bmp", *change & 0x7f));
+            if (!transition_masks_.contains(*change)) {
+                pending_transition_masks_.insert(*change);
+            }
+        }
         const auto* scene_high = literal(event, 1);
         const auto* scene_low = literal(event, 2);
         if (!scene_high || *scene_high < 0) {
@@ -132,13 +156,13 @@ int Game::prefetch_event_assets(
         // loop pair, so ask for whichever exists.
         const auto single = std::format("BGM_{:03d}.OGG", *track);
         if (bgm_archive_.find(single)) {
-            return request(bgm_archive_, single);
+            return request_audio(bgm_archive_, single);
         }
         const auto loop = literal(event, 2);
-        int requests = request(
+        int requests = request_audio(
             bgm_archive_, std::format("BGM_{:03d}_A.OGG", *track));
         if (!loop || *loop != 0) {
-            requests += request(
+            requests += request_audio(
                 bgm_archive_, std::format("BGM_{:03d}_B.OGG", *track));
         }
         return requests;
@@ -148,7 +172,8 @@ int Game::prefetch_event_assets(
         if (!sound || *sound < 0) {
             return 0;
         }
-        return request(se_archive_, std::format("SE_{:04d}.WAV", *sound));
+        return request_audio(
+            se_archive_, std::format("SE_{:04d}.WAV", *sound));
     }
     if (name == "VV" || name == "VA" || name == "VB" || name == "VC") {
         const auto* character_argument = literal(event, 0);
@@ -174,10 +199,10 @@ int Game::prefetch_event_assets(
             const auto alternate = std::format(
                 "K{:09d}_{:03d}{:03d}A.OGG", scenario, *voice, character);
             if (voice_archive_.find(alternate)) {
-                return request(voice_archive_, alternate);
+                return request_audio(voice_archive_, alternate);
             }
         }
-        return request(voice_archive_, standard);
+        return request_audio(voice_archive_, standard);
     }
     return 0;
 }
@@ -364,6 +389,7 @@ void Game::prefetch_upcoming_assets()
         return;
     }
     prefetch_follow_pending_ = false;
+    prepare_pending_transition_mask();
     for (const auto& target : targets) {
         if (requests >= request_budget) {
             break;

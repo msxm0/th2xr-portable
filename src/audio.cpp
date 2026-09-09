@@ -111,22 +111,20 @@ void append_frame(
 
 }  // namespace
 
-AudioClip decode_audio(std::span<const std::uint8_t> bytes)
-{
-    MemoryInput input{bytes};
-
-    AVFrame* frame = av_frame_alloc();
-    AVPacket* packet = av_packet_alloc();
-    if (!frame || !packet) {
-        throw std::bad_alloc();
-    }
-
+struct AudioDecoder::State {
+    std::vector<std::uint8_t> bytes;
+    MemoryInput input{};
+    AVFrame* frame = nullptr;
+    AVPacket* packet = nullptr;
     AVIOContext* io = nullptr;
     AVFormatContext* format = nullptr;
     AVCodecContext* codec = nullptr;
     SwrContext* resampler = nullptr;
+    int stream_index = -1;
+    bool drained = false;
 
-    auto cleanup = [&]() {
+    ~State()
+    {
         swr_free(&resampler);
         avcodec_free_context(&codec);
         if (format) {
@@ -138,106 +136,148 @@ AudioClip decode_audio(std::span<const std::uint8_t> bytes)
         }
         av_packet_free(&packet);
         av_frame_free(&frame);
+    }
+};
+
+AudioDecoder::AudioDecoder(std::vector<std::uint8_t> bytes)
+    : state_(std::make_unique<State>())
+{
+    auto& state = *state_;
+    state.bytes = std::move(bytes);
+    // State is heap allocated and never moved, so the span stays valid.
+    state.input.bytes = state.bytes;
+
+    state.frame = av_frame_alloc();
+    state.packet = av_packet_alloc();
+    if (!state.frame || !state.packet) {
+        throw std::bad_alloc();
+    }
+    auto* io_buffer = static_cast<std::uint8_t*>(av_malloc(64 * 1024));
+    if (!io_buffer) {
+        throw std::bad_alloc();
+    }
+    state.io = avio_alloc_context(
+        io_buffer, 64 * 1024, 0, &state.input, read_packet, nullptr,
+        seek_packet);
+    state.format = avformat_alloc_context();
+    if (!state.io || !state.format) {
+        throw std::bad_alloc();
+    }
+    state.format->pb = state.io;
+    state.format->flags |= AVFMT_FLAG_CUSTOM_IO;
+
+    int result = avformat_open_input(&state.format, nullptr, nullptr, nullptr);
+    if (result < 0) {
+        throw ffmpeg_error("open audio", result);
+    }
+    result = avformat_find_stream_info(state.format, nullptr);
+    if (result < 0) {
+        throw ffmpeg_error("read audio streams", result);
+    }
+    state.stream_index = av_find_best_stream(
+        state.format, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    if (state.stream_index < 0) {
+        throw std::runtime_error("audio file has no audio stream");
+    }
+    state.codec = open_codec(state.format, state.stream_index);
+    if (state.codec->sample_rate <= 0
+        || state.codec->ch_layout.nb_channels <= 0) {
+        throw std::runtime_error("invalid audio stream");
+    }
+
+    const int channels = state.codec->ch_layout.nb_channels;
+    AVChannelLayout output_layout;
+    av_channel_layout_default(&output_layout, channels);
+    result = swr_alloc_set_opts2(
+        &state.resampler, &output_layout, AV_SAMPLE_FMT_FLT,
+        state.codec->sample_rate, &state.codec->ch_layout,
+        state.codec->sample_fmt, state.codec->sample_rate, 0, nullptr);
+    av_channel_layout_uninit(&output_layout);
+    if (result < 0 || swr_init(state.resampler) < 0) {
+        throw std::runtime_error("cannot create audio resampler");
+    }
+
+    clip_.sample_rate = state.codec->sample_rate;
+    clip_.channels = channels;
+}
+
+AudioDecoder::~AudioDecoder() = default;
+
+bool AudioDecoder::decode(std::chrono::nanoseconds budget)
+{
+    if (done_) {
+        return true;
+    }
+    auto& state = *state_;
+    const auto started = std::chrono::steady_clock::now();
+    const auto spent = [&] {
+        return budget > std::chrono::nanoseconds::zero()
+            && std::chrono::steady_clock::now() - started >= budget;
     };
 
-    try {
-        auto* io_buffer = static_cast<std::uint8_t*>(av_malloc(64 * 1024));
-        if (!io_buffer) {
-            throw std::bad_alloc();
+    while (!state.drained) {
+        if (av_read_frame(state.format, state.packet) < 0) {
+            state.drained = true;
+            break;
         }
-        io = avio_alloc_context(
-            io_buffer, 64 * 1024, 0, &input, read_packet, nullptr, seek_packet);
-        format = avformat_alloc_context();
-        if (!io || !format) {
-            throw std::bad_alloc();
-        }
-        format->pb = io;
-        format->flags |= AVFMT_FLAG_CUSTOM_IO;
-
-        int result = avformat_open_input(&format, nullptr, nullptr, nullptr);
-        if (result < 0) {
-            throw ffmpeg_error("open audio", result);
-        }
-        result = avformat_find_stream_info(format, nullptr);
-        if (result < 0) {
-            throw ffmpeg_error("read audio streams", result);
-        }
-
-        const int audio_stream = av_find_best_stream(
-            format, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
-        if (audio_stream < 0) {
-            throw std::runtime_error("audio file has no audio stream");
-        }
-
-        codec = open_codec(format, audio_stream);
-        if (codec->sample_rate <= 0 || codec->ch_layout.nb_channels <= 0) {
-            throw std::runtime_error("invalid audio stream");
-        }
-
-        const int channels = codec->ch_layout.nb_channels;
-        AVChannelLayout output_layout;
-        av_channel_layout_default(&output_layout, channels);
-        result = swr_alloc_set_opts2(
-            &resampler, &output_layout, AV_SAMPLE_FMT_FLT, codec->sample_rate,
-            &codec->ch_layout, codec->sample_fmt, codec->sample_rate,
-            0, nullptr);
-        av_channel_layout_uninit(&output_layout);
-        if (result < 0 || swr_init(resampler) < 0) {
-            throw std::runtime_error("cannot create audio resampler");
-        }
-
-        AudioClip clip{
-            codec->sample_rate,
-            channels,
-            {},
-        };
-
-        while (av_read_frame(format, packet) >= 0) {
-            if (packet->stream_index == audio_stream) {
-                result = avcodec_send_packet(codec, packet);
-                if (result < 0 && result != AVERROR(EAGAIN)) {
-                    throw ffmpeg_error("send audio packet", result);
+        if (state.packet->stream_index == state.stream_index) {
+            int result = avcodec_send_packet(state.codec, state.packet);
+            if (result < 0 && result != AVERROR(EAGAIN)) {
+                av_packet_unref(state.packet);
+                throw ffmpeg_error("send audio packet", result);
+            }
+            while (result >= 0) {
+                result = avcodec_receive_frame(state.codec, state.frame);
+                if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) {
+                    break;
                 }
-                while (result >= 0) {
-                    result = avcodec_receive_frame(codec, frame);
-                    if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) {
-                        break;
-                    }
-                    if (result < 0) {
-                        throw ffmpeg_error("receive audio frame", result);
-                    }
-                    append_frame(clip, resampler, frame, channels);
+                if (result < 0) {
+                    av_packet_unref(state.packet);
+                    throw ffmpeg_error("receive audio frame", result);
                 }
+                append_frame(clip_, state.resampler, state.frame,
+                             clip_.channels);
             }
-            av_packet_unref(packet);
         }
-
-        // Flush any buffered frames out of the decoder.
-        result = avcodec_send_packet(codec, nullptr);
-        if (result < 0 && result != AVERROR_EOF) {
-            throw ffmpeg_error("flush audio decoder", result);
+        av_packet_unref(state.packet);
+        if (spent()) {
+            return false;
         }
-        while (true) {
-            result = avcodec_receive_frame(codec, frame);
-            if (result == AVERROR_EOF) {
-                break;
-            }
-            if (result < 0) {
-                throw ffmpeg_error("receive flushed audio frame", result);
-            }
-            append_frame(clip, resampler, frame, channels);
-        }
-
-        cleanup();
-
-        if (clip.samples.empty()) {
-            throw std::runtime_error("empty decoded audio");
-        }
-        return clip;
-    } catch (...) {
-        cleanup();
-        throw;
     }
+
+    // Flush whatever the decoder still holds; this only runs once.
+    int result = avcodec_send_packet(state.codec, nullptr);
+    if (result < 0 && result != AVERROR_EOF) {
+        throw ffmpeg_error("flush audio decoder", result);
+    }
+    while (true) {
+        result = avcodec_receive_frame(state.codec, state.frame);
+        if (result == AVERROR_EOF) {
+            break;
+        }
+        if (result < 0) {
+            throw ffmpeg_error("receive flushed audio frame", result);
+        }
+        append_frame(clip_, state.resampler, state.frame, clip_.channels);
+    }
+    done_ = true;
+    if (clip_.samples.empty()) {
+        throw std::runtime_error("empty decoded audio");
+    }
+    return true;
+}
+
+AudioClip AudioDecoder::take()
+{
+    decode(std::chrono::nanoseconds::zero());
+    return std::move(clip_);
+}
+
+AudioClip decode_audio(std::span<const std::uint8_t> bytes)
+{
+    AudioDecoder decoder{
+        std::vector<std::uint8_t>(bytes.begin(), bytes.end())};
+    return decoder.take();
 }
 
 AudioChannel::~AudioChannel()
@@ -247,6 +287,9 @@ AudioChannel::~AudioChannel()
 
 AudioChannel::AudioChannel(AudioChannel&& other) noexcept
     : stream_(std::exchange(other.stream_, nullptr)),
+      source_(std::move(other.source_)),
+      loop_source_(std::move(other.loop_source_)),
+      queued_samples_(std::exchange(other.queued_samples_, 0)),
       clip_(std::move(other.clip_)), loop_clip_(std::move(other.loop_clip_)),
       loop_(other.loop_), active_(other.active_),
       gain_(other.gain_), fade_from_(other.fade_from_),
@@ -265,6 +308,9 @@ AudioChannel& AudioChannel::operator=(AudioChannel&& other) noexcept
     if (this != &other) {
         stop();
         stream_ = std::exchange(other.stream_, nullptr);
+        source_ = std::move(other.source_);
+        loop_source_ = std::move(other.loop_source_);
+        queued_samples_ = std::exchange(other.queued_samples_, 0);
         clip_ = std::move(other.clip_);
         loop_clip_ = std::move(other.loop_clip_);
         loop_ = other.loop_;
@@ -301,6 +347,7 @@ void AudioChannel::play(AudioClip clip, bool loop, float gain)
     if (!SDL_SetAudioStreamGain(stream_, std::clamp(gain, 0.0f, 1.0f))) {
         throw std::runtime_error(SDL_GetError());
     }
+    playback_end_ = std::chrono::steady_clock::now();
     queue();
     if (!SDL_ResumeAudioStreamDevice(stream_)) {
         throw std::runtime_error(SDL_GetError());
@@ -310,7 +357,40 @@ void AudioChannel::play(AudioClip clip, bool loop, float gain)
     fade_started_.reset();
     fade_stop_ = false;
     paused_at_.reset();
-    set_playback_end();
+}
+
+void AudioChannel::play_streaming(
+    std::shared_ptr<AudioDecoder> decoder, bool loop, float gain)
+{
+    if (!decoder) {
+        throw std::runtime_error("streaming playback needs a decoder");
+    }
+    stop();
+    source_ = std::move(decoder);
+    loop_ = loop;
+    const SDL_AudioSpec spec{
+        SDL_AUDIO_F32,
+        source_->channels(),
+        source_->sample_rate(),
+    };
+    stream_ = SDL_OpenAudioDeviceStream(
+        SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+    if (!stream_) {
+        throw std::runtime_error(SDL_GetError());
+    }
+    if (!SDL_SetAudioStreamGain(stream_, std::clamp(gain, 0.0f, 1.0f))) {
+        throw std::runtime_error(SDL_GetError());
+    }
+    playback_end_ = std::chrono::steady_clock::now();
+    queue();
+    if (!SDL_ResumeAudioStreamDevice(stream_)) {
+        throw std::runtime_error(SDL_GetError());
+    }
+    active_ = true;
+    gain_ = std::clamp(gain, 0.0f, 1.0f);
+    fade_started_.reset();
+    fade_stop_ = false;
+    paused_at_.reset();
 }
 
 void AudioChannel::play_intro_loop(AudioClip intro, AudioClip loop, float gain)
@@ -322,16 +402,53 @@ void AudioChannel::play_intro_loop(AudioClip intro, AudioClip loop, float gain)
     loop_clip_ = std::move(loop);
 }
 
+const AudioClip& AudioChannel::active_clip() const
+{
+    // A streaming channel plays out of its decoder's clip, which keeps
+    // growing; everything else plays out of its own.
+    return source_ ? source_->clip() : clip_;
+}
+
+void AudioChannel::play_intro_loop_streaming(
+    std::shared_ptr<AudioDecoder> intro, std::shared_ptr<AudioDecoder> loop,
+    float gain)
+{
+    if (!intro || !loop) {
+        throw std::runtime_error("streaming playback needs a decoder");
+    }
+    if (intro->sample_rate() != loop->sample_rate()
+        || intro->channels() != loop->channels()) {
+        throw std::runtime_error("BGM intro and loop formats do not match");
+    }
+    auto body = std::move(loop);
+    play_streaming(std::move(intro), false, gain);
+    loop_source_ = std::move(body);
+}
+
 void AudioChannel::queue()
 {
-    if (!stream_ || clip_.samples.empty()) {
+    const auto& clip = active_clip();
+    if (!stream_ || clip.samples.size() <= queued_samples_) {
         return;
     }
-    const auto bytes = clip_.samples.size() * sizeof(float);
-    if (!SDL_PutAudioStreamData(stream_, clip_.samples.data(), static_cast<int>(bytes))) {
+    // SDL copies whatever it is handed, so handing it a whole decoded track
+    // is a multi-megabyte memcpy on the frame that starts playback - which
+    // is what read-ahead makes the common case.  A second of audio is far
+    // more than the frame loop needs to stay ahead of the device, and
+    // update() tops it up every frame.
+    const auto chunk = static_cast<std::size_t>(
+        std::max(1, clip.sample_rate)) * static_cast<std::size_t>(
+            std::max(1, clip.channels));
+    const auto count =
+        std::min(clip.samples.size() - queued_samples_, chunk);
+    if (!SDL_PutAudioStreamData(
+            stream_, clip.samples.data() + queued_samples_,
+            static_cast<int>(count * sizeof(float)))) {
         throw std::runtime_error(SDL_GetError());
     }
     SDL_FlushAudioStream(stream_);
+    queued_samples_ += count;
+    advance_playback_end(count);
 }
 
 void AudioChannel::stop()
@@ -340,6 +457,9 @@ void AudioChannel::stop()
         SDL_DestroyAudioStream(stream_);
         stream_ = nullptr;
     }
+    source_.reset();
+    loop_source_.reset();
+    queued_samples_ = 0;
     clip_ = {};
     loop_clip_ = {};
     loop_ = false;
@@ -432,18 +552,37 @@ void AudioChannel::update()
             }
         }
     }
-    if (!stream_ || !active_ || paused_at_
-        || std::chrono::steady_clock::now() < playback_end_) {
+    if (!stream_ || !active_ || paused_at_) {
         return;
     }
-    if (!loop_clip_.samples.empty()) {
+    // Hand the device whatever has been decoded since the last frame.  While
+    // the decode is still running the track cannot have ended, however far
+    // ahead of the decoder the clock has got.
+    queue();
+    if (source_ && !source_->done()) {
+        return;
+    }
+    if (std::chrono::steady_clock::now() < playback_end_) {
+        return;
+    }
+    if (loop_source_) {
+        // The intro has played out; the body takes over as the looping
+        // source, exactly as loop_clip_ does for a fully decoded track.
+        source_ = std::move(loop_source_);
+        loop_source_.reset();
+        clip_ = {};
+        loop_ = true;
+        queued_samples_ = 0;
+        queue();
+    } else if (!loop_clip_.samples.empty()) {
+        source_.reset();
         clip_ = std::move(loop_clip_);
         loop_ = true;
+        queued_samples_ = 0;
         queue();
-        set_playback_end();
     } else if (loop_) {
+        queued_samples_ = 0;
         queue();
-        set_playback_end();
     } else {
         active_ = false;
     }
@@ -454,18 +593,28 @@ bool AudioChannel::playing() const
     return stream_ && active_;
 }
 
-void AudioChannel::set_playback_end()
+void AudioChannel::advance_playback_end(std::size_t samples)
 {
-    const auto frames = clip_.channels > 0
-        ? clip_.samples.size() / static_cast<std::size_t>(clip_.channels)
+    // Queued audio extends the end of playback rather than resetting it, so
+    // topping a stream up mid-track does not make it look finished.
+    const auto& clip = active_clip();
+    const auto frames = clip.channels > 0
+        ? samples / static_cast<std::size_t>(clip.channels)
         : 0;
-    const auto duration = clip_.sample_rate > 0
+    const auto duration = clip.sample_rate > 0
         ? std::chrono::duration<double>(
-              static_cast<double>(frames) / clip_.sample_rate)
+              static_cast<double>(frames) / clip.sample_rate)
         : std::chrono::duration<double>::zero();
-    playback_end_ = std::chrono::steady_clock::now()
+    const auto now = std::chrono::steady_clock::now();
+    const auto base = playback_end_ > now ? playback_end_ : now;
+    playback_end_ = base
         + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             duration);
+}
+
+bool AudioChannel::starving() const
+{
+    return stream_ && active_ && source_ && !source_->done();
 }
 
 }  // namespace th2

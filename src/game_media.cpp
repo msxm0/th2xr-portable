@@ -291,13 +291,161 @@ void Game::set_character(const th2::Event& event)
     }
 }
 
+// Hands back the decoder for an asset, creating it if this is the first ask.
+// Creating one parses the container header only; the samples come later, a
+// few milliseconds per frame, through update_audio_decode().
+std::shared_ptr<th2::AudioDecoder> Game::audio_decoder(
+    const th2::Archive& archive, std::string_view name, int rank)
+{
+    std::string key(name);
+    if (const auto found = audio_decoders_.find(key);
+        found != audio_decoders_.end()) {
+        // A track that turns out to be needed sooner keeps the earlier rank.
+        found->second.rank = std::min(found->second.rank, rank);
+        return found->second.decoder;
+    }
+    const auto* entry = archive.find(name);
+    if (!entry) {
+        throw std::runtime_error("audio not found: " + key);
+    }
+    auto decoder = std::make_shared<th2::AudioDecoder>(archive.read(*entry));
+    audio_decoders_.emplace(
+        key, AudioDecodeEntry{decoder, rank, ++audio_decode_order_});
+    return decoder;
+}
+
+// The decoder a channel is about to play from.  Read-ahead usually means it
+// is already finished; when it is not, this pays a few milliseconds to get a
+// buffer in front of the device rather than the whole track at once.
+std::shared_ptr<th2::AudioDecoder> Game::ready_audio_decoder(
+    const th2::Archive& archive, std::string_view name)
+{
+    auto decoder = audio_decoder(
+        archive, name, static_cast<int>(th2::PrefetchRank::imminent));
+    if (!decoder->done()) {
+        decoder->decode(std::chrono::milliseconds(3));
+    }
+    return decoder;
+}
+
+void Game::request_audio_decode(
+    const th2::Archive& archive, std::string_view name, th2::PrefetchRank rank)
+{
+    std::string key(name);
+    if (audio_decoders_.contains(key)) {
+        return;
+    }
+    const auto queued = std::ranges::any_of(
+        audio_decode_queue_, [&](const AudioDecodeRequest& request) {
+            return request.name == key;
+        });
+    if (queued || audio_decode_queue_.size() >= audio_decode_queue_limit) {
+        return;
+    }
+    if (!archive.find(name)) {
+        return;  // A script can name a track the release does not ship.
+    }
+    audio_decode_queue_.push_back(AudioDecodeRequest{
+        &archive, std::move(key), static_cast<int>(rank),
+        ++audio_decode_order_});
+}
+
+void Game::update_audio_decode()
+{
+    // Two milliseconds a frame is a third of the budget at 60fps and decodes
+    // far faster than playback consumes, so a track started cold catches up
+    // within a few frames and read-ahead still gets through ten files in
+    // well under a second.
+    constexpr auto budget = std::chrono::milliseconds(2);
+    const auto started = std::chrono::steady_clock::now();
+    const auto remaining = [&] {
+        return budget - (std::chrono::steady_clock::now() - started);
+    };
+
+    // A channel playing ahead of its own decoder comes first: falling behind
+    // there is an audible dropout, not merely a slower read-ahead.
+    const auto feed = [&](th2::AudioChannel& channel) {
+        if (channel.starving() && remaining() > std::chrono::nanoseconds::zero()) {
+            channel.decoder()->decode(remaining());
+        }
+    };
+    feed(bgm_);
+    for (auto& channel : voice_channels_) {
+        feed(channel);
+    }
+    for (auto& channel : se_channels_) {
+        feed(channel);
+    }
+    for (auto& channel : transient_se_) {
+        feed(channel);
+    }
+
+    // Then read-ahead, in the order the scan reached them: imminent before
+    // branch, and within a rank the one the script reaches first.
+    std::ranges::sort(
+        audio_decode_queue_, [](const auto& left, const auto& right) {
+            return std::tie(left.rank, left.order)
+                < std::tie(right.rank, right.order);
+        });
+    while (!audio_decode_queue_.empty()
+           && remaining() > std::chrono::nanoseconds::zero()) {
+        auto& request = audio_decode_queue_.front();
+        try {
+            auto decoder = audio_decoder(
+                *request.archive, request.name, request.rank);
+            if (decoder->decode(remaining())) {
+                audio_decode_queue_.erase(audio_decode_queue_.begin());
+            } else {
+                break;  // Out of time; the rest of this file waits a frame.
+            }
+        } catch (const std::exception&) {
+            // A file that will not decode is not worth retrying every frame.
+            audio_decode_queue_.erase(audio_decode_queue_.begin());
+        }
+    }
+    evict_audio_decoders();
+}
+
+void Game::evict_audio_decoders()
+{
+    std::size_t total = 0;
+    for (const auto& [key, entry] : audio_decoders_) {
+        total += entry.decoder->clip().samples.size() * sizeof(float);
+    }
+    if (total <= audio_decode_budget_bytes) {
+        return;
+    }
+    // Decoded PCM is bulky - minutes of BGM run to tens of megabytes - so the
+    // cache is bounded the way the byte prefetch is: the most speculative go
+    // first, and anything a channel still holds is untouchable.
+    std::vector<const std::string*> droppable;
+    for (const auto& [key, entry] : audio_decoders_) {
+        if (entry.decoder.use_count() == 1) {
+            droppable.push_back(&key);
+        }
+    }
+    std::ranges::sort(droppable, [&](const auto* left, const auto* right) {
+        const auto& a = audio_decoders_.at(*left);
+        const auto& b = audio_decoders_.at(*right);
+        return std::tie(a.rank, a.order) > std::tie(b.rank, b.order);
+    });
+    for (const auto* key : droppable) {
+        if (total <= audio_decode_budget_bytes) {
+            break;
+        }
+        const auto found = audio_decoders_.find(*key);
+        total -= found->second.decoder->clip().samples.size() * sizeof(float);
+        audio_decoders_.erase(found);
+    }
+}
+
 void Game::play_se(int channel, int sound, bool loop, int volume, int fade,
              bool wait_for_completion)
 {
     const auto name = std::format("SE_{:04d}.WAV", sound);
     if (channel >= 0 && static_cast<std::size_t>(channel) < se_channels_.size()) {
-        se_channels_[channel].play(
-            load_audio(se_archive_, name), loop,
+        se_channels_[channel].play_streaming(
+            ready_audio_decoder(se_archive_, name), loop,
             fade > 0 ? 0.0f : se_gain(volume));
         if (fade > 0) {
             se_channels_[channel].fade_to(
@@ -318,7 +466,8 @@ void Game::play_se(int channel, int sound, bool loop, int volume, int fade,
     const auto index = static_cast<std::size_t>(
         std::distance(transient_se_.begin(), found));
     transient_se_volume_[index] = volume;
-    found->play(load_audio(se_archive_, name), false, se_gain(volume));
+    found->play_streaming(
+        ready_audio_decoder(se_archive_, name), false, se_gain(volume));
     if (wait_for_completion) {
         audio_wait_ = AudioWait{
             AudioWaitKind::sound_effect, se_channels_.size() + index};
@@ -361,7 +510,8 @@ void Game::play_bgm(int music, bool loop, int volume)
     const auto gain = bgm_gain(volume);
     const auto single = std::format("BGM_{:03d}.OGG", music);
     if (bgm_archive_.find(single)) {
-        bgm_.play(load_audio(bgm_archive_, single), loop, gain);
+        bgm_.play_streaming(
+            ready_audio_decoder(bgm_archive_, single), loop, gain);
         return;
     }
     const auto intro = std::format("BGM_{:03d}_A.OGG", music);
@@ -370,10 +520,12 @@ void Game::play_bgm(int music, bool loop, int volume)
         throw std::runtime_error("BGM track not found: " + std::to_string(music));
     }
     if (loop) {
-        bgm_.play_intro_loop(
-            load_audio(bgm_archive_, intro), load_audio(bgm_archive_, body), gain);
+        bgm_.play_intro_loop_streaming(
+            ready_audio_decoder(bgm_archive_, intro),
+            ready_audio_decoder(bgm_archive_, body), gain);
     } else {
-        bgm_.play(load_audio(bgm_archive_, intro), false, gain);
+        bgm_.play_streaming(
+            ready_audio_decoder(bgm_archive_, intro), false, gain);
     }
 }
 
@@ -425,8 +577,8 @@ void Game::play_voice(const th2::Event& event)
         voice_loop_[channel] = false;
         return;
     }
-    voice_channel.play(
-        th2::decode_audio(voice_archive_.read(*voice_entry)), loop,
+    voice_channel.play_streaming(
+        ready_audio_decoder(voice_archive_, voice_entry->name), loop,
         voice_gain(volume, character));
     voice_sound_[channel] = voice;
     voice_character_[channel] = character;
@@ -450,8 +602,8 @@ void Game::replay_backlog_voice(const Game::BacklogVoice& voice)
         return;
     }
     voice_channels_[0].stop();
-    voice_channels_[0].play(
-        load_audio(voice_archive_, name), false,
+    voice_channels_[0].play_streaming(
+        ready_audio_decoder(voice_archive_, name), false,
         voice_gain(voice.volume, voice.character));
     voice_sound_[0] = voice.voice;
     voice_character_[0] = voice.character;

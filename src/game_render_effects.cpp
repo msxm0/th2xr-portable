@@ -58,6 +58,46 @@ Surface Game::capture_frame_pixels(bool art_only)
     return Surface(converted);
 }
 
+Texture Game::capture_frame_texture()
+{
+    SDL_Texture* source = upscaler_->art_target();
+    float width = 0.0f;
+    float height = 0.0f;
+    if (!SDL_GetTextureSize(source, &width, &height)) {
+        throw std::runtime_error(SDL_GetError());
+    }
+    Texture copy(SDL_CreateTexture(
+        renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET,
+        static_cast<int>(width), static_cast<int>(height)));
+    if (!copy) {
+        throw std::runtime_error(SDL_GetError());
+    }
+
+    SDL_Texture* previous_target = SDL_GetRenderTarget(renderer_);
+    float scale_x = 1.0f;
+    float scale_y = 1.0f;
+    SDL_GetRenderScale(renderer_, &scale_x, &scale_y);
+    SDL_SetRenderTarget(renderer_, copy.get());
+    SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
+    // A straight copy, not a blend: the art target already holds the frame
+    // exactly as it should be remembered.
+    const SDL_BlendMode source_blend = [&] {
+        SDL_BlendMode mode = SDL_BLENDMODE_BLEND;
+        SDL_GetTextureBlendMode(source, &mode);
+        return mode;
+    }();
+    SDL_SetTextureBlendMode(source, SDL_BLENDMODE_NONE);
+    const bool drawn = SDL_RenderTexture(renderer_, source, nullptr, nullptr);
+    SDL_SetTextureBlendMode(source, source_blend);
+    SDL_SetRenderTarget(renderer_, previous_target);
+    SDL_SetRenderScale(renderer_, scale_x, scale_y);
+    if (!drawn) {
+        throw std::runtime_error(SDL_GetError());
+    }
+    SDL_SetTextureBlendMode(copy.get(), SDL_BLENDMODE_BLEND);
+    return copy;
+}
+
 Texture Game::texture_from_surface(SDL_Surface* surface)
 {
     SDL_Texture* raw = SDL_CreateTextureFromSurface(renderer_, surface);
@@ -84,6 +124,46 @@ void Game::retire_soak_gpu_work(bool force)
     SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
     if (!SDL_RenderClear(renderer_) || !SDL_RenderPresent(renderer_)) {
         throw std::runtime_error(SDL_GetError());
+    }
+}
+
+const Game::TransitionMask& Game::transition_mask(int type)
+{
+    if (const auto found = transition_masks_.find(type);
+        found != transition_masks_.end()) {
+        return found->second;
+    }
+    TransitionMask mask;
+    mask.pixels = load_transition_mask(type, mask.width, mask.height);
+    return transition_masks_.emplace(type, std::move(mask)).first->second;
+}
+
+// Runs on an idle frame only, and only once the mask's own bytes have
+// arrived, so preparing it never turns into a blocking read.
+void Game::prepare_pending_transition_mask()
+{
+    while (!pending_transition_masks_.empty()) {
+        const int type = *pending_transition_masks_.begin();
+        if (transition_masks_.contains(type)) {
+            pending_transition_masks_.erase(pending_transition_masks_.begin());
+            continue;
+        }
+        const auto name = std::format("f0{:03d}.bmp", type & 0x7f);
+        const auto* entry = graphics_.find(name);
+        if (!entry) {
+            pending_transition_masks_.erase(pending_transition_masks_.begin());
+            continue;  // Not in this release; nothing to prepare.
+        }
+        if (!graphics_.resident(*entry)) {
+            return;  // Still in flight; try again on the next idle scan.
+        }
+        pending_transition_masks_.erase(pending_transition_masks_.begin());
+        try {
+            transition_mask(type);
+        } catch (const std::exception&) {
+            // A mask that will not load is not worth retrying every scan.
+        }
+        return;  // One per idle frame; the walk is not cheap.
     }
 }
 
@@ -144,6 +224,19 @@ std::vector<std::uint8_t> Game::load_transition_mask(
     return mask;
 }
 
+namespace {
+
+// Pattern wipes and the per-pixel sweeps blend in C++ and need both frames on
+// the CPU.  Everything else - the plain cross-fade, which is two thirds of
+// the background changes, and the geometric moves - only ever draws the old
+// frame as a texture.
+bool transition_needs_pixels(int type)
+{
+    return type >= 0x80 || (type >= 2 && type <= 10) || type == 21;
+}
+
+}  // namespace
+
 void Game::begin_transition(
     int type, int frames, int vague, bool resume_script,
     EffectTiming timing)
@@ -155,8 +248,14 @@ void Game::begin_transition(
     // so a menu fade lasts the same half second whatever the effect speed.
     const int effective_frames = timing == EffectTiming::menu
         ? frames * 2 : effect_frames(frames);
-    auto previous_pixels = capture_frame_pixels(true);
-    auto previous = texture_from_surface(previous_pixels.get());
+    Surface previous_pixels;
+    Texture previous;
+    if (transition_needs_pixels(type)) {
+        previous_pixels = capture_frame_pixels(true);
+        previous = texture_from_surface(previous_pixels.get());
+    } else {
+        previous = capture_frame_texture();
+    }
     Transition transition{
         std::move(previous),
         std::move(previous_pixels),
@@ -175,8 +274,10 @@ void Game::begin_transition(
         false,
     };
     if (type >= 0x80) {
-        transition.mask = load_transition_mask(
-            type, transition.mask_width, transition.mask_height);
+        const auto& mask = transition_mask(type);
+        transition.mask = mask.pixels;
+        transition.mask_width = mask.width;
+        transition.mask_height = mask.height;
     }
     transition_ = std::move(transition);
 }
@@ -268,7 +369,13 @@ void Game::draw_pattern_transition(float progress)
 void Game::ensure_transition_target()
 {
     auto& transition = *transition_;
-    if (transition.next_pixels) {
+    if (transition.composite) {
+        return;
+    }
+    if (!transition_needs_pixels(transition.type)) {
+        // The new scene is already on the art target; copying it there and
+        // back through system memory would buy nothing.
+        transition.composite = capture_frame_texture();
         return;
     }
     transition.next_pixels = capture_frame_pixels();
@@ -387,7 +494,8 @@ void Game::draw_geometric_transition(float progress)
 {
     ensure_transition_target();
     auto& transition = *transition_;
-    if (!SDL_UpdateTexture(
+    if (transition.next_pixels
+        && !SDL_UpdateTexture(
             transition.composite.get(), nullptr,
             transition.next_pixels->pixels,
             transition.next_pixels->pitch)) {

@@ -25,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <ostream>
 #include <istream>
 #include <string>
@@ -178,6 +179,20 @@ private:
         int zoom_center_y = 0;
         int zoom = 0;
     };
+    // Transition masks are a hundred-odd fixed files reused across sixteen
+    // hundred pattern wipes, and preparing one costs an archive read, an LZS
+    // decompress, a BMP parse and a walk over every pixel.  Doing that once
+    // per wipe showed up as a fifth of the frames that overran.
+    struct TransitionMask {
+        std::vector<std::uint8_t> pixels;
+        int width = 0;
+        int height = 0;
+    };
+    std::unordered_map<int, TransitionMask> transition_masks_;
+    std::set<int> pending_transition_masks_;
+    const TransitionMask& transition_mask(int type);
+    void prepare_pending_transition_mask();
+
     struct Transition {
         Texture previous;
         Surface previous_pixels;
@@ -738,6 +753,11 @@ private:
     void skip(bool force_unread = false);
     CharacterTexture& character_texture(int number);
     Surface capture_frame_pixels(bool art_only = false);
+    // A GPU-side copy of the art target.  Transitions that only ever draw
+    // the old frame as a texture do not need it on the CPU, and
+    // SDL_RenderReadPixels is a pipeline sync: it waits for everything
+    // queued to finish, which at high DPI cost 20-40ms a wipe.
+    Texture capture_frame_texture();
     Texture texture_from_surface(SDL_Surface* surface);
     void retire_soak_gpu_work(bool force = false);
     std::vector<std::uint8_t> load_transition_mask(
@@ -880,6 +900,39 @@ private:
     // need, so their reads do not stall a frame (browser build; a no-op
     // where reads come off a disk).
     void prefetch_upcoming_assets();
+    // Decoding audio is the other half of getting an asset ready, and the
+    // expensive half: a BGM track is 100-200ms of Vorbis on the thread that
+    // draws.  Requests are queued alongside the byte prefetch and worked off
+    // a few milliseconds per frame, in the same need order.
+    struct AudioDecodeRequest {
+        const th2::Archive* archive = nullptr;
+        std::string name;
+        int rank = 0;
+        std::uint64_t order = 0;
+    };
+    struct AudioDecodeEntry {
+        std::shared_ptr<th2::AudioDecoder> decoder;
+        int rank = 0;
+        std::uint64_t order = 0;
+    };
+    std::vector<AudioDecodeRequest> audio_decode_queue_;
+    std::unordered_map<std::string, AudioDecodeEntry> audio_decoders_;
+    std::uint64_t audio_decode_order_ = 0;
+
+    // Read-ahead only: what a channel is playing is never evicted.
+    static constexpr std::size_t audio_decode_budget_bytes = 96ull << 20;
+    static constexpr std::size_t audio_decode_queue_limit = 10;
+
+    std::shared_ptr<th2::AudioDecoder> audio_decoder(
+        const th2::Archive& archive, std::string_view name, int rank);
+    std::shared_ptr<th2::AudioDecoder> ready_audio_decoder(
+        const th2::Archive& archive, std::string_view name);
+    void request_audio_decode(
+        const th2::Archive& archive, std::string_view name,
+        th2::PrefetchRank rank);
+    void update_audio_decode();
+    void evict_audio_decoders();
+
     int prefetch_event_assets(
         const th2::Event& event, std::string_view script_name,
         th2::PrefetchRank rank);

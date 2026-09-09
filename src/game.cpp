@@ -780,6 +780,7 @@ void Game::iterate()
     if (soak_) {
         update_transition();
         update_background_fade();
+        update_audio_decode();
         update_half_tone();
         update_screen_flash();
         update_shake();
@@ -809,6 +810,7 @@ void Game::iterate()
     draw();
     update_transition();
     update_background_fade();
+    update_audio_decode();
     update_half_tone();
     update_screen_flash();
     update_shake();
