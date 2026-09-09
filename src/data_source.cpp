@@ -41,8 +41,13 @@ EM_ASYNC_JS(int, fetch_range,
     (const char* url, double offset, double size, void* destination), {
     try {
         const last = offset + size - 1;
+        // This is a read the engine is blocked on, so it never waits behind
+        // a speculative one: it bypasses the prefetch queue entirely and
+        // asks the browser to schedule it ahead of the low-priority
+        // prefetches (ignored by engines without Fetch Priority).
         const response = await fetch(UTF8ToString(url), {
             headers: {Range: `bytes=${offset}-${last}`},
+            priority: "high",
         });
         if (!response.ok) {
             return 0;
@@ -79,7 +84,119 @@ EM_JS(void, start_prefetch,
     (const char* url, double offset, double size, int keep, int rank), {
     const path = UTF8ToString(url);
     const key = path + ":" + offset + ":" + size;
-    Module.th2Prefetch ||= {entries: new Map(), bytes: 0};
+    if (!Module.th2Prefetch) {
+        const store = {entries: new Map(), bytes: 0, queue: [], active: 0,
+                       counter: 0};
+        // Speculative requests in flight at once.  A browser keeps six
+        // connections per origin on HTTP/1.1 and queues the rest itself, in
+        // an order nothing can change afterwards; holding the guesses here
+        // instead leaves slots free for the read the player is actually
+        // waiting on, and keeps the ordering ours to rearrange.
+        store.limit = 4;
+        store.begin = (entry) => {
+            entry.started = true;
+            store.active++;
+            const last = entry.offset + entry.size - 1;
+            fetch(entry.path, {
+                headers: {Range: `bytes=${entry.offset}-${last}`},
+                priority: "low",
+            })
+                .then(async (response) => {
+                    if (!response.ok) {
+                        return null;
+                    }
+                    if (response.status !== 206) {
+                        const length =
+                            Number(response.headers.get("Content-Length"));
+                        if (length && length !== entry.size) {
+                            return null;
+                        }
+                    }
+                    const body = new Uint8Array(await response.arrayBuffer());
+                    if (body.length !== entry.size) {
+                        return null;
+                    }
+                    entry.body = body;
+                    store.bytes += body.length;
+                    return body;
+                })
+                .catch(() => null)
+                .then((body) => {
+                    store.active--;
+                    entry.settle(body);
+                    store.pump();
+                });
+        };
+        // Queued entries go out in need order rather than call order:
+        // imminent before branch, and within a rank the one the scan reached
+        // first, which is the one the script reaches first.  A later scan's
+        // imminent range therefore overtakes an earlier scan's guesses.
+        // Issuing a fetch costs about a tenth of a millisecond on the
+        // thread that draws.  The concurrency limit alone does not bound
+        // that per frame: over a fast link a request can complete in the
+        // same frame it was issued, and each completion pumps the queue
+        // again, so a burst drains in one go.  Capping the speculative
+        // starts per frame keeps that off the frame budget; promotions
+        // bypass this the way they bypass the concurrency limit, because
+        // the engine is already blocked on them.
+        store.perFrameLimit = 6;
+        store.issuedThisFrame = 0;
+        store.pump = () => {
+            // Sorting only when a slot is free keeps this off the hot path:
+            // a scan enqueues twenty ranges and can start at most four, so
+            // the other sixteen calls do nothing but append.
+            if (store.active >= store.limit || !store.queue.length
+                || store.issuedThisFrame >= store.perFrameLimit) {
+                return;
+            }
+            if (store.queue.length > 1) {
+                store.queue.sort(
+                    (a, b) => (a.rank - b.rank) || (a.order - b.order));
+            }
+            while (store.active < store.limit && store.queue.length
+                   && store.issuedThisFrame < store.perFrameLimit) {
+                store.issuedThisFrame++;
+                store.begin(store.queue.shift());
+            }
+        };
+        // A hidden tab stops painting, and stops prefetching with it; a read
+        // the engine blocks on still goes out, through promote().
+        const schedule = typeof requestAnimationFrame === "function"
+            ? requestAnimationFrame
+            : (fn) => setTimeout(fn, 16);
+        const frameTick = () => {
+            store.issuedThisFrame = 0;
+            store.pump();
+            schedule(frameTick);
+        };
+        schedule(frameTick);
+        // A queue that outruns the player is stale guesses competing for
+        // bandwidth with the ones that still matter, so it is bounded the
+        // way the byte budget is: the most speculative go first.  Anything
+        // dropped is simply a miss later, which data_read() refetches.
+        store.queue_limit = 64;
+        store.trim = () => {
+            while (store.queue.length > store.queue_limit) {
+                const dropped = store.queue.pop();
+                store.entries.delete(
+                    dropped.path + ":" + dropped.offset + ":" + dropped.size);
+                dropped.settle(null);
+            }
+        };
+        // A range stops being a guess the moment the engine blocks on it, so
+        // it leaves the queue and goes out immediately, over the limit.
+        store.promote = (entry) => {
+            if (entry.started) {
+                return;
+            }
+            const at = store.queue.indexOf(entry);
+            if (at >= 0) {
+                store.queue.splice(at, 1);
+            }
+            store.begin(entry);
+        };
+        Module.th2Prefetch = store;
+    }
     const store = Module.th2Prefetch;
     if (store.entries.has(key)) {
         return;
@@ -110,29 +227,13 @@ EM_JS(void, start_prefetch,
     // directory, say - so it stays after it has been read from.
     store.counter = (store.counter || 0) + 1;
     const entry = {body: null, path: path, offset: offset, size: size,
-                   keep: keep != 0, rank: rank, order: store.counter};
-    const last = offset + size - 1;
-    entry.promise = fetch(path, {headers: {Range: `bytes=${offset}-${last}`}})
-        .then(async (response) => {
-            if (!response.ok) {
-                return null;
-            }
-            if (response.status !== 206) {
-                const length = Number(response.headers.get("Content-Length"));
-                if (length && length !== size) {
-                    return null;
-                }
-            }
-            const body = new Uint8Array(await response.arrayBuffer());
-            if (body.length !== size) {
-                return null;
-            }
-            entry.body = body;
-            store.bytes += body.length;
-            return body;
-        })
-        .catch(() => null);
+                   keep: keep != 0, rank: rank, order: store.counter,
+                   started: false};
+    entry.promise = new Promise((resolve) => { entry.settle = resolve; });
     store.entries.set(key, entry);
+    store.queue.push(entry);
+    store.pump();
+    store.trim();
 });
 
 // Hands over a prefetched range, waiting for it when it is still in flight -
@@ -164,6 +265,9 @@ EM_ASYNC_JS(int, take_prefetched,
     }
     if (!entry) {
         return 0;
+    }
+    if (!entry.body) {
+        store.promote(entry);
     }
     const body = entry.body ?? await entry.promise;
     if (!entry.keep) {

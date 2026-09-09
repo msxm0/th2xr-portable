@@ -27,3 +27,6 @@ ffmpeg-*.7z
 /third_party/*
 !/third_party/
 !/third_party/build*.sh
+
+# Agent scratch tooling: harnesses and probes, not part of the build
+/claude-scratchpad/
