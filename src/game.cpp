@@ -29,6 +29,8 @@ extern "C" {
 
 namespace th2app {
 
+bool force_cpu_transitions = false;
+
 namespace {
 
 #ifdef __EMSCRIPTEN__
@@ -793,6 +795,15 @@ void Game::iterate()
         return;
     }
     ensure_upscaler();
+    if (!gl_transition_) {
+        // Built on the first drawn frame, once the renderer's context is
+        // current.  If the shader will not build, available() stays false
+        // and every wipe keeps the CPU blend.
+        gl_transition_ = std::make_unique<th2::GlPatternTransition>();
+        SDL_Log(
+            "pattern wipes: %s",
+            gl_transition_->available() ? "GPU shader" : "CPU blend");
+    }
     int output_width = 800;
     int output_height = 600;
     SDL_GetRenderOutputSize(
@@ -870,6 +881,8 @@ int main(int argc, char** argv)
                     throw std::runtime_error("--scenario requires an SDT path");
                 }
                 scenario = argv[index];
+            } else if (argument == "--cpu-transitions") {
+                th2app::force_cpu_transitions = true;
             } else if (argument == "--soak") {
                 soak_directory = writable_directory() / "logs" / "soak";
             } else if (argument == "--soak-state") {
@@ -894,7 +907,7 @@ int main(int argc, char** argv)
             } else {
                 throw std::runtime_error(
                     "usage: toheart2 [GAME_DATA_DIRECTORY] "
-                    "[--scenario FILE.SDT] [--soak] "
+                    "[--scenario FILE.SDT] [--cpu-transitions] [--soak] "
                     "[--soak-state DIRECTORY] [--soak-runs COUNT]");
             }
         }

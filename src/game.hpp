@@ -4,6 +4,7 @@
 #include "character.hpp"
 #include "config.hpp"
 #include "font.hpp"
+#include "gl_transition.hpp"
 #include "gamepad_input.hpp"
 #include "imgui_layer.hpp"
 #include "message.hpp"
@@ -34,6 +35,10 @@
 #include <utility>
 #include <vector>
 namespace th2app {
+
+// Set by --cpu-transitions.  Forces the CPU blend even where the shader
+// would work, so the two paths can be compared without rebuilding.
+extern bool force_cpu_transitions;
 struct TextureDeleter {
     void operator()(SDL_Texture* texture) const;
 };
@@ -187,9 +192,15 @@ private:
         std::vector<std::uint8_t> pixels;
         int width = 0;
         int height = 0;
+        Texture texture;  // Only built when the shader path can use it.
     };
     std::unordered_map<int, TransitionMask> transition_masks_;
     std::set<int> pending_transition_masks_;
+    // Best-effort: null or unavailable means every wipe takes the CPU blend.
+    std::unique_ptr<th2::GlPatternTransition> gl_transition_;
+    bool gl_transition_usable() const;
+    SDL_Texture* transition_mask_texture(int type);
+    bool transition_needs_pixels(int type) const;
     const TransitionMask& transition_mask(int type);
     void prepare_pending_transition_mask();
 
@@ -771,6 +782,7 @@ private:
         EffectTiming timing = EffectTiming::script);
     void update_transition();
     void draw_pattern_transition(float progress);
+    bool draw_pattern_transition_gpu(float progress);
     void ensure_transition_target();
     void draw_pixel_transition(float progress);
     void draw_geometric_transition(float progress);

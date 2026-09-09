@@ -127,6 +127,50 @@ void Game::retire_soak_gpu_work(bool force)
     }
 }
 
+bool Game::gl_transition_usable() const
+{
+    return !force_cpu_transitions && gl_transition_
+        && gl_transition_->available();
+}
+
+// The mask only becomes a texture if the shader path is going to sample it;
+// on the CPU path the bytes are all that is needed.
+SDL_Texture* Game::transition_mask_texture(int type)
+{
+    auto& mask = const_cast<TransitionMask&>(transition_mask(type));
+    if (mask.texture) {
+        return mask.texture.get();
+    }
+    if (mask.width <= 0 || mask.height <= 0) {
+        return nullptr;
+    }
+    Texture texture(SDL_CreateTexture(
+        renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC,
+        mask.width, mask.height));
+    if (!texture) {
+        return nullptr;
+    }
+    // The shader reads the red channel; the mask is a single value per pixel.
+    std::vector<std::uint8_t> rgba(
+        static_cast<std::size_t>(mask.width) * mask.height * 4);
+    for (std::size_t i = 0; i < mask.pixels.size(); ++i) {
+        const auto value = mask.pixels[i];
+        rgba[i * 4 + 0] = value;
+        rgba[i * 4 + 1] = value;
+        rgba[i * 4 + 2] = value;
+        rgba[i * 4 + 3] = 255;
+    }
+    if (!SDL_UpdateTexture(
+            texture.get(), nullptr, rgba.data(), mask.width * 4)) {
+        return nullptr;
+    }
+    // The CPU blend indexes the mask with integer division, so nearest keeps
+    // the two paths producing the same edge.
+    SDL_SetTextureScaleMode(texture.get(), SDL_SCALEMODE_NEAREST);
+    mask.texture = std::move(texture);
+    return mask.texture.get();
+}
+
 const Game::TransitionMask& Game::transition_mask(int type)
 {
     if (const auto found = transition_masks_.find(type);
@@ -224,18 +268,15 @@ std::vector<std::uint8_t> Game::load_transition_mask(
     return mask;
 }
 
-namespace {
-
-// Pattern wipes and the per-pixel sweeps blend in C++ and need both frames on
-// the CPU.  Everything else - the plain cross-fade, which is two thirds of
-// the background changes, and the geometric moves - only ever draws the old
-// frame as a texture.
-bool transition_needs_pixels(int type)
+// The per-pixel sweeps always blend in C++.  Pattern wipes do too, unless the
+// shader path is up, in which case nothing needs to come off the GPU at all.
+bool Game::transition_needs_pixels(int type) const
 {
-    return type >= 0x80 || (type >= 2 && type <= 10) || type == 21;
+    if (type >= 0x80) {
+        return !gl_transition_usable();
+    }
+    return (type >= 2 && type <= 10) || type == 21;
 }
-
-}  // namespace
 
 void Game::begin_transition(
     int type, int frames, int vague, bool resume_script,
@@ -299,6 +340,34 @@ void Game::update_transition()
     if (resume_script) {
         advance();
     }
+}
+
+// The shader form of draw_pattern_transition(): same blend, same mask, but
+// both frames stay on the GPU, so the wipe costs no readback.  Returns false
+// if anything is missing, and the caller falls back to the CPU blend.
+bool Game::draw_pattern_transition_gpu(float progress)
+{
+    if (!gl_transition_usable()) {
+        return false;
+    }
+    auto& transition = *transition_;
+    if (!transition.previous) {
+        return false;
+    }
+    if (!transition.composite) {
+        // The new scene is on the art target; take a GPU-side copy of it the
+        // same way the old one was taken.
+        transition.composite = capture_frame_texture();
+    }
+    SDL_Texture* mask = transition_mask_texture(transition.type);
+    if (!mask) {
+        return false;
+    }
+    const int vague = std::clamp(transition.vague, 1, 256);
+    const float offset = progress * static_cast<float>(256 + vague);
+    return gl_transition_->draw(
+        renderer_, transition.previous.get(), transition.composite.get(),
+        mask, offset, static_cast<float>(vague));
 }
 
 void Game::draw_pattern_transition(float progress)
@@ -703,7 +772,9 @@ void Game::draw_active_transition()
             elapsed.count() * 60.0 / transition_->frames),
         0.0f, 1.0f);
     if (transition_->type >= 0x80) {
-        draw_pattern_transition(progress);
+        if (!draw_pattern_transition_gpu(progress)) {
+            draw_pattern_transition(progress);
+        }
     } else if (transition_->type == 0) {
         if (progress < 0.5f) {
             SDL_SetTextureAlphaModFloat(

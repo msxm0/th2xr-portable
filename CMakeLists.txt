@@ -301,6 +301,7 @@ endif()
 if(ANDROID)
     add_library(toheart2 SHARED
         src/anime4k.cpp
+        src/gl_transition.cpp
         src/font.cpp
         src/game.cpp
         src/game_backlog_touch.cpp
@@ -332,6 +333,7 @@ if(ANDROID)
 else()
     add_executable(toheart2
         src/anime4k.cpp
+        src/gl_transition.cpp
         src/font.cpp
         src/game.cpp
         src/game_backlog_touch.cpp
