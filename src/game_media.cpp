@@ -339,7 +339,17 @@ void Game::request_audio_decode(
         audio_decode_queue_, [&](const AudioDecodeRequest& request) {
             return request.name == key;
         });
-    if (queued || audio_decode_queue_.size() >= audio_decode_queue_limit) {
+    if (queued) {
+        return;
+    }
+    // Counted per archive: voice, music and effects each get their own five,
+    // so a run of voice lines cannot crowd out the music that is about to
+    // start.
+    const auto same_archive = std::ranges::count_if(
+        audio_decode_queue_, [&](const AudioDecodeRequest& request) {
+            return request.archive == &archive;
+        });
+    if (static_cast<std::size_t>(same_archive) >= audio_decode_queue_limit) {
         return;
     }
     if (!archive.find(name)) {
@@ -392,6 +402,16 @@ void Game::update_audio_decode()
             // Building the decoder reads the file, which on a streaming
             // build can suspend, so the budget has to be re-read after it
             // rather than assumed to be the one the loop tested.
+            // Opening builds the stream's VLC tables and cannot be cut
+            // short, so it is rationed by count rather than by clock: one a
+            // frame keeps a six-millisecond atomic step from landing twice on
+            // the same one.
+            if (!audio_decoders_.contains(request.name)) {
+                if (audio_opens_this_frame_ >= audio_opens_per_frame) {
+                    break;
+                }
+                ++audio_opens_this_frame_;
+            }
             auto decoder = background_budget_.spend([&] {
                 return audio_decoder(
                     *request.archive, request.name, request.rank);
@@ -776,12 +796,20 @@ void Game::request_image_decode(bool background, std::string_view name)
     if (!entry || !source.resident(*entry)) {
         return;
     }
-    auto key = std::string(background ? "bak:" : "grp:") + std::string(name);
+    const std::string prefix = background ? "bak:" : "grp:";
+    auto key = prefix + std::string(name);
     if (decoded_images_.contains(key)) {
         return;
     }
     if (std::ranges::find(image_decode_queue_, key)
         != image_decode_queue_.end()) {
+        return;
+    }
+    const auto same_kind = std::ranges::count_if(
+        image_decode_queue_, [&](const std::string& queued) {
+            return queued.starts_with(prefix);
+        });
+    if (static_cast<std::size_t>(same_kind) >= image_decode_kind_limit) {
         return;
     }
     image_decode_queue_.push_back(std::move(key));
@@ -876,9 +904,12 @@ void Game::update_image_decode()
             }));
         }
         if (surface) {
-            while (decoded_images_.size() >= decoded_image_limit) {
-                decoded_images_.erase(decoded_images_.begin());
+            while (decoded_images_.size() >= decoded_image_limit
+                   && !decoded_image_order_.empty()) {
+                decoded_images_.erase(decoded_image_order_.front());
+                decoded_image_order_.pop_front();
             }
+            decoded_image_order_.push_back(pending.key);
             decoded_images_.emplace(pending.key, std::move(surface));
         }
     } catch (const std::exception& error) {
@@ -901,6 +932,10 @@ Surface Game::take_predecoded_image(bool background, std::string_view name)
     // Handed over rather than shared: the tone curves rewrite it in place.
     Surface surface = std::move(found->second);
     decoded_images_.erase(found);
+    if (const auto at = std::ranges::find(decoded_image_order_, key);
+        at != decoded_image_order_.end()) {
+        decoded_image_order_.erase(at);
+    }
     return surface;
 }
 

@@ -535,8 +535,21 @@ private:
     // Keyed by archive and name.  Small: a couple of backgrounds in flight,
     // not a history of everything seen.
     std::unordered_map<std::string, Surface> decoded_images_;
+    // Insertion order, so the cache can drop the oldest rather than whichever
+    // one the hash table happens to hand back first - evicting at random can
+    // throw away the picture that is about to be drawn and pay for it twice.
+    std::deque<std::string> decoded_image_order_;
     std::deque<std::string> image_decode_queue_;
-    static constexpr std::size_t decoded_image_limit = 6;
+    static constexpr std::size_t decoded_image_limit = 12;
+    // Five backgrounds and five sprites: enough for the next screen whichever
+    // branch is taken, and no more.  An unbounded sprite lookahead decoded
+    // nine times as much as it used, most of it discarded.
+    static constexpr std::size_t image_decode_kind_limit = 5;
+    // Opening a Vorbis stream builds its VLC tables - about six milliseconds,
+    // atomic, and three times the whole frame allowance.  The budget cannot
+    // interrupt it, so the only control is how often it is allowed to happen.
+    static constexpr int audio_opens_per_frame = 1;
+    int audio_opens_this_frame_ = 0;
 
     // A picture part-way through being decoded.  Held across frames, because
     // a large one is twenty milliseconds of work and no frame can take that
@@ -1000,7 +1013,11 @@ private:
 
     // Read-ahead only: what a channel is playing is never evicted.
     static constexpr std::size_t audio_decode_budget_bytes = 96ull << 20;
-    static constexpr std::size_t audio_decode_queue_limit = 10;
+    // Five per archive, not ten overall.  Everything queued here is already
+    // in the byte cache, so depth buys nothing against the network - it only
+    // decides how much speculative decoding happens, and five covers the next
+    // line whichever way a branch goes.
+    static constexpr std::size_t audio_decode_queue_limit = 5;
 
     std::shared_ptr<th2::AudioDecoder> audio_decoder(
         const th2::Archive& archive, std::string_view name, int rank);

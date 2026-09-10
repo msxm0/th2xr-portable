@@ -567,6 +567,7 @@ void Game::iterate()
     // One allowance for every subsystem that works ahead, spent in the order
     // they ask.  Reset here so it covers the whole frame.
     background_budget_.begin_frame();
+    audio_opens_this_frame_ = 0;
     update_image_decode();
     if (prefetch_scan_pending_ || prefetch_follow_pending_) {
         const auto now = std::chrono::steady_clock::now();

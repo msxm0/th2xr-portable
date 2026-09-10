@@ -95,8 +95,13 @@ int Game::prefetch_event_assets(
         if (!character || !pose || *character < 0 || *pose < 0) {
             return 0;
         }
-        return request(
-            graphics_, th2::character_asset_name(*character, *pose));
+        const auto asset = th2::character_asset_name(*character, *pose);
+        const int requested = request(graphics_, asset);
+        // Capped at five, unlike the first attempt at this: the lookahead
+        // sees every pose across every branch, and decoding all of them cost
+        // nine times what it used.
+        request_image_decode(false, asset);
+        return requested;
     }
     if (name == "B" || name == "BT" || name == "BC" || name == "BCT") {
         // A pattern wipe needs its mask prepared as well as its background
@@ -303,6 +308,13 @@ int Game::prefetch_script_start(const std::string& name, int budget)
 
 void Game::prefetch_upcoming_assets()
 {
+    // The queues are rebuilt rather than appended to, so they always hold the
+    // nearest few rather than whatever an earlier scan happened to leave
+    // behind.  Work already under way is held elsewhere - a part-decoded
+    // picture in pending_image_, an open decoder in audio_decoders_ - so
+    // nothing in progress is lost.
+    image_decode_queue_.clear();
+    audio_decode_queue_.clear();
 
 
 
