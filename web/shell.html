@@ -279,8 +279,11 @@
             + Math.round(box.width) + 'x' + Math.round(box.height)
             + ' @' + Math.round(box.left) + ',' + Math.round(box.top);
         })(),
-        'canvas pad ' + (getComputedStyle(canvas).paddingTop || '0') + '/'
-          + (getComputedStyle(canvas).paddingLeft || '0'),
+        'canvas pad ' + (() => {
+          // One style resolution, not two: getComputedStyle forces one.
+          const style = getComputedStyle(canvas);
+          return (style.paddingTop || '0') + '/' + (style.paddingLeft || '0');
+        })(),
         'published  ' + (engine.published || '?'),
         'sdl window ' + (engine.window || '?')
           + '  pixels ' + (engine.pixels || '?'),

@@ -502,19 +502,17 @@ void Game::sync_web_viewport()
 // readings the engine cannot take for itself - the canvas's measured box and
 // its real backing store - and they are already in the slot, so displaying
 // them costs nothing.
+#ifdef __EMSCRIPTEN__
 void Game::web_published_sizes(
     int* box_width, int* box_height,
     int* buffer_width, int* buffer_height) const
 {
-#ifdef __EMSCRIPTEN__
     *box_width = web_viewport_slot.width;
     *box_height = web_viewport_slot.height;
     *buffer_width = web_viewport_slot.buffer_width;
     *buffer_height = web_viewport_slot.buffer_height;
-#else
-    *box_width = *box_height = *buffer_width = *buffer_height = 0;
-#endif
 }
+#endif
 
 void Game::sync_web_canvas_buffer()
 {
@@ -1006,15 +1004,14 @@ void Game::iterate()
             int window_height = 0;
             int pixel_width = 0;
             int pixel_height = 0;
-            int box_width = 0;
-            int box_height = 0;
-            double box_ratio = 1.0;
             SDL_GetWindowSize(window_, &window_width, &window_height);
             SDL_GetWindowSizeInPixels(window_, &pixel_width, &pixel_height);
-            th2_web_canvas_box(&box_width, &box_height, &box_ratio);
+            // Straight out of the slot; asking JS for it would be a crossing
+            // to fetch a number already sitting in our own memory.
             th2_web_publish_metrics(
-                window_width, window_height, pixel_width, pixel_height, output_width, output_height,
-                box_width, box_height,
+                window_width, window_height, pixel_width, pixel_height,
+                output_width, output_height,
+                web_viewport_slot.width, web_viewport_slot.height,
                 SDL_GetWindowPixelDensity(window_),
                 SDL_GetWindowDisplayScale(window_));
         }

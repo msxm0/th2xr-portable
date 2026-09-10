@@ -308,13 +308,9 @@ void Game::draw_config()
                 ImGui::TextDisabled(
                     "Dumps are written to debug/transitions/");
                 if (ImGui::TreeNode("Viewport sizes")) {
-                    // Everything here is already in hand or a cached read, so
-                    // showing it costs nothing.  The page's own numbers are
-                    // deliberately not here: fetching them would mean calling
-                    // into the browser, and this panel is drawn inside the
-                    // very area that is wrong when they disagree.  ?vpdebug=1
-                    // shows those, outside the canvas, where they stay
-                    // readable.
+                    // Only evaluated while the node is open, and every
+                    // reading here is either already in hand or a cached
+                    // field, so showing it costs nothing.
                     int window_width = 0;
                     int window_height = 0;
                     int pixel_width = 0;
