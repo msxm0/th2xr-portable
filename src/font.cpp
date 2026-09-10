@@ -454,10 +454,22 @@ void GameFont::configure(
     bool authentic, std::string_view family, int font_size,
     float framebuffer_scale)
 {
+    // Called once a frame with the same arguments almost every time, so the
+    // assignment below is worth skipping: it copies a std::string, which
+    // reaches the heap as soon as the family name outgrows the small-string
+    // buffer.
+    const std::string_view resolved =
+        family.empty() ? std::string_view("sans-serif") : family;
+    const int clamped_size = std::clamp(font_size, 12, 48);
+    const float scale = std::max(framebuffer_scale, 1.0f);
+    if (authentic_ == authentic && family_ == resolved
+        && font_size_ == clamped_size && framebuffer_scale_ == scale) {
+        return;
+    }
     authentic_ = authentic;
-    family_ = family.empty() ? "sans-serif" : std::string(family);
-    font_size_ = std::clamp(font_size, 12, 48);
-    framebuffer_scale_ = std::max(framebuffer_scale, 1.0f);
+    family_ = resolved;
+    font_size_ = clamped_size;
+    framebuffer_scale_ = scale;
 }
 
 float GameFont::text_width(std::string_view text) const

@@ -258,14 +258,34 @@
     }, 250);
   }
 
+  // Reused rather than rebuilt, and only written when something actually
+  // moved.  The backstop timer and the observer both call this far more often
+  // than the box changes, and every call used to allocate an object and wake
+  // the engine for a comparison it was going to fail.
+  const viewportBox = {width: 0, height: 0};
+  let publishedWidth = 0;
+  let publishedHeight = 0;
+  let publishedRatio = 0;
+
   function publishBox(width, height) {
-    window.__th2Viewport = {
-      width: Math.round(width), height: Math.round(height)};
+    const nextWidth = Math.round(width);
+    const nextHeight = Math.round(height);
+    const nextRatio = window.devicePixelRatio;
+    if (nextWidth === publishedWidth && nextHeight === publishedHeight
+        && nextRatio === publishedRatio) {
+      return;
+    }
+    publishedWidth = nextWidth;
+    publishedHeight = nextHeight;
+    publishedRatio = nextRatio;
+    viewportBox.width = nextWidth;
+    viewportBox.height = nextHeight;
+    window.__th2Viewport = viewportBox;
     // Push it into the engine rather than leaving the engine to ask once a
     // frame.  The bridge appears when the engine starts; until then the
     // object above is what it reads on the way up.
     if (window.__th2PublishViewport) {
-      window.__th2PublishViewport(width, height, window.devicePixelRatio);
+      window.__th2PublishViewport(nextWidth, nextHeight, nextRatio);
     }
   }
 
