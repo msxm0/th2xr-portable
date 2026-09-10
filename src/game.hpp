@@ -508,6 +508,9 @@ private:
     bool prefetch_scan_pending_ = false;
     // A follow that was put off because the engine was busy animating.
     bool prefetch_follow_pending_ = false;
+    // Scratch for the CPU transition blends, kept so a wipe allocates once
+    // rather than once a frame.
+    std::vector<std::uint8_t> transition_pixels_;
     std::chrono::steady_clock::time_point last_metrics_publish_{};
     std::chrono::steady_clock::time_point last_viewport_poll_{};
     int web_viewport_generation_ = 0;

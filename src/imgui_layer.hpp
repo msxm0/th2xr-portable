@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 // Platforms where touch is a first-class input: SDL's synthetic touch-mouse
 // events are turned off there (see the SDL_HINT_TOUCH_MOUSE_EVENTS hint in
@@ -63,6 +64,10 @@ private:
     std::uint64_t last_frame_ticks_ = 0;
     std::string imgui_font_path_;
     float display_scale_ = 1.0f;
+    // Kept between frames so the per-frame conversion below reuses their
+    // capacity instead of allocating for every draw command.
+    std::vector<SDL_Vertex> vertices_;
+    std::vector<int> indices_;
     float last_font_scale_ = 0.0f;
     float last_style_scale_ = 0.0f;
 #ifdef __ANDROID__

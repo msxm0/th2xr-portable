@@ -388,11 +388,13 @@ void ImGuiLayer::render()
     }
     for (int list_index = 0; list_index < data->CmdListsCount; ++list_index) {
         const auto* list = data->CmdLists[list_index];
-        std::vector<SDL_Vertex> vertices;
-        vertices.reserve(list->VtxBuffer.Size);
+        // Cleared, not rebuilt: capacity survives the frame, so a steady UI
+        // stops allocating entirely after the first one.
+        vertices_.clear();
+        vertices_.reserve(list->VtxBuffer.Size);
         for (const auto& vertex : list->VtxBuffer) {
             const auto color = vertex.col;
-            vertices.push_back(SDL_Vertex{
+            vertices_.push_back(SDL_Vertex{
                 {vertex.pos.x, vertex.pos.y},
                 {
                     ((color >> IM_COL32_R_SHIFT) & 0xff) / 255.0f,
@@ -416,17 +418,17 @@ void ImGuiLayer::render()
             };
             SDL_SetRenderClipRect(renderer_, &clip);
             auto* texture = sdl_texture(command.GetTexID());
-            std::vector<int> indices;
-            indices.reserve(command.ElemCount);
+            indices_.clear();
+            indices_.reserve(command.ElemCount);
             for (unsigned int i = 0; i < command.ElemCount; ++i) {
-                indices.push_back(
+                indices_.push_back(
                     list->IdxBuffer[command.IdxOffset + i]
                     + static_cast<int>(command.VtxOffset));
             }
             SDL_RenderGeometry(
-                renderer_, texture, vertices.data(),
-                static_cast<int>(vertices.size()),
-                indices.data(), static_cast<int>(indices.size()));
+                renderer_, texture, vertices_.data(),
+                static_cast<int>(vertices_.size()),
+                indices_.data(), static_cast<int>(indices_.size()));
         }
     }
     SDL_SetRenderClipRect(renderer_, nullptr);

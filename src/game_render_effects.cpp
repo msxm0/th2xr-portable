@@ -438,8 +438,11 @@ void Game::draw_pattern_transition(float progress)
 
     const int width = transition.next_pixels->w;
     const int height = transition.next_pixels->h;
-    std::vector<std::uint8_t> pixels(
-        static_cast<std::size_t>(width) * height * 4);
+    // Reused across the frames of a wipe rather than reallocated and zeroed
+    // for each one: at 800x600 that was ~1.9MB of allocation and a memset
+    // every frame, for a buffer every byte of which is overwritten below.
+    auto& pixels = transition_pixels_;
+    pixels.resize(static_cast<std::size_t>(width) * height * 4);
     const auto* previous =
         static_cast<const std::uint8_t*>(transition.previous_pixels->pixels);
     const auto* next =
@@ -514,8 +517,8 @@ void Game::draw_pixel_transition(float progress)
     const int width = transition.next_pixels->w;
     const int height = transition.next_pixels->h;
     const int rate = std::clamp(static_cast<int>(progress * 256.0f), 0, 256);
-    std::vector<std::uint8_t> pixels(
-        static_cast<std::size_t>(width) * height * 4);
+    auto& pixels = transition_pixels_;
+    pixels.resize(static_cast<std::size_t>(width) * height * 4);
     const auto* previous =
         static_cast<const std::uint8_t*>(transition.previous_pixels->pixels);
     const auto* next =
