@@ -474,6 +474,16 @@ if(EMSCRIPTEN)
         "SHELL:--shell-file ${CMAKE_CURRENT_SOURCE_DIR}/web/shell.html"
         # SHELL: keeps CMake from collapsing the repeated --preload-file flags.
         "SHELL:--preload-file ${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/assets/fonts@/fonts")
+    # Off by default: it keeps every function name in the wasm, which makes
+    # the download bigger for no benefit to a player.  On, a CPU profile from
+    # the browser names our functions instead of numbering them, and the
+    # symbol map lets the harness resolve the ones it still numbers.
+    option(TH2_WASM_PROFILING "Keep wasm function names for profiling" OFF)
+    if(TH2_WASM_PROFILING)
+        target_link_options(toheart2 PRIVATE
+            --profiling-funcs
+            --emit-symbol-map)
+    endif()
     set_property(TARGET toheart2 APPEND PROPERTY LINK_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/web/shell.html")
 endif()
