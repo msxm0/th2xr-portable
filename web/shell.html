@@ -234,17 +234,14 @@
     // fullscreens a container div it wraps around the canvas - so the surest
     // way to stay visible is to move into that subtree, whether or not the
     // browser supports popovers.
-    // Only into an element that actually renders its children.  A canvas's
-    // children are fallback content and are never painted, so moving into one
-    // hides the panel rather than saving it; whether the fullscreen element
-    // is the canvas or a container emscripten wrapped around it depends on
-    // the browser, so this has to be checked rather than assumed.
-    const REPLACED = ['canvas', 'img', 'video', 'iframe', 'embed', 'object'];
+    // Into the fullscreen element itself, which is what actually rendered on
+    // a phone.  Reasoning said this could not work when that element is the
+    // canvas, whose children are fallback content - and a desktop
+    // visibility check agreed - but the device showed the panel anyway, with
+    // the popover holding it in the top layer.  The device wins.  The
+    // config panel carries the same numbers for when this does not.
     const relocate = () => {
-      const target = document.fullscreenElement;
-      const host = (target
-        && !REPLACED.includes(target.tagName.toLowerCase()))
-        ? target : document.body;
+      const host = document.fullscreenElement || document.body;
       if (panel.parentNode !== host) {
         try {
           if (panel.matches(':popover-open')) {
@@ -426,14 +423,24 @@
   function resyncViewport() {
     lastWidth = lastHeight = lastRatio = 0;
     syncViewport();
-    // The canvas ResizeObserver reports any box change on its own, so this
-    // only has to catch a device pixel ratio that changed without one.
+    // Staggered, because these are the moments the canvas gets resized out
+    // from under us and none of them are finished when they are announced:
+    // emscripten sizes the backing store during a fullscreen transition from
+    // whatever the screen measures at that instant, and a rotation and a
+    // restored GL context both land in stages.  The observer sees a box that
+    // changes; it cannot see a backing store that was set short, so this is
+    // what catches it.
     requestAnimationFrame(syncViewport);
-    setTimeout(syncViewport, 350);
+    for (const delay of [50, 150, 350, 700, 1200, 2000]) {
+      setTimeout(syncViewport, delay);
+    }
   }
 
   window.addEventListener('orientationchange', resyncViewport);
   document.addEventListener('fullscreenchange', resyncViewport);
+  // A restored context comes back with a backing store of its own.
+  canvas.addEventListener('webglcontextrestored', resyncViewport);
+  canvas.addEventListener('webglcontextlost', resyncViewport);
   if (window.screen && screen.orientation) {
     screen.orientation.addEventListener('change', resyncViewport);
   }
