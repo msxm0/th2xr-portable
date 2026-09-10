@@ -762,6 +762,80 @@ std::optional<std::size_t> Game::overlay_index(int requested) const
     return static_cast<std::size_t>(requested);
 }
 
+void Game::request_image_decode(bool background, std::string_view name)
+{
+    if (name.empty()) {
+        return;
+    }
+    const auto& source = background ? backgrounds_ : graphics_;
+    const auto* entry = source.find(name);
+    // Only once the bytes are here.  Reading them is what suspends the wasm
+    // stack for a fetch, and doing that from the decode-ahead would move the
+    // wait rather than remove it.
+    if (!entry || !source.resident(*entry)) {
+        return;
+    }
+    auto key = std::string(background ? "bak:" : "grp:") + std::string(name);
+    if (decoded_images_.contains(key)) {
+        return;
+    }
+    if (std::ranges::find(image_decode_queue_, key)
+        != image_decode_queue_.end()) {
+        return;
+    }
+    image_decode_queue_.push_back(std::move(key));
+}
+
+void Game::update_image_decode()
+{
+    if (image_decode_queue_.empty()) {
+        return;
+    }
+    // One per frame at most.  A background is a few milliseconds to decode,
+    // so this is not something to run twice on the same frame just because
+    // there is a queue.
+    const auto key = image_decode_queue_.front();
+    image_decode_queue_.pop_front();
+    if (decoded_images_.contains(key)) {
+        return;
+    }
+    const bool background = key.starts_with("bak:");
+    const std::string name = key.substr(4);
+    const auto& source = background ? backgrounds_ : graphics_;
+    const auto* entry = source.find(name);
+    if (!entry || !source.resident(*entry)) {
+        return;
+    }
+    try {
+        auto surface = th2app::decode_image(source, name);
+        if (!surface) {
+            return;
+        }
+        while (decoded_images_.size() >= decoded_image_limit) {
+            decoded_images_.erase(decoded_images_.begin());
+        }
+        decoded_images_.emplace(key, std::move(surface));
+    } catch (const std::exception& error) {
+        // A picture that will not decode is not worth a crash here; the load
+        // path will hit the same failure and report it in context.
+        SDL_Log("pre-decode of %s failed: %s", name.c_str(), error.what());
+    }
+}
+
+Surface Game::take_predecoded_image(bool background, std::string_view name)
+{
+    const auto key =
+        std::string(background ? "bak:" : "grp:") + std::string(name);
+    const auto found = decoded_images_.find(key);
+    if (found == decoded_images_.end()) {
+        return {};
+    }
+    // Handed over rather than shared: the tone curves rewrite it in place.
+    Surface surface = std::move(found->second);
+    decoded_images_.erase(found);
+    return surface;
+}
+
 void Game::load_overlay(
     std::size_t slot, std::string name, std::string archive,
     int tone_type)
@@ -772,7 +846,8 @@ void Game::load_overlay(
         tone_type == 1
             ? character_tone_curves()
             : background_tone_curves(),
-        &overlay_pixels_[slot]);
+        &overlay_pixels_[slot],
+        take_predecoded_image(archive == "bak", name));
     auto& state = overlay_states_[slot];
     state = {};
     state.name = std::move(name);

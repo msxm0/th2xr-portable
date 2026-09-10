@@ -145,7 +145,14 @@ int Game::prefetch_event_assets(
         if (!asset || !pack || asset->empty()) {
             return 0;
         }
-        return request(*pack == "bak" ? backgrounds_ : graphics_, *asset);
+        const bool background = *pack == "bak";
+        const int requested =
+            request(background ? backgrounds_ : graphics_, *asset);
+        // Queue the decode too.  request_image_decode() only takes it up once
+        // the bytes have arrived, so a miss here simply means the next scan
+        // catches it.
+        request_image_decode(background, *asset);
+        return requested;
     }
     if (name == "M") {
         const auto* track = literal(event, 0);

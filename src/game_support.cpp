@@ -263,21 +263,33 @@ Texture load_texture(SDL_Renderer* renderer, const th2::Archive& archive,
     return Texture(texture);
 }
 
-Texture load_toned_texture(
-    SDL_Renderer* renderer,
-    const th2::Archive& image_archive,
-    std::string_view image_name,
-    const th2::Archive& curve_archive,
-    const std::vector<ToneCurveSpec>& curves,
-    Surface* pixels)
+Surface decode_image(
+    const th2::Archive& image_archive, std::string_view image_name)
 {
     const auto* image = image_archive.find(image_name);
     if (!image) {
         throw std::runtime_error(
             "image not found: " + std::string(image_name));
     }
-    Surface surface(
-        th2::load_image(image_archive.read(*image), image->name));
+    return Surface(th2::load_image(image_archive.read(*image), image->name));
+}
+
+Texture load_toned_texture(
+    SDL_Renderer* renderer,
+    const th2::Archive& image_archive,
+    std::string_view image_name,
+    const th2::Archive& curve_archive,
+    const std::vector<ToneCurveSpec>& curves,
+    Surface* pixels,
+    Surface predecoded)
+{
+    // Decoding is the expensive half - LZS, then TGA, then a conversion per
+    // pixel - and it is what lands on the frame where the scene changes.  A
+    // caller that decoded it earlier hands the surface in; the tone curves
+    // below rewrite it, so what arrives must already be a private copy.
+    Surface surface = predecoded
+        ? std::move(predecoded)
+        : decode_image(image_archive, image_name);
     for (const auto& curve : curves) {
         if (curve.name.empty()) {
             th2::apply_tone_curve(surface.get(), {}, curve.vividness);

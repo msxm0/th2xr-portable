@@ -9,6 +9,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace th2 {
@@ -31,6 +32,14 @@ public:
     };
     static std::span<const BundledFont> bundled_fonts();
     float text_width(std::string_view text) const;
+    // Cumulative width at every glyph boundary of a line, measured once and
+    // remembered.  Drawing a partially revealed line needs the left and right
+    // edge of each glyph, and asking text_width() for a prefix per glyph
+    // re-measures the whole line from the start every time - quadratic in the
+    // line, repeated every frame, which put FreeType's kerning lookup among
+    // the busiest functions in a playthrough.  Entry k is the width of the
+    // first k glyphs, so entry 0 is 0 and the last entry is the whole line.
+    const std::vector<float>& glyph_boundaries(std::string_view line) const;
     // Line advance the face itself asks for, in logical units; 0 when the
     // modern font is unavailable.
     float line_height() const;
@@ -62,6 +71,8 @@ private:
     std::vector<std::uint8_t> shadow_data_;
     int shadow_width_ = 0;
     std::unique_ptr<Modern> modern_;
+    mutable std::unordered_map<std::string, std::vector<float>>
+        boundary_cache_;
     bool authentic_ = false;
     std::string family_;
     int font_size_ = size;

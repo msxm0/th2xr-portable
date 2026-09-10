@@ -564,6 +564,9 @@ void Game::iterate()
     // its cost lands on an idle frame instead of the one the player's click
     // is already busy with.  It is throttled because skipping advances the
     // script far faster than the network can answer anyway.
+    // One decoded background per frame at most, and only when one is queued
+    // and its bytes are already here.
+    update_image_decode();
     if (prefetch_scan_pending_ || prefetch_follow_pending_) {
         const auto now = std::chrono::steady_clock::now();
         if (now - last_prefetch_scan_ >= std::chrono::milliseconds(50)) {

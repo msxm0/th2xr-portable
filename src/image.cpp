@@ -103,6 +103,11 @@ SDL_Surface* load_tga(std::span<const std::uint8_t> bytes)
     }
     auto* destination = static_cast<std::uint32_t*>(surface->pixels);
     const int destination_pitch = surface->pitch / sizeof(std::uint32_t);
+    // Once, not once per pixel: SDL_GetPixelFormatDetails() is a hash table
+    // lookup, and calling it inside the loop below made SDL_FindInHashTable
+    // one of the busiest functions in a playthrough profile - 10 seconds of
+    // it, all to fetch the same pointer a few million times.
+    const auto* details = SDL_GetPixelFormatDetails(surface->format);
 
     for (int source_y = 0; source_y < height; ++source_y) {
         const int destination_y = top_origin ? source_y : height - source_y - 1;
@@ -121,7 +126,7 @@ SDL_Surface* load_tga(std::span<const std::uint8_t> bytes)
                 position += source_pixel_size;
             }
             destination[destination_y * destination_pitch + x]
-                = SDL_MapRGBA(SDL_GetPixelFormatDetails(surface->format), nullptr,
+                = SDL_MapRGBA(details, nullptr,
                               color[0], color[1], color[2], color[3]);
         }
     }

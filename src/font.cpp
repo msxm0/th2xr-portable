@@ -470,6 +470,61 @@ void GameFont::configure(
     family_ = resolved;
     font_size_ = clamped_size;
     framebuffer_scale_ = scale;
+    // Every cached measurement was taken with the old face and size.
+    boundary_cache_.clear();
+}
+
+namespace {
+
+// Bytes in the UTF-8 sequence at the front of text, stepping exactly the way
+// Game::utf8_prefix_bytes() does.  It has to be exactly: the caller walks the
+// line with that one and indexes the table built here, so any input the two
+// disagreed about - a truncated sequence, a stray continuation byte - would
+// slide every glyph after it sideways.
+std::size_t utf8_sequence_bytes(std::string_view text)
+{
+    if (text.empty()) {
+        return 0;
+    }
+    const auto byte = static_cast<unsigned char>(text.front());
+    const std::size_t bytes = byte < 0x80 ? 1
+        : byte < 0xe0 ? 2
+        : byte < 0xf0 ? 3
+        : 4;
+    return std::min(bytes, text.size());
+}
+
+}  // namespace
+
+const std::vector<float>& GameFont::glyph_boundaries(
+    std::string_view line) const
+{
+    if (const auto found = boundary_cache_.find(std::string(line));
+        found != boundary_cache_.end()) {
+        return found->second;
+    }
+    // Built once per line rather than per glyph per frame.  Each entry is
+    // still a real measurement of the prefix, so kerning is accounted for
+    // exactly as before and the text lands in the same place; what goes away
+    // is measuring it again on every frame the line is on screen.
+    std::vector<float> boundaries;
+    boundaries.push_back(0.0f);
+    std::size_t offset = 0;
+    while (offset < line.size()) {
+        const auto bytes = utf8_sequence_bytes(line.substr(offset));
+        if (bytes == 0) {
+            break;
+        }
+        offset += bytes;
+        boundaries.push_back(text_width(line.substr(0, offset)));
+    }
+    // Bounded: a long scene can put thousands of distinct lines through here,
+    // and this is a convenience, not a record worth keeping.
+    if (boundary_cache_.size() > 512) {
+        boundary_cache_.clear();
+    }
+    return boundary_cache_.emplace(std::string(line), std::move(boundaries))
+        .first->second;
 }
 
 float GameFont::text_width(std::string_view text) const

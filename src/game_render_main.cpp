@@ -845,6 +845,11 @@ void Game::draw_frame()
             }
             std::size_t glyph_offset = 0;
             float authentic_x = x;
+            // Measured once for the line and reused for every glyph in it,
+            // instead of asking for the width of a growing prefix twice per
+            // glyph per frame.
+            const auto& boundaries = font_.glyph_boundaries(line);
+            std::size_t glyph_index_in_line = 0;
             while (glyph_offset < line.size()) {
                 const auto glyph_bytes = utf8_prefix_bytes(
                     std::string_view(line).substr(glyph_offset), 1);
@@ -875,16 +880,16 @@ void Game::draw_frame()
                             255, 255, 255, alpha);
                         authentic_x += font_.text_width(glyph);
                         glyph_offset += glyph_bytes;
+                        ++glyph_index_in_line;
                         continue;
                     }
-                    const auto prefix =
-                        std::string_view(line).substr(0, glyph_offset);
-                    const auto through_glyph =
-                        std::string_view(line).substr(0, glyph_end);
+                    (void)glyph_end;
                     const float glyph_left =
-                        x + font_.text_width(prefix);
+                        x + boundaries[std::min(glyph_index_in_line,
+                                                boundaries.size() - 1)];
                     const float glyph_right =
-                        x + font_.text_width(through_glyph);
+                        x + boundaries[std::min(glyph_index_in_line + 1,
+                                                boundaries.size() - 1)];
                     const SDL_Rect clip{
                         static_cast<int>(std::floor(glyph_left)),
                         static_cast<int>(std::floor(y)),
@@ -905,6 +910,7 @@ void Game::draw_frame()
                     SDL_SetRenderClipRect(renderer_, nullptr);
                 }
                 glyph_offset += glyph_bytes;
+                ++glyph_index_in_line;
             }
             source_cursor = line_start + line.size();
             y += text_line_height();

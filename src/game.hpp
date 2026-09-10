@@ -19,6 +19,8 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_iostream.h>
 #include <array>
+#include <deque>
+#include <unordered_map>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -76,13 +78,18 @@ struct ToneCurveSpec {
     std::string name;
     int vividness = 256;
 };
+// Decodes an image without touching the renderer, so it can be done on a
+// frame that has time rather than on the one that needs the picture.
+Surface decode_image(
+    const th2::Archive& image_archive, std::string_view image_name);
 Texture load_toned_texture(
     SDL_Renderer* renderer,
     const th2::Archive& image_archive,
     std::string_view image_name,
     const th2::Archive& curve_archive,
     const std::vector<ToneCurveSpec>& curves,
-    Surface* pixels = nullptr);
+    Surface* pixels = nullptr,
+    Surface predecoded = {});
 th2::AudioClip load_audio(const th2::Archive& archive, std::string_view name);
 int scenario_number(std::string_view name);
 // Left edge of the message sidebar, from HistorySystemRectX[] in the
@@ -423,6 +430,12 @@ private:
     // Keeps SDL's window in step with the page's canvas (browser only).
     void sync_web_viewport();
     void sync_web_canvas_buffer();
+    // Decoding an upcoming background before the script asks for it.  The
+    // bytes are already being prefetched; this is the other half, and it is
+    // the half that lands on the frame where the scene changes.
+    void request_image_decode(bool background, std::string_view name);
+    void update_image_decode();
+    Surface take_predecoded_image(bool background, std::string_view name);
 #ifdef __EMSCRIPTEN__
     void web_published_sizes(int* box_width, int* box_height,
                              int* buffer_width,
@@ -517,6 +530,11 @@ private:
     // Scratch for the CPU transition blends, kept so a wipe allocates once
     // rather than once a frame.
     std::vector<std::uint8_t> transition_pixels_;
+    // Keyed by archive and name.  Small: a couple of backgrounds in flight,
+    // not a history of everything seen.
+    std::unordered_map<std::string, Surface> decoded_images_;
+    std::deque<std::string> image_decode_queue_;
+    static constexpr std::size_t decoded_image_limit = 6;
     std::chrono::steady_clock::time_point last_metrics_publish_{};
     std::chrono::steady_clock::time_point last_viewport_poll_{};
     int web_viewport_generation_ = 0;
