@@ -498,6 +498,24 @@ void Game::sync_web_viewport()
 #endif
 }
 
+// What the page last published, for the config panel to show.  These are the
+// readings the engine cannot take for itself - the canvas's measured box and
+// its real backing store - and they are already in the slot, so displaying
+// them costs nothing.
+void Game::web_published_sizes(
+    int* box_width, int* box_height,
+    int* buffer_width, int* buffer_height) const
+{
+#ifdef __EMSCRIPTEN__
+    *box_width = web_viewport_slot.width;
+    *box_height = web_viewport_slot.height;
+    *buffer_width = web_viewport_slot.buffer_width;
+    *buffer_height = web_viewport_slot.buffer_height;
+#else
+    *box_width = *box_height = *buffer_width = *buffer_height = 0;
+#endif
+}
+
 void Game::sync_web_canvas_buffer()
 {
 #ifdef __EMSCRIPTEN__

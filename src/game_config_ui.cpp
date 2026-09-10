@@ -334,6 +334,28 @@ void Game::draw_config()
                         "density %.3f  scale %.3f",
                         SDL_GetWindowPixelDensity(window_),
                         SDL_GetWindowDisplayScale(window_));
+#ifdef __EMSCRIPTEN__
+                    // The page's own readings.  SDL derives its pixel size
+                    // rather than measuring the canvas, so these are the only
+                    // numbers that can contradict it - and the browser will
+                    // not paint an HTML overlay over a fullscreen element,
+                    // which is exactly when they are wanted.
+                    int box_width = 0;
+                    int box_height = 0;
+                    int buffer_width = 0;
+                    int buffer_height = 0;
+                    web_published_sizes(&box_width, &box_height,
+                                        &buffer_width, &buffer_height);
+                    ImGui::Text("canvas css %dx%d", box_width, box_height);
+                    const bool buffer_agrees =
+                        buffer_width == pixel_width
+                        && buffer_height == pixel_height;
+                    ImGui::TextColored(
+                        buffer_agrees ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f)
+                                      : ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                        "canvas buf %dx%d%s", buffer_width, buffer_height,
+                        buffer_agrees ? "" : "  <- disagrees with pixels");
+#endif
                     ImGui::TreePop();
                 }
                 ImGui::EndTabItem();
