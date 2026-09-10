@@ -299,9 +299,6 @@
   // than the box changes, and every call used to allocate an object and wake
   // the engine for a comparison it was going to fail.
   const viewportBox = {width: 0, height: 0};
-  let publishedWidth = 0;
-  let publishedHeight = 0;
-  let publishedRatio = 0;
 
   function publishBox(width, height) {
     const nextWidth = Math.round(width);
@@ -314,9 +311,6 @@
     // anything which resizes the canvas behind our back is never corrected,
     // because the box we would compare against never changed.  That is worth
     // far more than the writes it saves.
-    publishedWidth = nextWidth;
-    publishedHeight = nextHeight;
-    publishedRatio = nextRatio;
     viewportBox.width = nextWidth;
     viewportBox.height = nextHeight;
     window.__th2Viewport = viewportBox;
