@@ -336,27 +336,50 @@ struct WebViewportSlot {
     int height;
     int ratio_milli;
     int generation;
+    // The canvas's real backing store.  SDL derives its own pixel size from
+    // the window size and the pixel ratio and never reads this, so the two
+    // can disagree with nothing noticing.
+    int buffer_width;
+    int buffer_height;
 };
 WebViewportSlot web_viewport_slot{};
+
+// Sets the canvas backing store to what SDL thinks it already is.  This is
+// what emscripten_set_canvas_element_size() does; going through
+// SDL_SetWindowSize() would not, because it returns early when the window
+// size it is given matches the one it already holds - which is exactly the
+// case here.
+EM_JS(void, th2_web_force_canvas_buffer, (int width, int height), {
+    var canvas = Module['canvas'] || document.getElementById('canvas');
+    if (canvas && width > 0 && height > 0) {
+        canvas.width = width;
+        canvas.height = height;
+    }
+});
 
 EM_JS(void, th2_web_install_viewport_bridge, (WebViewportSlot* slot), {
     // This body runs in the module's scope, so HEAP32 resolves here and keeps
     // resolving after a memory growth reassigns it.
     var base = slot >> 2;
-    window.__th2PublishViewport = function(width, height, ratio) {
+    window.__th2PublishViewport = function(width, height, ratio,
+                                           bufferWidth, bufferHeight) {
         if (!(width > 0) || !(height > 0)) {
             return;
         }
         HEAP32[base] = Math.round(width);
         HEAP32[base + 1] = Math.round(height);
         HEAP32[base + 2] = Math.round(ratio * 1000);
+        HEAP32[base + 4] = bufferWidth | 0;
+        HEAP32[base + 5] = bufferHeight | 0;
         HEAP32[base + 3] = (HEAP32[base + 3] | 0) + 1;
     };
     // Whatever the page already measured, before the engine was up to hear it.
     if (window.__th2Viewport) {
+        var canvas = Module['canvas'] || document.getElementById('canvas');
         window.__th2PublishViewport(
             window.__th2Viewport.width, window.__th2Viewport.height,
-            window.devicePixelRatio);
+            window.devicePixelRatio,
+            canvas ? canvas.width : 0, canvas ? canvas.height : 0);
     }
 });
 
@@ -475,9 +498,45 @@ void Game::sync_web_viewport()
 #endif
 }
 
+void Game::sync_web_canvas_buffer()
+{
+#ifdef __EMSCRIPTEN__
+    // Entering fullscreen on a phone, emscripten sizes the backing store from
+    // whatever the screen measured mid-transition, which can be short of the
+    // settled height - 1967x2056 against 1967x2183 on the device this was
+    // found on.  SDL never notices, because it derives its pixel size from
+    // the window size and the pixel ratio rather than reading the canvas, so
+    // both sides agree with each other while the canvas agrees with neither
+    // and the frame is drawn into a viewport taller than the buffer holding
+    // it.  Nothing else corrects this; a rotation only helped because it
+    // resized the canvas from scratch.
+    const int actual_width = web_viewport_slot.buffer_width;
+    const int actual_height = web_viewport_slot.buffer_height;
+    if (actual_width <= 0 || actual_height <= 0) {
+        return;
+    }
+    int expected_width = 0;
+    int expected_height = 0;
+    if (!SDL_GetWindowSizeInPixels(
+            window_, &expected_width, &expected_height)
+        || expected_width <= 0 || expected_height <= 0) {
+        return;
+    }
+    if (actual_width == expected_width && actual_height == expected_height) {
+        return;
+    }
+    SDL_Log("canvas backing store is %dx%d but SDL draws %dx%d; correcting",
+            actual_width, actual_height, expected_width, expected_height);
+    th2_web_force_canvas_buffer(expected_width, expected_height);
+#endif
+}
+
 void Game::iterate()
 {
     sync_web_viewport();
+    // Reads two ints the page publishes and compares them; it does not go
+    // near the browser unless they actually disagree.
+    sync_web_canvas_buffer();
     // Before any event is looked at, not after: process_event() scales touch
     // positions by this, and entering fullscreen changes it, so leaving it
     // until new_frame() maps a frame's worth of input with the old scale -
@@ -901,9 +960,15 @@ void Game::iterate()
         // current.  If the shader will not build, available() stays false
         // and every wipe keeps the CPU blend.
         gl_transition_ = std::make_unique<th2::GlPatternTransition>(renderer_);
+        // Reports what will actually run, which is not the same question as
+        // whether the shader built: --cpu-transitions leaves it built and
+        // unused, and a line saying "GPU shader" in that case sent a
+        // comparison run off to measure the GPU path against itself.
         SDL_Log(
             "pattern wipes: %s",
-            gl_transition_->available() ? "GPU shader" : "CPU blend");
+            th2app::force_cpu_transitions
+                ? "CPU blend (forced)"
+                : (gl_transition_->available() ? "GPU shader" : "CPU blend"));
     }
     int output_width = 800;
     int output_height = 600;

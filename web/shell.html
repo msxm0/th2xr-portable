@@ -229,10 +229,36 @@
     if ('popover' in panel) {
       panel.popover = 'manual';
     }
-    document.body.appendChild(panel);
-    showPanel();
-    // Entering fullscreen can drop it out of the top layer, so put it back.
-    document.addEventListener('fullscreenchange', showPanel);
+    // Fullscreen paints the fullscreen element's subtree and the top layer,
+    // and nothing else.  SDL asks emscripten for fullscreen, and emscripten
+    // fullscreens a container div it wraps around the canvas - so the surest
+    // way to stay visible is to move into that subtree, whether or not the
+    // browser supports popovers.
+    // Only into an element that actually renders its children.  A canvas's
+    // children are fallback content and are never painted, so moving into one
+    // hides the panel rather than saving it; whether the fullscreen element
+    // is the canvas or a container emscripten wrapped around it depends on
+    // the browser, so this has to be checked rather than assumed.
+    const REPLACED = ['canvas', 'img', 'video', 'iframe', 'embed', 'object'];
+    const relocate = () => {
+      const target = document.fullscreenElement;
+      const host = (target
+        && !REPLACED.includes(target.tagName.toLowerCase()))
+        ? target : document.body;
+      if (panel.parentNode !== host) {
+        try {
+          if (panel.matches(':popover-open')) {
+            panel.hidePopover();
+          }
+        } catch (error) {
+          // Not a popover here; moving it is enough.
+        }
+        host.appendChild(panel);
+      }
+      showPanel();
+    };
+    relocate();
+    document.addEventListener('fullscreenchange', relocate);
     setInterval(() => {
       const rect = canvas.getBoundingClientRect();
       const engine = window.__th2Debug || {};
@@ -248,6 +274,16 @@
         'canvas css ' + Math.round(rect.width) + 'x' + Math.round(rect.height)
           + ' @' + Math.round(rect.left) + ',' + Math.round(rect.top),
         'canvas buf ' + canvas.width + 'x' + canvas.height,
+        'fs elem    ' + (() => {
+          const element = document.fullscreenElement;
+          if (!element) { return 'none'; }
+          const box = element.getBoundingClientRect();
+          return element.tagName.toLowerCase() + ' '
+            + Math.round(box.width) + 'x' + Math.round(box.height)
+            + ' @' + Math.round(box.left) + ',' + Math.round(box.top);
+        })(),
+        'canvas pad ' + (getComputedStyle(canvas).paddingTop || '0') + '/'
+          + (getComputedStyle(canvas).paddingLeft || '0'),
         'published  ' + (engine.published || '?'),
         'sdl window ' + (engine.window || '?')
           + '  pixels ' + (engine.pixels || '?'),
@@ -271,10 +307,13 @@
     const nextWidth = Math.round(width);
     const nextHeight = Math.round(height);
     const nextRatio = window.devicePixelRatio;
-    if (nextWidth === publishedWidth && nextHeight === publishedHeight
-        && nextRatio === publishedRatio) {
-      return;
-    }
+    // Deliberately not deduplicated.  Publishing the same size again costs a
+    // write to a reused object and four ints in the engine's slot - no
+    // allocation, and the engine's frame path still only wakes on the
+    // generation counter.  Skipping it, on the other hand, means that
+    // anything which resizes the canvas behind our back is never corrected,
+    // because the box we would compare against never changed.  That is worth
+    // far more than the writes it saves.
     publishedWidth = nextWidth;
     publishedHeight = nextHeight;
     publishedRatio = nextRatio;
@@ -285,7 +324,10 @@
     // frame.  The bridge appears when the engine starts; until then the
     // object above is what it reads on the way up.
     if (window.__th2PublishViewport) {
-      window.__th2PublishViewport(nextWidth, nextHeight, nextRatio);
+      // The backing store goes with it: it is the one thing SDL cannot see,
+      // because it derives its pixel size instead of reading the canvas.
+      window.__th2PublishViewport(nextWidth, nextHeight, nextRatio,
+                                  canvas.width, canvas.height);
     }
   }
 
@@ -308,10 +350,20 @@
     const viewport = window.visualViewport;
     const ratio = window.devicePixelRatio;
 
-    // Nothing to do while fullscreen.  SDL asks emscripten for fullscreen
-    // with a strategy that sizes the canvas and restores the styles it found
-    // when it exits, so writing to them here fights it on the way in and
-    // corrupts what it puts back on the way out.
+    // The canvas's own measured box is the truth in every case - a URL bar
+    // retracting, a fold opening, a fullscreen transition - so it is what
+    // gets published, always, rather than a size inferred from the window.
+    // At twice a second plus whenever the observer fires, the layout this
+    // costs does not matter; it is nowhere near the frame path.
+    const measured = canvas.getBoundingClientRect();
+    if (measured.width > 0 && measured.height > 0) {
+      publishBox(measured.width, measured.height);
+    }
+
+    // Only the styles are conditional, and for a concrete reason: while
+    // fullscreen they belong to emscripten, which sizes the canvas on the
+    // transition and puts back what it found on the way out, so writing them
+    // here fights it going in and corrupts what it restores coming out.
     if (document.fullscreenElement) {
       return;
     }
@@ -334,13 +386,8 @@
     setStyle('width', width + 'px');
     setStyle('height', height + 'px');
 
-    // The engine reads this every frame instead of measuring the canvas
-    // itself, which would flush layout once per frame on a phone.  The
-    // ResizeObserver publishes the canvas's measured box over the top of this
-    // as soon as one is available, which is what actually settles fullscreen.
     const realWidth = width;
     const realHeight = height;
-    publishBox(realWidth, realHeight);
 
     if (realWidth === lastWidth && realHeight === lastHeight
         && ratio === lastRatio) {

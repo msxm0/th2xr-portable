@@ -422,6 +422,7 @@ private:
     void toggle_fullscreen();
     // Keeps SDL's window in step with the page's canvas (browser only).
     void sync_web_viewport();
+    void sync_web_canvas_buffer();
     // True when the ImGui panels should use the phone layout: full-screen
     // window with a scrollable, full-width body.
     bool compact_ui() const;
