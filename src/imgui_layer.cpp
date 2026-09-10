@@ -304,10 +304,15 @@ void ImGuiLayer::apply_mobile_style(float scale)
 #endif
 }
 
+void ImGuiLayer::set_display_scale(float display_scale)
+{
+    display_scale_ = std::max(1.0f, display_scale);
+}
+
 void ImGuiLayer::new_frame(SDL_Window* window, float display_scale)
 {
     auto& io = ImGui::GetIO();
-    display_scale_ = std::max(1.0f, display_scale);
+    set_display_scale(display_scale);
 
     // Use the pixel size so the math works on platforms (e.g. Android) where
     // SDL_GetWindowSize() returns pixels rather than logical points.

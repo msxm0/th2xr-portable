@@ -39,6 +39,7 @@ namespace th2app {
 // Set by --cpu-transitions.  Forces the CPU blend even where the shader
 // would work, so the two paths can be compared without rebuilding.
 extern bool force_cpu_transitions;
+
 struct TextureDeleter {
     void operator()(SDL_Texture* texture) const;
 };
@@ -507,6 +508,10 @@ private:
     bool prefetch_scan_pending_ = false;
     // A follow that was put off because the engine was busy animating.
     bool prefetch_follow_pending_ = false;
+    std::chrono::steady_clock::time_point last_metrics_publish_{};
+    std::chrono::steady_clock::time_point last_viewport_poll_{};
+    int web_viewport_generation_ = 0;
+    bool viewport_bridge_installed_ = false;
     std::chrono::steady_clock::time_point last_prefetch_scan_{};
     // Event id that tells the loop to drop the hover highlights, queued
     // behind the click a lifted finger produced.

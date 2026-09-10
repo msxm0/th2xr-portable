@@ -118,9 +118,38 @@
     }
   }
 
+  // Engine arguments can come from the query string, so a device that is
+  // hard to attach a debugger to can still be tested against a different
+  // configuration - ?args=--cpu-transitions to take the CPU blend, say.
+  const engineArguments = (() => {
+    const raw = new URLSearchParams(location.search).get('args');
+    return raw ? raw.split(/[\s,]+/).filter(Boolean) : [];
+  })();
+  if (engineArguments.length) {
+    appendLog('engine arguments: ' + engineArguments.join(' '));
+  }
+
+  // A crash before the menu leaves nothing on screen to go on, so surface
+  // whatever the page can see.
+  // Chrome reports a ResizeObserver that needed another pass as an error.
+  // It is a warning, not a failure, and must not be treated as one.
+  const benign = (message) =>
+    typeof message === 'string' && message.includes('ResizeObserver loop');
+
+  window.addEventListener('error', (event) => {
+    if (benign(event.message)) {
+      return;
+    }
+    appendLog('error: ' + (event.message || event.error || 'unknown'));
+  });
+  window.addEventListener('unhandledrejection', (event) => {
+    appendLog('unhandled rejection: ' + (event.reason && event.reason.message
+      ? event.reason.message : event.reason));
+  });
+
   var Module = {
     canvas,
-    arguments: [],
+    arguments: engineArguments,
     print: appendLog,
     printErr: appendLog,
     setStatus: (text) => { if (text) status.textContent = text; },
@@ -148,7 +177,7 @@
     overlay.classList.add('hidden');
     canvas.focus();
     try {
-      Module.callMain(Module.arguments);
+      Module.callMain(engineArguments);
     } catch (error) {
       overlay.classList.remove('hidden');
       status.textContent = 'Failed to start: ' + error;
@@ -166,28 +195,139 @@
   let lastHeight = 0;
   let lastRatio = 0;
 
+  function setStyle(property, value) {
+    if (canvas.style[property] !== value) {
+      canvas.style[property] = value;
+    }
+  }
+
+  // ?vpdebug=1 shows every size that has to agree, live, in the corner of
+  // the page.  It sits outside the canvas so it stays readable whatever the
+  // canvas is doing, which is the whole point of it.
+  if (location.search.includes('vpdebug')) {
+    const panel = document.createElement('div');
+    panel.id = 'vpdebug';
+    // Fullscreen renders the fullscreen element and the top layer, and
+    // nothing else - an ordinary fixed div simply stops being drawn.  A
+    // manual popover is put in the top layer, which is above even the
+    // fullscreen element, so the readout survives exactly the transition it
+    // exists to explain.  The inset/margin/border resets undo the UA styles
+    // that would otherwise centre it in a box of its own.
+    panel.style.cssText =
+      'position:fixed;inset:auto;left:0;top:0;margin:0;border:0;'
+      + 'z-index:99999;background:rgba(0,0,0,.82);'
+      + 'color:#0f0;font:11px/1.35 monospace;padding:4px 6px;'
+      + 'white-space:pre;pointer-events:none;max-width:100vw';
+    const showPanel = () => {
+      try {
+        panel.showPopover();
+      } catch (error) {
+        // No popover support, or already showing; the plain fixed position
+        // still works everywhere except fullscreen.
+      }
+    };
+    if ('popover' in panel) {
+      panel.popover = 'manual';
+    }
+    document.body.appendChild(panel);
+    showPanel();
+    // Entering fullscreen can drop it out of the top layer, so put it back.
+    document.addEventListener('fullscreenchange', showPanel);
+    setInterval(() => {
+      const rect = canvas.getBoundingClientRect();
+      const engine = window.__th2Debug || {};
+      panel.textContent = [
+        'fullscreen ' + !!document.fullscreenElement
+          + '   dpr ' + window.devicePixelRatio,
+        'screen     ' + screen.width + 'x' + screen.height,
+        'inner      ' + window.innerWidth + 'x' + window.innerHeight,
+        'visualvp   ' + (window.visualViewport
+          ? Math.round(window.visualViewport.width) + 'x'
+            + Math.round(window.visualViewport.height)
+          : 'n/a'),
+        'canvas css ' + Math.round(rect.width) + 'x' + Math.round(rect.height)
+          + ' @' + Math.round(rect.left) + ',' + Math.round(rect.top),
+        'canvas buf ' + canvas.width + 'x' + canvas.height,
+        'published  ' + (engine.published || '?'),
+        'sdl window ' + (engine.window || '?')
+          + '  pixels ' + (engine.pixels || '?'),
+        'sdl output ' + (engine.output || '?'),
+        'density ' + (engine.density || '?')
+          + '  scale ' + (engine.scale || '?')
+      ].join('\n');
+    }, 250);
+  }
+
+  function publishBox(width, height) {
+    window.__th2Viewport = {
+      width: Math.round(width), height: Math.round(height)};
+    // Push it into the engine rather than leaving the engine to ask once a
+    // frame.  The bridge appears when the engine starts; until then the
+    // object above is what it reads on the way up.
+    if (window.__th2PublishViewport) {
+      window.__th2PublishViewport(width, height, window.devicePixelRatio);
+    }
+  }
+
+  // A device pixel ratio change with no size change still has to reach the
+  // engine, and only this pushes it.
+  if (window.matchMedia) {
+    const watchRatio = () => {
+      const query = window.matchMedia(
+        `(resolution: ${window.devicePixelRatio}dppx)`);
+      query.addEventListener('change', () => {
+        const rect = canvas.getBoundingClientRect();
+        publishBox(rect.width, rect.height);
+        watchRatio();
+      }, {once: true});
+    };
+    watchRatio();
+  }
+
   function syncViewport() {
     const viewport = window.visualViewport;
+    const ratio = window.devicePixelRatio;
+
+    // Nothing to do while fullscreen.  SDL asks emscripten for fullscreen
+    // with a strategy that sizes the canvas and restores the styles it found
+    // when it exits, so writing to them here fights it on the way in and
+    // corrupts what it puts back on the way out.
+    if (document.fullscreenElement) {
+      return;
+    }
+
     const width = Math.round(viewport ? viewport.width : window.innerWidth);
     const height = Math.round(viewport ? viewport.height : window.innerHeight);
-    const ratio = window.devicePixelRatio;
+
     if (viewport) {
       // A fixed element is positioned against the layout viewport, so undo
       // the offset between the two while the page is zoomed or the bars are
       // sliding.
-      canvas.style.left = Math.round(viewport.offsetLeft) + 'px';
-      canvas.style.top = Math.round(viewport.offsetTop) + 'px';
+      setStyle('left', Math.round(viewport.offsetLeft) + 'px');
+      setStyle('top', Math.round(viewport.offsetTop) + 'px');
     }
-    canvas.style.width = width + 'px';
-    canvas.style.height = height + 'px';
+    // Writing these unconditionally re-triggers the ResizeObserver that
+    // called us; on a phone, where the bars animate and the pixel ratio is
+    // fractional, the rounding can flip between two values and the loop never
+    // settles.  The browser reports that as "ResizeObserver loop completed
+    // with undelivered notifications".
+    setStyle('width', width + 'px');
+    setStyle('height', height + 'px');
+
     // The engine reads this every frame instead of measuring the canvas
-    // itself, which would flush layout once per frame on a phone.
-    window.__th2Viewport = { width: width, height: height };
-    if (width === lastWidth && height === lastHeight && ratio === lastRatio) {
+    // itself, which would flush layout once per frame on a phone.  The
+    // ResizeObserver publishes the canvas's measured box over the top of this
+    // as soon as one is available, which is what actually settles fullscreen.
+    const realWidth = width;
+    const realHeight = height;
+    publishBox(realWidth, realHeight);
+
+    if (realWidth === lastWidth && realHeight === lastHeight
+        && ratio === lastRatio) {
       return;
     }
-    lastWidth = width;
-    lastHeight = height;
+    lastWidth = realWidth;
+    lastHeight = realHeight;
     lastRatio = ratio;
     // The engine picks the new box up on its own; this is for SDL's own
     // resize handling and anything else listening.
@@ -195,7 +335,18 @@
   }
 
   if (window.ResizeObserver) {
-    new ResizeObserver(syncViewport).observe(canvas);
+    // The observed box is the canvas's real one, measured by the browser
+    // during layout.  It is the only size that is true in both cases: the
+    // fullscreen box is the browser's to decide and is settled by the time
+    // this fires, and window.innerHeight is not even reliable there - Firefox
+    // on Android reports one that does not match (bugzilla 712225).
+    new ResizeObserver((entries) => {
+      const box = entries[entries.length - 1].contentRect;
+      if (box.width > 0 && box.height > 0) {
+        publishBox(box.width, box.height);
+      }
+      syncViewport();
+    }).observe(canvas);
   }
   if (window.visualViewport) {
     window.visualViewport.addEventListener('resize', syncViewport);
@@ -203,8 +354,28 @@
   }
   window.addEventListener('resize', syncViewport);
   window.addEventListener('scroll', syncViewport);
-  window.addEventListener('orientationchange', syncViewport);
-  document.addEventListener('fullscreenchange', syncViewport);
+  // Entering fullscreen on a phone does not resize the viewport by the time
+  // the event fires - the bars are still animating away - so a single sync
+  // reads stale numbers, dispatches a resize with them, and then never fires
+  // again because the size it cached matches what it keeps measuring.  That
+  // left touch coordinates mapped to the old box until a rotation forced a
+  // real change.  Re-read across the settling period, and forget the cached
+  // size first so the engine is told even if the numbers land where they
+  // started.
+  function resyncViewport() {
+    lastWidth = lastHeight = lastRatio = 0;
+    syncViewport();
+    // The canvas ResizeObserver reports any box change on its own, so this
+    // only has to catch a device pixel ratio that changed without one.
+    requestAnimationFrame(syncViewport);
+    setTimeout(syncViewport, 350);
+  }
+
+  window.addEventListener('orientationchange', resyncViewport);
+  document.addEventListener('fullscreenchange', resyncViewport);
+  if (window.screen && screen.orientation) {
+    screen.orientation.addEventListener('change', resyncViewport);
+  }
   syncViewport();
 
   // A device pixel ratio change fires no resize of its own - a foldable
@@ -238,9 +409,15 @@
   });
 
   window.onerror = (message) => {
+    // Covering a running game with an error panel over a warning is worse
+    // than the warning.
+    if (benign(message)) {
+      return;
+    }
     overlay.classList.remove('hidden');
     status.textContent = 'Error: ' + message;
   };
+
 </script>
 {{{ SCRIPT }}}
 </body>

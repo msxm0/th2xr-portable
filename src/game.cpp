@@ -327,6 +327,68 @@ int Game::run_loop()
 #ifdef __EMSCRIPTEN__
 // Reads the box the canvas actually occupies, which is what SDL measures
 // touches against, plus the device pixel ratio.
+// JS writes the canvas box straight into these instead of the engine asking
+// for it, so the common case - nothing moved - costs a load and a compare and
+// never crosses into JS at all.  generation is bumped on every write so a
+// resize back to a previous size is still seen.
+struct WebViewportSlot {
+    int width;
+    int height;
+    int ratio_milli;
+    int generation;
+};
+WebViewportSlot web_viewport_slot{};
+
+EM_JS(void, th2_web_install_viewport_bridge, (WebViewportSlot* slot), {
+    // This body runs in the module's scope, so HEAP32 resolves here and keeps
+    // resolving after a memory growth reassigns it.
+    var base = slot >> 2;
+    window.__th2PublishViewport = function(width, height, ratio) {
+        if (!(width > 0) || !(height > 0)) {
+            return;
+        }
+        HEAP32[base] = Math.round(width);
+        HEAP32[base + 1] = Math.round(height);
+        HEAP32[base + 2] = Math.round(ratio * 1000);
+        HEAP32[base + 3] = (HEAP32[base + 3] | 0) + 1;
+    };
+    // Whatever the page already measured, before the engine was up to hear it.
+    if (window.__th2Viewport) {
+        window.__th2PublishViewport(
+            window.__th2Viewport.width, window.__th2Viewport.height,
+            window.devicePixelRatio);
+    }
+});
+
+// Read once and remembered, so this does not cost a crossing per frame.
+int th2_web_debug_panel()
+{
+    static const int enabled = []() {
+        return EM_ASM_INT({
+            return location.search.indexOf('vpdebug') >= 0 ? 1 : 0;
+        });
+    }();
+    return enabled;
+}
+
+EM_JS(void, th2_web_publish_metrics,
+      (int window_w, int window_h, int pixel_w, int pixel_h,
+       int output_w, int output_h, int box_w, int box_h,
+       double density, double scale), {
+    // Everything that has to agree for the picture to land in the right
+    // place, published for the page to show when ?vpdebug=1 is set.  Read
+    // these off the device rather than guessing which one is lying.
+    window.__th2Debug = {
+        fullscreen: !!document.fullscreenElement,
+        window: window_w + 'x' + window_h,
+        pixels: pixel_w + 'x' + pixel_h,
+        output: output_w + 'x' + output_h,
+        published: box_w + 'x' + box_h,
+        density: density.toFixed(3),
+        scale: scale.toFixed(3)
+    };
+});
+
 EM_JS(void, th2_web_canvas_box, (int* out_width, int* out_height,
                                  double* out_ratio), {
     // The page publishes the box it pinned the canvas to; measuring it here
@@ -361,10 +423,40 @@ void Game::sync_web_viewport()
     // arrive normalized against the real canvas and are scaled back up by
     // the window size SDL believes in.  Measure it ourselves every frame and
     // push the truth into SDL when it drifts.
+    // This has to keep running while fullscreen.  SDL sizes the canvas from
+    // the fullscreen change event, and on a phone that arrives before the
+    // browser chrome has finished retracting, so the size it keeps is the
+    // smaller one - and nothing else would ever correct it, which is why a
+    // rotation used to be the only way out.
+    if (!viewport_bridge_installed_) {
+        viewport_bridge_installed_ = true;
+        th2_web_install_viewport_bridge(&web_viewport_slot);
+    }
+
     int width = 0;
     int height = 0;
     double ratio = 1.0;
-    th2_web_canvas_box(&width, &height, &ratio);
+    if (web_viewport_slot.generation != 0) {
+        // The usual path: a plain read of our own memory.
+        if (web_viewport_slot.generation == web_viewport_generation_) {
+            return;
+        }
+        web_viewport_generation_ = web_viewport_slot.generation;
+        width = web_viewport_slot.width;
+        height = web_viewport_slot.height;
+        ratio = web_viewport_slot.ratio_milli / 1000.0;
+    } else {
+        // A page hosting the engine with its own shell may never publish.
+        // Fall back to asking, but four times a second rather than every
+        // frame, since this only exists to catch a page that is not talking
+        // to us.
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_viewport_poll_ < std::chrono::milliseconds(250)) {
+            return;
+        }
+        last_viewport_poll_ = now;
+        th2_web_canvas_box(&width, &height, &ratio);
+    }
     if (width <= 0 || height <= 0) {
         return;
     }
@@ -386,6 +478,13 @@ void Game::sync_web_viewport()
 void Game::iterate()
 {
     sync_web_viewport();
+    // Before any event is looked at, not after: process_event() scales touch
+    // positions by this, and entering fullscreen changes it, so leaving it
+    // until new_frame() maps a frame's worth of input with the old scale -
+    // and on a phone that is every tap until a rotation forces a refresh.
+    if (imgui_) {
+        imgui_->set_display_scale(imgui_display_scale());
+    }
     // The lookahead scan runs here rather than at the end of advance(), so
     // its cost lands on an idle frame instead of the one the player's click
     // is already busy with.  It is throttled because skipping advances the
@@ -813,6 +912,31 @@ void Game::iterate()
     const float scale_x = output_width / 800.0f;
     const float scale_y = output_height / 600.0f;
     const float framebuffer_scale = std::min(scale_x, scale_y);
+#ifdef __EMSCRIPTEN__
+    // Only while the readout is actually on screen; it is the one thing here
+    // that reaches into the browser, and it has no reason to run otherwise.
+    if (th2_web_debug_panel()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_metrics_publish_ >= std::chrono::milliseconds(250)) {
+            last_metrics_publish_ = now;
+            int window_width = 0;
+            int window_height = 0;
+            int pixel_width = 0;
+            int pixel_height = 0;
+            int box_width = 0;
+            int box_height = 0;
+            double box_ratio = 1.0;
+            SDL_GetWindowSize(window_, &window_width, &window_height);
+            SDL_GetWindowSizeInPixels(window_, &pixel_width, &pixel_height);
+            th2_web_canvas_box(&box_width, &box_height, &box_ratio);
+            th2_web_publish_metrics(
+                window_width, window_height, pixel_width, pixel_height, output_width, output_height,
+                box_width, box_height,
+                SDL_GetWindowPixelDensity(window_),
+                SDL_GetWindowDisplayScale(window_));
+        }
+    }
+#endif
     const float display_scale = imgui_display_scale();
     imgui_->new_frame(window_, display_scale);
     font_.configure(

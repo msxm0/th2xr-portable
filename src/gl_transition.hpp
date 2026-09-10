@@ -18,9 +18,11 @@ namespace th2 {
 // blend there instead, with no readback at all.
 //
 // It is best-effort by design: if the renderer is not a GL one, or the
-// shader or the texture handles are not what it expects, available() is
-// false and the caller keeps the CPU path.  That covers the browser and
-// Android today, and anything else SDL draws through GL.
+// shader will not build, or the texture handles are missing, available() is
+// false and the caller keeps the CPU path.  Those are the cases where the
+// shader cannot run at all - it deliberately does not judge what the shader
+// draws, because silently demoting a working GPU path is worse than showing
+// that something is wrong.
 class GlPatternTransition {
 public:
     explicit GlPatternTransition(SDL_Renderer* renderer);

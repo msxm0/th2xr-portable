@@ -24,6 +24,11 @@ public:
     ImGuiLayer& operator=(const ImGuiLayer&) = delete;
 
     void process_event(const SDL_Event& event);
+    // Keeps the scale used to map input in step with the one the next frame
+    // will draw at.  process_event() mixes a live pixel density with this
+    // cached scale, so a stale value skews every touch until something
+    // refreshes it.
+    void set_display_scale(float display_scale);
     void new_frame(SDL_Window* window, float display_scale = 1.0f);
     void render();
     bool wants_input() const;

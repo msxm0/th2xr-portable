@@ -307,6 +307,35 @@ void Game::draw_config()
                     &config_.dump_transition_frames);
                 ImGui::TextDisabled(
                     "Dumps are written to debug/transitions/");
+                if (ImGui::TreeNode("Viewport sizes")) {
+                    // Everything here is already in hand or a cached read, so
+                    // showing it costs nothing.  The page's own numbers are
+                    // deliberately not here: fetching them would mean calling
+                    // into the browser, and this panel is drawn inside the
+                    // very area that is wrong when they disagree.  ?vpdebug=1
+                    // shows those, outside the canvas, where they stay
+                    // readable.
+                    int window_width = 0;
+                    int window_height = 0;
+                    int pixel_width = 0;
+                    int pixel_height = 0;
+                    int output_width = 0;
+                    int output_height = 0;
+                    SDL_GetWindowSize(
+                        window_, &window_width, &window_height);
+                    SDL_GetWindowSizeInPixels(
+                        window_, &pixel_width, &pixel_height);
+                    SDL_GetRenderOutputSize(
+                        renderer_, &output_width, &output_height);
+                    ImGui::Text("window %dx%d", window_width, window_height);
+                    ImGui::Text("pixels %dx%d", pixel_width, pixel_height);
+                    ImGui::Text("output %dx%d", output_width, output_height);
+                    ImGui::Text(
+                        "density %.3f  scale %.3f",
+                        SDL_GetWindowPixelDensity(window_),
+                        SDL_GetWindowDisplayScale(window_));
+                    ImGui::TreePop();
+                }
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();

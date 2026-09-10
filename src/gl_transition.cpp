@@ -25,6 +25,7 @@ namespace {
 // texture with row 0 at the top of the image, so it needs the opposite one.
 // Sampling all three the same way renders the scene upside down.
 constexpr char vertex_source[] = R"(#version 300 es
+precision highp float;
 in vec2 a_position;
 out vec2 v_uv;
 out vec2 v_mask_uv;
@@ -36,8 +37,14 @@ void main() {
 }
 )";
 
+// highp, not mediump: a desktop GPU quietly promotes mediump to 32 bits, but
+// on a phone it really is 16, whose guaranteed range is only +-16384.  The
+// blend's intermediate reaches about 98000 with a wide mask, overflows, and
+// the whole wipe comes out black.  The arithmetic is also folded so it stays
+// in 0..1 rather than scaling up to 0..65280 and dividing back down.
 constexpr char fragment_source[] = R"(#version 300 es
-precision mediump float;
+precision highp float;
+precision highp sampler2D;
 in vec2 v_uv;
 in vec2 v_mask_uv;
 out vec4 fragment;
@@ -49,7 +56,7 @@ uniform float u_vague;
 void main() {
     float mask = texture(u_mask, v_mask_uv).r * 255.0;
     float alpha = clamp(
-        (mask + u_offset - 256.0) * 256.0 / u_vague, 0.0, 255.0) / 255.0;
+        (mask + u_offset - 256.0) * (256.0 / 255.0) / u_vague, 0.0, 1.0);
     vec3 blended = mix(
         texture(u_previous, v_uv).rgb, texture(u_next, v_uv).rgb, alpha);
     fragment = vec4(blended, 1.0);
@@ -156,6 +163,106 @@ struct GlPatternTransition::Impl {
         glBindBuffer(GL_ARRAY_BUFFER, 0);
 
         ready = glGetError() == GL_NO_ERROR;
+        if (ready) {
+            report_self_test();
+        }
+    }
+
+    // Renders a known blend and says so loudly if the result is wrong, but
+    // does not act on it.  A shader can compile, link, draw, and still be
+    // wrong - mediump on a phone is genuinely 16-bit, so arithmetic that is
+    // fine on a desktop GPU overflows there and the wipe comes out black.
+    // Worth knowing about; not worth silently demoting a path that may well
+    // be working, since a wrong picture is easier to notice and report than
+    // an unexplained slow one.
+    void report_self_test()
+    {
+        const auto solid = [](GLubyte r, GLubyte g, GLubyte b) {
+            GLuint name = 0;
+            const GLubyte pixel[4] = {r, g, b, 255};
+            glGenTextures(1, &name);
+            glBindTexture(GL_TEXTURE_2D, name);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA,
+                         GL_UNSIGNED_BYTE, pixel);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            return name;
+        };
+        const GLuint previous = solid(255, 0, 0);
+        const GLuint next = solid(0, 255, 0);
+        const GLuint mask = solid(255, 255, 255);
+        GLuint target = 0;
+        glGenTextures(1, &target);
+        glBindTexture(GL_TEXTURE_2D, target);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 2, 2, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+        GLint previous_fbo = 0;
+        GLint viewport[4] = {0, 0, 0, 0};
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous_fbo);
+        glGetIntegerv(GL_VIEWPORT, viewport);
+        GLuint fbo = 0;
+        glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, target, 0);
+
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+            glViewport(0, 0, 2, 2);
+            glDisable(GL_BLEND);
+            glDisable(GL_SCISSOR_TEST);
+            glUseProgram(program);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, previous);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, next);
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, mask);
+            glUniform1i(previous_location, 0);
+            glUniform1i(next_location, 1);
+            glUniform1i(mask_location, 2);
+            glUniform1f(vague_location, 128.0f);
+            glBindVertexArray(vertex_array);
+
+            GLubyte pixel[4] = {0, 0, 0, 0};
+            // Past the end of the ramp the result must be the incoming frame.
+            glUniform1f(offset_location, 384.0f);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+            if (!(pixel[1] > 200 && pixel[0] < 64)) {
+                SDL_Log("pattern wipe shader looks wrong: expected the "
+                        "incoming frame, got rgba(%d,%d,%d,%d) - wipes will "
+                        "render incorrectly on this device",
+                        pixel[0], pixel[1], pixel[2], pixel[3]);
+            }
+            // Before it starts, the outgoing one.
+            glUniform1f(offset_location, 0.0f);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+            if (!(pixel[0] > 200 && pixel[1] < 64)) {
+                SDL_Log("pattern wipe shader looks wrong: expected the "
+                        "outgoing frame, got rgba(%d,%d,%d,%d) - wipes will "
+                        "render incorrectly on this device",
+                        pixel[0], pixel[1], pixel[2], pixel[3]);
+            }
+            glBindVertexArray(0);
+            glUseProgram(0);
+        }
+
+        glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previous_fbo));
+        glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+        glDeleteFramebuffers(1, &fbo);
+        const GLuint scratch[] = {previous, next, mask, target};
+        glDeleteTextures(4, scratch);
+        glActiveTexture(GL_TEXTURE0);
+        // Whatever it found, the shader still runs: this reports, it does not
+        // decide.  Clear any error it raised so it cannot affect readiness.
+        while (glGetError() != GL_NO_ERROR) {
+        }
     }
 
     ~Impl()
@@ -224,24 +331,47 @@ bool GlPatternTransition::draw(
         return false;
     }
 
+    // Sampling state travels with the texture, not the sampler uniform, and
+    // these textures belong to SDL - whatever it last set is what applies.
+    // A texture whose filter wants mipmaps it does not have is incomplete,
+    // and an incomplete texture samples as solid black rather than failing,
+    // so this has to be set explicitly on every one of them.
+    const auto bind = [](GLenum unit, GLuint name, GLint filter) {
+        glActiveTexture(unit);
+        glBindTexture(GL_TEXTURE_2D, name);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    };
     glUseProgram(impl_->program);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, previous_name);
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, next_name);
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, mask_name);
+    bind(GL_TEXTURE0, previous_name, GL_LINEAR);
+    bind(GL_TEXTURE1, next_name, GL_LINEAR);
+    // The CPU blend indexes the mask with integer division, so this one stays
+    // nearest or the two paths disagree along the wipe's edge.
+    bind(GL_TEXTURE2, mask_name, GL_NEAREST);
     glUniform1i(impl_->previous_location, 0);
     glUniform1i(impl_->next_location, 1);
     glUniform1i(impl_->mask_location, 2);
     glUniform1f(impl_->offset_location, offset);
     glUniform1f(impl_->vague_location, vague);
 
+    // Put these back afterwards rather than trusting SDL to reset them: it
+    // caches its own idea of the GL state and only sets what it thinks has
+    // changed.
+    const GLboolean blend_was_on = glIsEnabled(GL_BLEND);
+    const GLboolean scissor_was_on = glIsEnabled(GL_SCISSOR_TEST);
     glDisable(GL_BLEND);
     glDisable(GL_SCISSOR_TEST);
     glBindVertexArray(impl_->vertex_array);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindVertexArray(0);
+    if (blend_was_on) {
+        glEnable(GL_BLEND);
+    }
+    if (scissor_was_on) {
+        glEnable(GL_SCISSOR_TEST);
+    }
 
     // Put back what SDL expects to find; it caches this state rather than
     // setting it per draw.
