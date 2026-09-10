@@ -352,21 +352,19 @@ void Game::request_audio_decode(
 
 void Game::update_audio_decode()
 {
-    // Two milliseconds a frame is a third of the budget at 60fps and decodes
-    // far faster than playback consumes, so a track started cold catches up
-    // within a few frames and read-ahead still gets through ten files in
-    // well under a second.
-    constexpr auto budget = std::chrono::milliseconds(2);
-    const auto started = std::chrono::steady_clock::now();
+    // Drawn from the frame's shared allowance rather than a private two
+    // milliseconds, so decoding ahead cannot pile on top of a picture being
+    // decoded ahead and hand the frame more than either of them intended.
     const auto remaining = [&] {
-        return budget - (std::chrono::steady_clock::now() - started);
+        return background_budget_.remaining();
     };
 
     // A channel playing ahead of its own decoder comes first: falling behind
     // there is an audible dropout, not merely a slower read-ahead.
     const auto feed = [&](th2::AudioChannel& channel) {
         if (channel.starving()) {
-            channel.decoder()->decode(remaining());
+            background_budget_.spend(
+                [&] { return channel.decoder()->decode(remaining()); });
         }
     };
     feed(bgm_);
@@ -394,9 +392,12 @@ void Game::update_audio_decode()
             // Building the decoder reads the file, which on a streaming
             // build can suspend, so the budget has to be re-read after it
             // rather than assumed to be the one the loop tested.
-            auto decoder = audio_decoder(
-                *request.archive, request.name, request.rank);
-            if (decoder->decode(remaining())) {
+            auto decoder = background_budget_.spend([&] {
+                return audio_decoder(
+                    *request.archive, request.name, request.rank);
+            });
+            if (background_budget_.spend(
+                    [&] { return decoder->decode(remaining()); })) {
                 audio_decode_queue_.erase(audio_decode_queue_.begin());
             } else {
                 break;  // Out of time; the rest of this file waits a frame.
@@ -788,38 +789,105 @@ void Game::request_image_decode(bool background, std::string_view name)
 
 void Game::update_image_decode()
 {
-    if (image_decode_queue_.empty()) {
+    // Never more than the frame's remaining allowance, and never at all once
+    // it is gone.  Everything here is speculative: the picture is being
+    // decoded before anyone has asked for it, so it always yields to the
+    // frame rather than the other way round.
+    if (background_budget_.exhausted()) {
         return;
     }
-    // One per frame at most.  A background is a few milliseconds to decode,
-    // so this is not something to run twice on the same frame just because
-    // there is a queue.
-    const auto key = image_decode_queue_.front();
-    image_decode_queue_.pop_front();
-    if (decoded_images_.contains(key)) {
+    if (!pending_image_ && image_decode_queue_.empty()) {
         return;
     }
-    const bool background = key.starts_with("bak:");
-    const std::string name = key.substr(4);
-    const auto& source = background ? backgrounds_ : graphics_;
-    const auto* entry = source.find(name);
-    if (!entry || !source.resident(*entry)) {
-        return;
-    }
-    try {
-        auto surface = th2app::decode_image(source, name);
-        if (!surface) {
+
+    if (!pending_image_) {
+        const auto key = image_decode_queue_.front();
+        image_decode_queue_.pop_front();
+        if (decoded_images_.contains(key)) {
             return;
         }
-        while (decoded_images_.size() >= decoded_image_limit) {
-            decoded_images_.erase(decoded_images_.begin());
+        const bool background = key.starts_with("bak:");
+        const std::string name = key.substr(4);
+        const auto& source = background ? backgrounds_ : graphics_;
+        const auto* entry = source.find(name);
+        // Only once the bytes are here: reading them is what suspends the
+        // wasm stack for a fetch, and doing that from a decode-ahead would
+        // move the wait rather than remove it.
+        if (!entry || !source.resident(*entry)) {
+            return;
         }
-        decoded_images_.emplace(key, std::move(surface));
+        try {
+            auto stored = background_budget_.spend(
+                [&] { return source.read_stored(*entry); });
+            PendingImage pending;
+            pending.key = key;
+            // Only TGA decodes in bands; a BMP goes through SDL, which has no
+            // way to be interrupted, so those stay one-shot.  They are the
+            // transition masks, which are small.
+            pending.streamable = name.size() > 4
+                && name.compare(name.size() - 4, 4, ".tga") == 0;
+            if (stored.compressed) {
+                pending.unpacking.emplace(
+                    std::move(stored.bytes), stored.output_size);
+            } else {
+                pending.bytes = std::move(stored.bytes);
+            }
+            pending_image_ = std::move(pending);
+        } catch (const std::exception& error) {
+            SDL_Log("pre-decode of %s failed: %s",
+                    key.c_str(), error.what());
+            return;
+        }
+    }
+
+    auto& pending = *pending_image_;
+    try {
+        if (pending.unpacking) {
+            const bool finished = background_budget_.spend([&] {
+                return pending.unpacking->advance(
+                    background_budget_.remaining());
+            });
+            if (!finished) {
+                return;
+            }
+            pending.bytes = pending.unpacking->take();
+            pending.unpacking.reset();
+        }
+        if (background_budget_.exhausted()) {
+            return;
+        }
+        Surface surface;
+        if (pending.streamable) {
+            if (!pending.decoding) {
+                pending.decoding.emplace(std::move(pending.bytes));
+            }
+            const bool finished = background_budget_.spend([&] {
+                return pending.decoding->advance(
+                    background_budget_.remaining());
+            });
+            if (!finished) {
+                return;
+            }
+            surface.reset(pending.decoding->take());
+        } else {
+            const auto key = pending.key;
+            surface.reset(background_budget_.spend([&] {
+                return th2::load_image(pending.bytes, key.substr(4));
+            }));
+        }
+        if (surface) {
+            while (decoded_images_.size() >= decoded_image_limit) {
+                decoded_images_.erase(decoded_images_.begin());
+            }
+            decoded_images_.emplace(pending.key, std::move(surface));
+        }
     } catch (const std::exception& error) {
         // A picture that will not decode is not worth a crash here; the load
         // path will hit the same failure and report it in context.
-        SDL_Log("pre-decode of %s failed: %s", name.c_str(), error.what());
+        SDL_Log("pre-decode of %s failed: %s",
+                pending.key.c_str(), error.what());
     }
+    pending_image_.reset();
 }
 
 Surface Game::take_predecoded_image(bool background, std::string_view name)

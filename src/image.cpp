@@ -1,6 +1,9 @@
 #include "image.hpp"
 
 #include <array>
+#include <span>
+#include <memory>
+#include <chrono>
 #include <algorithm>
 #include <cctype>
 #include <stdexcept>
@@ -51,7 +54,25 @@ SDL_Surface* load_image(
     throw std::runtime_error("unsupported image extension: " + extension);
 }
 
-SDL_Surface* load_tga(std::span<const std::uint8_t> bytes)
+namespace {
+
+// The parts of a TGA header the decoder needs, plus its palette.  Split out so
+// the one-shot and the streaming decoders share one parser and one row loop:
+// two copies of this would eventually disagree, and a picture that decodes
+// differently depending on which path loaded it is not a bug anyone would
+// enjoy finding.
+struct TgaHeader {
+    int width = 0;
+    int height = 0;
+    int image_type = 0;
+    int depth = 0;
+    bool top_origin = false;
+    std::size_t source_pixel_size = 0;
+    std::size_t pixels_at = 0;
+    std::vector<std::array<std::uint8_t, 4>> palette;
+};
+
+TgaHeader parse_tga_header(std::span<const std::uint8_t> bytes)
 {
     if (bytes.size() < 18) {
         throw std::runtime_error("truncated TGA header");
@@ -59,77 +80,184 @@ SDL_Surface* load_tga(std::span<const std::uint8_t> bytes)
 
     const int id_length = bytes[0];
     const int color_map_type = bytes[1];
-    const int image_type = bytes[2];
     const int color_map_length = read_u16(bytes.data() + 5);
     const int color_map_depth = bytes[7];
-    const int width = read_u16(bytes.data() + 12);
-    const int height = read_u16(bytes.data() + 14);
-    const int depth = bytes[16];
-    const bool top_origin = (bytes[17] & 0x20) != 0;
 
-    if (width <= 0 || height <= 0 || (image_type != 1 && image_type != 2)) {
+    TgaHeader header;
+    header.image_type = bytes[2];
+    header.width = read_u16(bytes.data() + 12);
+    header.height = read_u16(bytes.data() + 14);
+    header.depth = bytes[16];
+    header.top_origin = (bytes[17] & 0x20) != 0;
+
+    if (header.width <= 0 || header.height <= 0
+        || (header.image_type != 1 && header.image_type != 2)) {
         throw std::runtime_error("unsupported TGA image type");
     }
-    if ((image_type == 1 && (depth != 8 || color_map_type != 1))
-        || (image_type == 2 && depth != 24 && depth != 32)) {
+    if ((header.image_type == 1
+         && (header.depth != 8 || color_map_type != 1))
+        || (header.image_type == 2
+            && header.depth != 24 && header.depth != 32)) {
         throw std::runtime_error("unsupported TGA pixel format");
     }
 
     std::size_t position = 18 + id_length;
-    std::vector<std::array<std::uint8_t, 4>> palette;
     if (color_map_type) {
         const std::size_t palette_pixel_size = color_map_depth / 8;
         if ((palette_pixel_size != 3 && palette_pixel_size != 4)
-            || position + color_map_length * palette_pixel_size > bytes.size()) {
+            || position + color_map_length * palette_pixel_size
+                > bytes.size()) {
             throw std::runtime_error("invalid TGA palette");
         }
-        palette.reserve(color_map_length);
+        header.palette.reserve(color_map_length);
         for (int i = 0; i < color_map_length; ++i) {
             const auto* pixel = bytes.data() + position;
-            palette.push_back({pixel[2], pixel[1], pixel[0],
-                               static_cast<std::uint8_t>(palette_pixel_size == 4 ? pixel[3] : 255)});
+            header.palette.push_back(
+                {pixel[2], pixel[1], pixel[0],
+                 static_cast<std::uint8_t>(
+                     palette_pixel_size == 4 ? pixel[3] : 255)});
             position += palette_pixel_size;
         }
     }
 
-    const std::size_t source_pixel_size = depth / 8;
-    if (position + static_cast<std::size_t>(width) * height * source_pixel_size > bytes.size()) {
+    header.source_pixel_size = header.depth / 8;
+    header.pixels_at = position;
+    if (position
+            + static_cast<std::size_t>(header.width) * header.height
+                * header.source_pixel_size
+        > bytes.size()) {
         throw std::runtime_error("truncated TGA pixels");
     }
+    return header;
+}
 
-    SDL_Surface* surface = SDL_CreateSurface(width, height, SDL_PIXELFORMAT_RGBA32);
-    if (!surface) {
-        throw std::runtime_error(SDL_GetError());
-    }
+// Rows [first, first + count) of the image, in source order.
+void decode_tga_rows(
+    const TgaHeader& header, std::span<const std::uint8_t> bytes,
+    SDL_Surface* surface, const SDL_PixelFormatDetails* details,
+    int first, int count)
+{
     auto* destination = static_cast<std::uint32_t*>(surface->pixels);
     const int destination_pitch = surface->pitch / sizeof(std::uint32_t);
-    // Once, not once per pixel: SDL_GetPixelFormatDetails() is a hash table
-    // lookup, and calling it inside the loop below made SDL_FindInHashTable
-    // one of the busiest functions in a playthrough profile - 10 seconds of
-    // it, all to fetch the same pointer a few million times.
-    const auto* details = SDL_GetPixelFormatDetails(surface->format);
+    const std::size_t row_bytes =
+        static_cast<std::size_t>(header.width) * header.source_pixel_size;
 
-    for (int source_y = 0; source_y < height; ++source_y) {
-        const int destination_y = top_origin ? source_y : height - source_y - 1;
-        for (int x = 0; x < width; ++x) {
+    for (int source_y = first; source_y < first + count; ++source_y) {
+        const int destination_y = header.top_origin
+            ? source_y : header.height - source_y - 1;
+        std::size_t position =
+            header.pixels_at + static_cast<std::size_t>(source_y) * row_bytes;
+        for (int x = 0; x < header.width; ++x) {
             std::array<std::uint8_t, 4> color{};
-            if (image_type == 1) {
+            if (header.image_type == 1) {
                 const auto index = bytes[position++];
-                if (index >= palette.size()) {
-                    SDL_DestroySurface(surface);
+                if (index >= header.palette.size()) {
                     throw std::runtime_error("TGA palette index out of range");
                 }
-                color = palette[index];
+                color = header.palette[index];
             } else {
-                color = {bytes[position + 2], bytes[position + 1], bytes[position],
-                         static_cast<std::uint8_t>(depth == 32 ? bytes[position + 3] : 255)};
-                position += source_pixel_size;
+                color = {bytes[position + 2], bytes[position + 1],
+                         bytes[position],
+                         static_cast<std::uint8_t>(
+                             header.depth == 32 ? bytes[position + 3] : 255)};
+                position += header.source_pixel_size;
             }
             destination[destination_y * destination_pitch + x]
                 = SDL_MapRGBA(details, nullptr,
                               color[0], color[1], color[2], color[3]);
         }
     }
+}
+
+SDL_Surface* create_tga_surface(const TgaHeader& header)
+{
+    SDL_Surface* surface =
+        SDL_CreateSurface(header.width, header.height, SDL_PIXELFORMAT_RGBA32);
+    if (!surface) {
+        throw std::runtime_error(SDL_GetError());
+    }
+    return surface;
+}
+
+}  // namespace
+
+SDL_Surface* load_tga(std::span<const std::uint8_t> bytes)
+{
+    const auto header = parse_tga_header(bytes);
+    SDL_Surface* surface = create_tga_surface(header);
+    try {
+        decode_tga_rows(
+            header, bytes, surface,
+            SDL_GetPixelFormatDetails(surface->format), 0, header.height);
+    } catch (...) {
+        SDL_DestroySurface(surface);
+        throw;
+    }
+    return surface;
+}
+
+struct TgaStream::State {
+    std::vector<std::uint8_t> bytes;
+    TgaHeader header;
+    SDL_Surface* surface = nullptr;
+    const SDL_PixelFormatDetails* details = nullptr;
+    int row = 0;
+};
+
+TgaStream::TgaStream(std::vector<std::uint8_t> bytes)
+    : state_(std::make_unique<State>())
+{
+    state_->bytes = std::move(bytes);
+    state_->header = parse_tga_header(state_->bytes);
+    state_->surface = create_tga_surface(state_->header);
+    state_->details = SDL_GetPixelFormatDetails(state_->surface->format);
+}
+
+TgaStream::~TgaStream()
+{
+    if (state_ && state_->surface) {
+        SDL_DestroySurface(state_->surface);
+    }
+}
+
+TgaStream::TgaStream(TgaStream&&) noexcept = default;
+TgaStream& TgaStream::operator=(TgaStream&&) noexcept = default;
+
+bool TgaStream::advance(std::chrono::nanoseconds budget)
+{
+    if (!state_ || state_->row >= state_->header.height) {
+        return true;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    // A band at a time, so the clock is read once per band rather than once
+    // per row.  Sixteen rows of an 800-wide picture is about 13k pixels,
+    // comfortably under a millisecond.
+    constexpr int band = 16;
+    while (state_->row < state_->header.height) {
+        const int count = std::min(band, state_->header.height - state_->row);
+        decode_tga_rows(state_->header, state_->bytes, state_->surface,
+                        state_->details, state_->row, count);
+        state_->row += count;
+        if (state_->row < state_->header.height
+            && std::chrono::steady_clock::now() - started >= budget) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool TgaStream::done() const
+{
+    return !state_ || state_->row >= state_->header.height;
+}
+
+SDL_Surface* TgaStream::take()
+{
+    if (!state_) {
+        return nullptr;
+    }
+    SDL_Surface* surface = state_->surface;
+    state_->surface = nullptr;
     return surface;
 }
 

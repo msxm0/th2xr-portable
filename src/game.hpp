@@ -4,6 +4,8 @@
 #include "character.hpp"
 #include "config.hpp"
 #include "font.hpp"
+#include "frame_budget.hpp"
+#include "image.hpp"
 #include "gl_transition.hpp"
 #include "gamepad_input.hpp"
 #include "imgui_layer.hpp"
@@ -535,6 +537,33 @@ private:
     std::unordered_map<std::string, Surface> decoded_images_;
     std::deque<std::string> image_decode_queue_;
     static constexpr std::size_t decoded_image_limit = 6;
+
+    // A picture part-way through being decoded.  Held across frames, because
+    // a large one is twenty milliseconds of work and no frame can take that
+    // in one go.
+    struct PendingImage {
+        std::string key;
+        std::optional<th2::LzsStream> unpacking;
+        std::optional<th2::TgaStream> decoding;
+        std::vector<std::uint8_t> bytes;
+        bool streamable = false;
+    };
+    std::optional<PendingImage> pending_image_;
+
+    // The frame's whole allowance for work nobody is waiting on, shared by
+    // the prefetch scan, audio decoding and image decoding alike.
+    //
+    // Two milliseconds, not four.  These consumers spend whatever they are
+    // given - the audio read-ahead in particular will decode as far forward
+    // as the clock allows - so the allowance sets how much speculative work
+    // gets done, not just how much is permitted.  At four, a playthrough
+    // spent 40 seconds more in the Vorbis decoder than the same playthrough
+    // at two, most of it on clips the script had already moved past, and
+    // frames over 10ms went from 805 to 6167.  Two matches what audio used
+    // to have to itself, so the shared pool is no larger than the largest
+    // private one it replaced - the difference is that everything else now
+    // has to fit inside it rather than being added on top.
+    th2::FrameBudget background_budget_{std::chrono::milliseconds(2)};
     std::chrono::steady_clock::time_point last_metrics_publish_{};
     std::chrono::steady_clock::time_point last_viewport_poll_{};
     int web_viewport_generation_ = 0;

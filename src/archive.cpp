@@ -31,9 +31,9 @@ std::string ascii_lower(std::string_view text)
 
 // max_output stops the stream early, for callers that only need the start of
 // a file; the size check is then skipped, since a prefix is expected.
-std::vector<std::uint8_t> decompress_lzs(
+std::vector<std::uint8_t> decompress_lzs_impl(
     std::span<const std::uint8_t> source, std::size_t output_size,
-    std::size_t max_output = std::numeric_limits<std::size_t>::max())
+    std::size_t max_output)
 {
     const std::size_t limit = std::min(output_size, max_output);
     constexpr std::size_t ring_size = 4096;
@@ -106,6 +106,83 @@ void validate_entry(
 }
 
 }  // namespace
+
+std::vector<std::uint8_t> decompress_lzs(
+    std::span<const std::uint8_t> source, std::size_t output_size,
+    std::size_t max_output)
+{
+    return decompress_lzs_impl(source, output_size, max_output);
+}
+
+LzsStream::LzsStream(std::vector<std::uint8_t> source,
+                     std::size_t output_size)
+    : source_(std::move(source)), limit_(output_size)
+{
+    ring_.fill(' ');
+    output_.reserve(limit_);
+    if (limit_ == 0) {
+        done_ = true;
+    }
+}
+
+bool LzsStream::advance(std::chrono::nanoseconds budget)
+{
+    if (done_) {
+        return true;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    std::size_t until_check = check_interval;
+
+    while (source_position_ < source_.size() && output_.size() < limit_) {
+        if (until_check == 0) {
+            if (std::chrono::steady_clock::now() - started >= budget) {
+                return false;
+            }
+            until_check = check_interval;
+        }
+        flags_ >>= 1;
+        if ((flags_ & 0x100) == 0) {
+            flags_ = source_[source_position_++] | 0xff00;
+        }
+        if (source_position_ >= source_.size()) {
+            break;
+        }
+        const int first = source_[source_position_++];
+        if (flags_ & 1) {
+            const auto value = static_cast<std::uint8_t>(first);
+            output_.push_back(value);
+            ring_[ring_position_++ & (ring_size - 1)] = value;
+            until_check = until_check > 0 ? until_check - 1 : 0;
+        } else {
+            if (source_position_ >= source_.size()) {
+                break;
+            }
+            const int second = source_[source_position_++];
+            int position = first | ((second & 0xf0) << 4);
+            const int length = (second & 0x0f) + 3;
+            for (int i = 0; i < length && output_.size() < limit_; ++i) {
+                const auto value = ring_[position++ & (ring_size - 1)];
+                output_.push_back(value);
+                ring_[ring_position_++ & (ring_size - 1)] = value;
+            }
+            until_check = until_check > static_cast<std::size_t>(length)
+                ? until_check - static_cast<std::size_t>(length)
+                : 0;
+        }
+    }
+
+    done_ = true;
+    if (output_.size() != limit_) {
+        throw std::runtime_error("LZS stream produced an unexpected size");
+    }
+    return true;
+}
+
+std::vector<std::uint8_t> LzsStream::take()
+{
+    return std::move(output_);
+}
+
 
 Archive::Archive(const std::filesystem::path& path)
     : path_(path)
@@ -227,6 +304,28 @@ std::vector<std::uint8_t> Archive::read_prefix(
     return decompress_lzs(
         std::span<const std::uint8_t>(stored).subspan(header),
         read_u32(stored.data() + size_offset), max_bytes);
+}
+
+Archive::StoredEntry Archive::read_stored(const ArchiveEntry& entry) const
+{
+    std::vector<std::uint8_t> stored(entry.stored_size);
+    if (!data_read(path_, entry.offset, stored)) {
+        throw std::runtime_error(
+            path_.string() + ": cannot read " + entry.name);
+    }
+    if (!entry.compressed) {
+        return {std::move(stored), stored.size(), false};
+    }
+    const std::size_t header = kind_ == ArchiveKind::lac ? 4 : 8;
+    if (stored.size() < header) {
+        throw std::runtime_error(
+            path_.string() + ": invalid compressed entry");
+    }
+    const auto size_offset = kind_ == ArchiveKind::lac ? 0 : 4;
+    const auto output_size = read_u32(stored.data() + size_offset);
+    stored.erase(stored.begin(),
+                 stored.begin() + static_cast<std::ptrdiff_t>(header));
+    return {std::move(stored), output_size, true};
 }
 
 std::vector<std::uint8_t> Archive::read(const ArchiveEntry& entry) const

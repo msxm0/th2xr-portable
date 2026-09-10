@@ -233,6 +233,13 @@ add_custom_target(th2-conformance ALL
 endif()
 
 if(BUILD_TESTING AND NOT EMSCRIPTEN)
+    add_executable(th2-lzs-test
+        src/lzs_test.cpp
+        src/image.cpp
+    )
+    target_link_libraries(th2-lzs-test PRIVATE th2_archive SDL3::SDL3)
+    add_test(NAME lzs-stream COMMAND th2-lzs-test)
+
     add_executable(th2-scenario-test
         src/scenario_test.cpp
     )
