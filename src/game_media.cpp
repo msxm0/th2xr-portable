@@ -339,19 +339,23 @@ void Game::update_audio_decode()
         return background_budget_.remaining();
     };
 
-    // A channel playing ahead of its own decoder comes first: falling behind
-    // there is an audible dropout, not merely a slower read-ahead.
-    // The track being played keeps itself a few seconds ahead.  This is not
-    // speculative work - falling behind here is an audible dropout, not a
-    // slower guess - so it asks for what the channel actually wants rather
-    // than for a fixed slice.
+    // A track that is playing is not read-ahead and is not the pre-decoder's
+    // business: it has no budget, takes nothing from the frame's allowance,
+    // and is never deferred.  Losing a frame of read-ahead costs a decode
+    // later; losing a frame here is a hole in the sound.
+    //
+    // Below a second of headroom it is topped up outright, however long that
+    // takes.  Above that it is still filled to the five-second target, which
+    // is what keeps the unbudgeted case rare: by the time a frame is busy
+    // enough to matter, the buffer is already seconds deep.  The target
+    // bounds the work either way - a channel five seconds ahead asks for
+    // nothing.
     const auto feed = [&](th2::AudioChannel& channel) {
-        if (channel.starving()) {
-            background_budget_.spend([&] {
-                return channel.decoder()->decode(
-                    remaining(), channel.desired_samples());
-            });
+        if (!channel.starving()) {
+            return;
         }
+        channel.decoder()->decode(
+            th2::AudioDecoder::unbudgeted, channel.desired_samples());
     };
     feed(bgm_);
     for (auto& channel : voice_channels_) {
@@ -414,9 +418,11 @@ void Game::update_audio_decode()
                 return audio_decoder(
                     *request.archive, request.name, request.rank);
             });
-            // A second, not the whole file.  Read-ahead exists so playback
-            // can start without waiting; the rest arrives while it plays.
-            const auto preroll = static_cast<std::size_t>(
+            // Two seconds, not the whole file.  Read-ahead exists so
+            // playback can start instantly and stay ahead through the frames
+            // it takes the streaming window to take over; the rest arrives
+            // while it plays.
+            const auto preroll = 2 * static_cast<std::size_t>(
                 std::max(1, decoder->sample_rate()))
                 * static_cast<std::size_t>(std::max(1, decoder->channels()));
             if (background_budget_.spend([&] {

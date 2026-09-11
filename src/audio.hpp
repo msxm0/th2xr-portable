@@ -52,6 +52,13 @@ public:
     bool decode_all();
     bool done() const { return done_; }
     std::size_t decoded_samples() const { return clip_.samples.size(); }
+    // For a caller that must not be cut short.  decode() stops on whichever
+    // comes first, the sample target or the clock, so "no clock" has to be
+    // spelled as a duration; this is that, named, rather than an arbitrary
+    // large number at each call site.  It is never waited out - the target
+    // is what ends the call.
+    static constexpr std::chrono::nanoseconds unbudgeted =
+        std::chrono::hours(24);
 
     // The format is known as soon as the decoder exists, so a stream can be
     // opened before a single sample has been decoded.
@@ -95,11 +102,14 @@ public:
     void play_intro_loop_streaming(std::shared_ptr<AudioDecoder> intro,
                                    std::shared_ptr<AudioDecoder> loop,
                                    float gain);
-    // True while the channel is playing ahead of its own decoder, so the
-    // caller knows to give this one decoding time before any read-ahead.
+    // True once the window in front of the device has drained to the low
+    // mark, so the caller knows to give this one decoding time before any
+    // read-ahead.  Distinct from desired_samples(), which is the high mark:
+    // filling to the same point that triggers the fill would mean topping up
+    // every frame forever.
     bool starving() const;
     // How much decoded audio this channel wants to have in hand: what it has
-    // already handed the device plus a few seconds.  The track being played
+    // already handed the device plus the high mark.  The track being played
     // streams on its own terms rather than out of the read-ahead pool.
     std::size_t desired_samples() const;
     AudioDecoder* decoder() const { return source_.get(); }
@@ -114,6 +124,25 @@ public:
     bool fading() const { return fade_started_.has_value(); }
 
 private:
+    // The window of decoded audio kept in front of the device.  It drains as
+    // the device plays and is refilled only once it reaches the low mark, so
+    // a track is decoded at roughly the rate it is heard rather than as fast
+    // as frames go by.
+    //
+    // This is what bounds the work: a second is far more than the frame loop
+    // needs to stay ahead - even a 60ms hitch is four frames of slack - and
+    // the 200ms band above it means the refill happens a few times a second
+    // rather than on every frame.
+    static constexpr int window_low_ms = 1000;
+    static constexpr int window_high_ms = 1200;
+    // Samples of the active clip that correspond to those durations.
+    std::size_t mark_samples(int milliseconds) const;
+    // What the device still holds and has not played, in samples.  This is
+    // the real headroom: samples handed over are gone from our buffer but
+    // have not been heard yet, and it is the gap ahead of the *device* that
+    // a dropout is measured against.
+    std::size_t device_samples() const;
+
     SDL_AudioStream* stream_ = nullptr;
     std::shared_ptr<AudioDecoder> source_;
     std::shared_ptr<AudioDecoder> loop_source_;

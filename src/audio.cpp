@@ -406,7 +406,14 @@ bool AudioDecoder::decode_browser(std::chrono::nanoseconds budget,
         }
         state.browser_frames = frames;
         clip_.channels = channels;
-        clip_.samples.resize(
+        // Room for the whole track, but no samples yet.  size() is what every
+        // consumer reads as "how much has been decoded" - starving(), the
+        // read-ahead's target, the early-out in decode() - so it has to mean
+        // samples actually copied.  Sizing it up front made a track look
+        // fully decoded the instant the browser reported its length, which
+        // stopped both the copy and the top-up after the first slice and left
+        // the rest of the buffer silent.
+        clip_.samples.reserve(
             static_cast<std::size_t>(frames) * channels);
     }
 
@@ -418,11 +425,14 @@ bool AudioDecoder::decode_browser(std::chrono::nanoseconds budget,
     while (state.browser_copied < state.browser_frames) {
         const int count =
             std::min(slice, state.browser_frames - state.browser_copied);
+        const auto filled = static_cast<std::size_t>(state.browser_copied)
+            * clip_.channels;
+        // Grows into the capacity reserved above, so the buffer never moves
+        // and the slices already copied stay where they are.
+        clip_.samples.resize(
+            filled + static_cast<std::size_t>(count) * clip_.channels);
         th2_audio_copy(
-            state.browser_handle,
-            clip_.samples.data()
-                + static_cast<std::size_t>(state.browser_copied)
-                    * clip_.channels,
+            state.browser_handle, clip_.samples.data() + filled,
             state.browser_copied, count);
         state.browser_copied += count;
         if (target_samples != 0
@@ -684,16 +694,20 @@ void AudioChannel::queue()
     if (!stream_ || clip.samples.size() <= queued_samples_) {
         return;
     }
-    // SDL copies whatever it is handed, so handing it a whole decoded track
-    // is a multi-megabyte memcpy on the frame that starts playback - which
-    // is what read-ahead makes the common case.  A second of audio is far
-    // more than the frame loop needs to stay ahead of the device, and
-    // update() tops it up every frame.
-    const auto chunk = static_cast<std::size_t>(
-        std::max(1, clip.sample_rate)) * static_cast<std::size_t>(
-            std::max(1, clip.channels));
+    // Only up to the high mark, and only once the device has drained to the
+    // low one.  queue() runs every frame, so handing over a fixed second
+    // each time pushed a whole track into SDL's own buffer within a few
+    // frames - which in turn made the decoder chase a target that was always
+    // seconds further on, so every track was decoded in full whatever the
+    // read-ahead target said.  Gating on what the device still holds is what
+    // makes the window mean anything.
+    const auto in_device = device_samples();
+    if (in_device >= mark_samples(window_low_ms)) {
+        return;
+    }
+    const auto room = mark_samples(window_high_ms) - in_device;
     const auto count =
-        std::min(clip.samples.size() - queued_samples_, chunk);
+        std::min(clip.samples.size() - queued_samples_, room);
     if (!SDL_PutAudioStreamData(
             stream_, clip.samples.data() + queued_samples_,
             static_cast<int>(count * sizeof(float)))) {
@@ -865,22 +879,36 @@ void AudioChannel::advance_playback_end(std::size_t samples)
             duration);
 }
 
+std::size_t AudioChannel::mark_samples(int milliseconds) const
+{
+    const auto& clip = active_clip();
+    const auto per_second = static_cast<std::size_t>(
+        std::max(1, clip.sample_rate))
+        * static_cast<std::size_t>(std::max(1, clip.channels));
+    return per_second * static_cast<std::size_t>(milliseconds) / 1000;
+}
+
+std::size_t AudioChannel::device_samples() const
+{
+    if (!stream_) {
+        return 0;
+    }
+    const int bytes = SDL_GetAudioStreamQueued(stream_);
+    return bytes > 0 ? static_cast<std::size_t>(bytes) / sizeof(float) : 0;
+}
+
 bool AudioChannel::starving() const
 {
     return stream_ && active_ && source_ && !source_->done()
-        && source_->decoded_samples() < desired_samples();
+        && source_->decoded_samples()
+            < queued_samples_ + mark_samples(window_low_ms);
 }
 
 std::size_t AudioChannel::desired_samples() const
 {
-    const auto& clip = active_clip();
-    // Five seconds beyond what the device already has.  Enough that a frame
-    // or two of nothing being decoded is inaudible, and far less than the
-    // whole track.
-    const auto per_second = static_cast<std::size_t>(
-        std::max(1, clip.sample_rate))
-        * static_cast<std::size_t>(std::max(1, clip.channels));
-    return queued_samples_ + per_second * 5;
+    // The high mark, beyond what has already been handed over.  Reaching it
+    // is what ends a top-up; starving() at the low mark is what begins one.
+    return queued_samples_ + mark_samples(window_high_ms);
 }
 
 }  // namespace th2
