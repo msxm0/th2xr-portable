@@ -101,9 +101,13 @@ public:
     // Starts fetching an entry in the background so a later read() of it does
     // not wait on the network.  A no-op on the native builds.  The rank says
     // how speculative the guess is; see PrefetchRank.
-    void prefetch(
-        const ArchiveEntry& entry,
-        int depth = prefetch_depth::imminent) const;
+    // Where an entry lives, for a caller assembling a scan's wanted list.
+    struct Range {
+        std::string path;
+        std::uint64_t offset = 0;
+        std::size_t size = 0;
+    };
+    Range range_of(const ArchiveEntry& entry) const;
     // True when read() would not have to go to the network for this entry.
     bool resident(const ArchiveEntry& entry) const;
 

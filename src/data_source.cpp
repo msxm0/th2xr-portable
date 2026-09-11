@@ -7,6 +7,7 @@
 #include <list>
 #include <string>
 #include <unordered_map>
+#include <limits>
 #include <unordered_set>
 #else
 #include <fstream>
@@ -75,38 +76,62 @@ EM_ASYNC_JS(int, fetch_range,
     }
 });
 
-// Fetches a range without waiting for it.  The bytes land in a JS-side map
-// that take_prefetched() drains, so the engine can ask for what a script is
-// about to need while the player is still reading the current line.  The
-// budget is generous but bounded: prefetches are guesses, and a wrong guess
-// must not be able to push the tab out of memory.
-EM_JS(void, bump_prefetch_round, (), {
-    const store = Module.th2Prefetch;
-    if (store) {
-        store.round = (store.round || 0) + 1;
+// Set up once, on first use.  Kept out of the admission pass so that pass
+// reads as the algorithm it is rather than as initialisation with an
+// algorithm attached.
+EM_JS(void, th2InitPrefetchStore, (), {
+    if (Module.th2Prefetch) {
+        return;
     }
-});
-
-EM_JS(void, start_prefetch,
-    (const char* url, double offset, double size, int keep, int depth), {
-    const path = UTF8ToString(url);
-    const key = path + ":" + offset + ":" + size;
-    if (!Module.th2Prefetch) {
         const store = {entries: new Map(), bytes: 0, queue: [], active: 0,
                        counter: 0};
+        // Prefetches are guesses, and a wrong guess must not be able to push
+        // the tab out of memory.
+        store.budget = 256 * 1024 * 1024;
         // Speculative requests in flight at once.  A browser keeps six
         // connections per origin on HTTP/1.1 and queues the rest itself, in
         // an order nothing can change afterwards; holding the guesses here
         // instead leaves slots free for the read the player is actually
         // waiting on, and keeps the ordering ours to rearrange.
         store.limit = 4;
+        // One place that forgets a range: drop it from the map and give back
+        // whatever space it was holding or had reserved.  Getting this wrong
+        // in one path out of four is how a budget quietly becomes unusable,
+        // so there is only one path.
+        store.release = (entry) => {
+            const key = entry.path + ":" + entry.offset + ":" + entry.size;
+            if (!store.entries.delete(key)) {
+                return;  // Already gone; do not refund twice.
+            }
+            store.bytes -= entry.size;
+            // Also out of the queue.  Every caller happens to splice before
+            // calling this, but one that forgot would leave the queue holding
+            // a range the store no longer knows about, and pump() would fetch
+            // it into nowhere.
+            const queued = store.queue.indexOf(entry);
+            if (queued >= 0) {
+                store.queue.splice(queued, 1);
+            }
+            if (entry.abort && !entry.body) {
+                // Still on the wire and nobody wants it any more.
+                try {
+                    entry.abort.abort();
+                } catch (error) {
+                    // An abort that cannot be delivered is not worth failing
+                    // the eviction for.
+                }
+            }
+        };
         store.begin = (entry) => {
             entry.started = true;
             store.active++;
+            entry.abort = typeof AbortController === "function"
+                ? new AbortController() : null;
             const last = entry.offset + entry.size - 1;
             fetch(entry.path, {
                 headers: {Range: `bytes=${entry.offset}-${last}`},
                 priority: "low",
+                signal: entry.abort ? entry.abort.signal : undefined,
             })
                 .then(async (response) => {
                     if (!response.ok) {
@@ -124,20 +149,25 @@ EM_JS(void, start_prefetch,
                         return null;
                     }
                     entry.body = body;
-                    store.bytes += body.length;
                     return body;
                 })
                 .catch(() => null)
                 .then((body) => {
                     store.active--;
+                    if (!body) {
+                        // Failed, or aborted because the range left the
+                        // graph.  Either way the space set aside for it goes
+                        // back, or the budget would shrink with every miss.
+                        store.release(entry);
+                    }
                     entry.settle(body);
                     store.pump();
                 });
         };
         // Queued entries go out in need order rather than call order:
-        // imminent before branch, and within a rank the one the scan reached
-        // first, which is the one the script reaches first.  A later scan's
-        // imminent range therefore overtakes an earlier scan's guesses.
+        // nearest in the script first, and among equals the one asked for
+        // earliest.  A later scan's imminent range therefore overtakes an
+        // earlier scan's guesses rather than queueing behind them.
         // Issuing a fetch costs about a tenth of a millisecond on the
         // thread that draws.  The concurrency limit alone does not bound
         // that per frame: over a fast link a request can complete in the
@@ -190,36 +220,33 @@ EM_JS(void, start_prefetch,
                 // position.
                 let worst = 0;
                 for (let i = 1; i < store.queue.length; ++i) {
-                    if (store.priority(store.queue[i])
-                        > store.priority(store.queue[worst])) {
+                    const here = store.priority(store.queue[i]);
+                    const best = store.priority(store.queue[worst]);
+                    if (here > best
+                        || (here === best
+                            && store.queue[i].round
+                                < store.queue[worst].round)) {
                         worst = i;
                     }
                 }
                 const dropped = store.queue.splice(worst, 1)[0];
-                store.entries.delete(
-                    dropped.path + ":" + dropped.offset + ":" + dropped.size);
+                store.release(dropped);
                 dropped.settle(null);
             }
         };
-        // A range stops being a guess the moment the engine blocks on it, so
-        // it leaves the queue and goes out immediately, over the limit.
-        // Exploration happens in rounds.  An entry asked for again this
-        // round is still on a path the script can take; one that is not has
-        // been passed or the branch carrying it abandoned, and is the first
-        // thing to go however urgent it was when it was fetched.
         store.round = 0;
         store.PASSED = 1000000;
-        // Rounds are recorded but do not by themselves demote an entry.
-        // data_prefetch() returns early for a range already in the C++ cache,
-        // so a still-wanted range often cannot be re-announced at all: making
-        // one missed round mean "unreachable" evicted prefetched bytes before
-        // the engine read them, and the refetches cost more than the space
-        // ever saved.  Demotion needs a signal that a path was abandoned, not
-        // the absence of a signal.
-        store.staleRounds = 8;
+        // Each scan is a generation.  A range carries the generation of the
+        // scan that last named it, so "how long since the script could still
+        // reach this" is just how far that number has fallen behind.
+        //
+        // No grace period: the scan names every reachable range every time,
+        // so going unnamed for even one generation means the range has left
+        // the graph.
         store.priority = (entry) => (
-            (store.round - entry.round) > store.staleRounds
-                ? store.PASSED : entry.rank);
+            entry.round === store.round ? entry.rank : store.PASSED);
+        // A range stops being a guess the moment the engine blocks on it, so
+        // it leaves the queue and goes out immediately, over both limits.
         store.promote = (entry) => {
             if (entry.started) {
                 return;
@@ -231,63 +258,135 @@ EM_JS(void, start_prefetch,
             store.begin(entry);
         };
         Module.th2Prefetch = store;
+});
+
+// One admission pass over the scan's whole list.
+//
+// The list arrives sorted by (priority, size, offset) - deterministic, so the
+// same script position always admits the same ranges in the same order - and
+// each line is `path\toffset\tsize\tdepth`.  Ranges already held are repriced
+// and skipped; the rest are admitted in order, evicting only entries the
+// script wants later, until one will not fit even after that.  The pass stops
+// there: everything after it in the list is at least as far off, so nothing
+// after it would fit either.
+EM_JS(void, submit_prefetch, (const char* text), {
+    if (!Module.th2Prefetch) {
+        th2InitPrefetchStore();
     }
     const store = Module.th2Prefetch;
-    const existing = store.entries.get(key);
-    if (existing) {
-        // Already here or on its way.  Re-asking is how the explorer says
-        // "still wanted, and this is how soon now" - the script has moved
-        // since this was fetched, so the depth it carried is stale.
-        existing.rank = depth;
-        existing.round = store.round;
-        return;
-    }
-    const budget = 256 * 1024 * 1024;
-    if (store.bytes + size > budget) {
-        // Make room by dropping the most speculative entries first, and
-        // within a rank the most recently added - those sit furthest ahead
-        // of the player, because the scan walks the script in order.  What
-        // the next few lines need was requested earliest at the lowest rank,
-        // so it is the last thing to go.  Only entries that have arrived can
-        // be dropped; a request still in flight has nothing to reclaim.
-        // Least urgent first, by what the script is going to want rather
-        // than by when it was asked for.  Within equal urgency the oldest
-        // goes: ordering both descending dropped whatever had just been
-        // fetched, which the next round promptly asked for again.  Only
-        // arrived entries can be dropped - a request in flight has nothing
-        // to reclaim yet.
-        const droppable = [...store.entries]
-            .filter(([, entry]) => entry.body && !entry.keep)
-            .sort((a, b) => (store.priority(b[1]) - store.priority(a[1]))
-                         || (a[1].order - b[1].order));
-        for (const [oldKey, entry] of droppable) {
-            if (store.bytes + size <= budget) {
-                break;
+    const budget = store.budget;
+    store.round = (store.round || 0) + 1;
+    const lines = UTF8ToString(text);
+    const named = new Set();
+
+    let at = 0;
+    while (at < lines.length) {
+        const stop = lines.indexOf("\n", at);
+        const line = lines.slice(at, stop < 0 ? lines.length : stop);
+        at = (stop < 0 ? lines.length : stop) + 1;
+        if (!line) {
+            continue;
+        }
+        const parts = line.split("\t");
+        if (parts.length < 4) {
+            continue;
+        }
+        const path = parts[0];
+        const offset = Number(parts[1]);
+        const size = Number(parts[2]);
+        const depth = parseInt(parts[3], 10);
+            const key = path + ":" + offset + ":" + size;
+        named.add(key);
+
+        const held = store.entries.get(key);
+        if (held) {
+            // Already here or on its way: this is how it learns what the
+            // range is worth now rather than when it was fetched.
+            held.rank = depth;
+            held.round = store.round;
+            continue;
+        }
+
+        // Make room, but only from ranges the script wants later than this
+        // one.  Least urgent first; among equals the one whose generation has
+        // fallen furthest behind, which for the passed ones - all tied at the
+        // same worthless priority - means the longest since the script could
+        // reach it at all.  Insertion order settles the rest.
+        //
+        // Only ranges that have arrived can be dropped: one still in flight
+        // has nothing to reclaim and its space is already reserved.
+        if (store.bytes + size > budget) {
+            const droppable = [...store.entries]
+                .filter(([, e]) => !e.keep && e.body)
+                .sort((a, b) => (store.priority(b[1]) - store.priority(a[1]))
+                             || (a[1].round - b[1].round)
+                             || (a[1].order - b[1].order));
+            for (const [oldKey, entry] of droppable) {
+                if (store.bytes + size <= budget) {
+                    break;
+                }
+                if (store.priority(entry) <= depth) {
+                    break;  // Nothing left that is worth less than this.
+                }
+                store.release(entry);
             }
-            // Never for something the script wants as soon or sooner.  The
-            // list is least-urgent-first, so everything after this is at
-            // least as urgent as the range asking for the room.
-            if (store.priority(entry) <= depth) {
-                break;
-            }
-            store.bytes -= entry.body.length;
-            store.entries.delete(oldKey);
         }
         if (store.bytes + size > budget) {
-            return;
+            break;  // Everything further down the list is at least as far off.
         }
+
+        // Reserved now, not when the bytes land, so two admissions cannot be
+        // let in against the same free space.
+        store.bytes += size;
+        store.counter = (store.counter || 0) + 1;
+        const entry = {body: null, path: path, offset: offset, size: size,
+                       keep: false, rank: depth, round: store.round,
+                       order: store.counter, started: false};
+        entry.promise = new Promise((resolve) => { entry.settle = resolve; });
+        store.entries.set(key, entry);
+        store.queue.push(entry);
     }
-    // A "kept" entry is a chunk covering many later reads - an archive's
-    // directory, say - so it stays after it has been read from.
+    // A queued range that the scan did not name has left the graph before it
+    // ever went out.  Nothing has been spent on it, so drop it rather than
+    // let it sit ahead of ranges that are still wanted.  Ones already in
+    // flight are left alone: the bandwidth is spent either way, and the bytes
+    // may still be useful if the player goes back.
+    for (let i = store.queue.length - 1; i >= 0; --i) {
+        const entry = store.queue[i];
+        const key = entry.path + ":" + entry.offset + ":" + entry.size;
+        if (entry.keep || entry.started || named.has(key)) {
+            continue;
+        }
+        store.queue.splice(i, 1);
+        store.release(entry);
+        entry.settle(null);
+    }
+    store.pump();
+    store.trim();
+});
+
+// A range the engine is about to block on, admitted whatever the budget says:
+// it is not a guess, and refusing it would only mean fetching it twice.
+EM_JS(void, pin_prefetch,
+    (const char* url, double offset, double size, int keep), {
+    if (!Module.th2Prefetch) {
+        th2InitPrefetchStore();
+    }
+    const store = Module.th2Prefetch;
+    const path = UTF8ToString(url);
+    const key = path + ":" + offset + ":" + size;
+    if (store.entries.has(key)) {
+        return;
+    }
+    store.bytes += size;
     store.counter = (store.counter || 0) + 1;
     const entry = {body: null, path: path, offset: offset, size: size,
-                   keep: keep != 0, rank: depth, round: store.round,
+                   keep: keep != 0, rank: 0, round: store.round,
                    order: store.counter, started: false};
     entry.promise = new Promise((resolve) => { entry.settle = resolve; });
     store.entries.set(key, entry);
     store.queue.push(entry);
     store.pump();
-    store.trim();
 });
 
 // Hands over a prefetched range, waiting for it when it is still in flight -
@@ -324,15 +423,15 @@ EM_ASYNC_JS(int, take_prefetched,
         store.promote(entry);
     }
     const body = entry.body ?? await entry.promise;
-    if (!entry.keep) {
-        if (entry.body) {
-            store.bytes -= entry.body.length;
-        }
-        store.entries.delete(path + ":" + offset + ":" + size);
-    }
     if (!body) {
-        return -1;
+        return -1;  // begin() has already released it.
     }
+    // Deliberately kept.  This region is a cache, not a queue of things not
+    // yet read: dropping a range the moment it is used meant the 256MB was
+    // never more than a few megabytes of in-flight requests, and a second
+    // read of the same range - after the layer above it had let go - went
+    // back to the network.  It stays until something the script wants sooner
+    // needs the room.
     // HEAPU8 is re-read after the await so a heap that grew meanwhile still
     // resolves to a live view.
     HEAPU8.set(body.subarray(start, start + size), destination);
@@ -425,14 +524,34 @@ std::string range_key(
     return path + ':' + std::to_string(offset) + ':' + std::to_string(size);
 }
 
+}  // namespace
+
+std::string data_range_key(
+    const std::filesystem::path& path, std::uint64_t offset, std::size_t size)
+{
+    return range_key(path.string(), offset, size);
+}
+
+namespace {
+
 void remember_range(
     const std::string& key, std::span<const std::uint8_t> bytes)
 {
     if (bytes.size() > range_cache_entry_limit) {
-        return;
+        return;  // Movie-sized reads are streamed, not cached.
     }
     auto& entries = range_cache();
     auto& index = range_index();
+    // Already here.  Two reads of one range can be in flight at once, because
+    // both the prefetch store and the network suspend the wasm stack and a
+    // second read can begin while the first is parked.  Pushing a duplicate
+    // would leave the older copy unreachable through the index but still
+    // counted against the budget, and evicting it later would erase the
+    // index entry belonging to the newer one.
+    if (const auto found = index.find(key); found != index.end()) {
+        entries.splice(entries.begin(), entries, found->second);
+        return;
+    }
     entries.push_front(RangeEntry{key, {bytes.begin(), bytes.end()}});
     index[key] = entries.begin();
     range_cache_bytes() += bytes.size();
@@ -535,30 +654,21 @@ bool data_read(
     return true;
 }
 
-void data_prefetch_new_round()
+void data_prefetch_submit(const std::string& sorted_lines)
 {
-    bump_prefetch_round();
+    submit_prefetch(sorted_lines.c_str());
 }
 
-void data_prefetch(
+void data_prefetch_pin(
     const std::filesystem::path& path, std::uint64_t offset, std::size_t size,
-    int depth)
+    bool keep)
 {
-    if (size == 0 || size > range_cache_entry_limit) {
-        return;  // Movie-sized reads are streamed, not cached.
-    }
-    const std::string key = path.string();
-    if (pinned_files().contains(key)) {
+    if (size == 0 || pinned_files().contains(path.string())) {
         return;
     }
-    const auto cache_key = range_key(key, offset, size);
-    if (range_index().contains(cache_key)
-        || !requested_ranges().insert(cache_key).second) {
-        return;
-    }
-    start_prefetch(
-        key.c_str(), static_cast<double>(offset), static_cast<double>(size),
-        0, depth);
+    pin_prefetch(
+        path.string().c_str(), static_cast<double>(offset),
+        static_cast<double>(size), keep ? 1 : 0);
 }
 
 void data_prefetch_chunk(
@@ -568,9 +678,9 @@ void data_prefetch_chunk(
     if (pinned_files().contains(key)) {
         return;
     }
-    start_prefetch(
+    pin_prefetch(
         key.c_str(), static_cast<double>(offset), static_cast<double>(size),
-        1, static_cast<int>(PrefetchRank::imminent));
+        1);
 }
 
 bool data_is_resident(
@@ -582,8 +692,7 @@ bool data_is_resident(
         return true;
     }
     const auto cache_key = range_key(key, offset, size);
-    if (range_index().contains(cache_key)
-        || requested_ranges().contains(cache_key)) {
+    if (range_index().contains(cache_key)) {
         return true;
     }
     // Not asked for directly, but a chunk fetched for something else may
@@ -601,7 +710,12 @@ bool data_exists(const std::filesystem::path& path)
     return std::filesystem::exists(path, error);
 }
 
-void data_prefetch_new_round() {}
+void data_prefetch_submit(const std::string&) {}
+
+void data_prefetch_pin(
+    const std::filesystem::path&, std::uint64_t, std::size_t, bool)
+{
+}
 
 void data_prefetch(
     const std::filesystem::path&, std::uint64_t, std::size_t, int)

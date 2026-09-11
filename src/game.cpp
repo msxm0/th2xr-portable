@@ -189,7 +189,9 @@ Game::Game(
     };
     for (const auto* asset : startup_textures) {
         if (const auto* entry = graphics_.find(asset)) {
-            graphics_.prefetch(*entry);
+            const auto range = graphics_.range_of(*entry);
+            th2::data_prefetch_pin(
+                range.path, range.offset, range.size, false);
         }
     }
     // The interface sounds are played by menus rather than by the script, so
@@ -197,7 +199,9 @@ Game::Game(
     for (const int sound : {9002, 9012, 9014, 9015, 9104, 9107, 9108, 9111}) {
         if (const auto* entry =
                 se_archive_.find(std::format("SE_{:04d}.WAV", sound))) {
-            se_archive_.prefetch(*entry);
+            const auto range = se_archive_.range_of(*entry);
+            th2::data_prefetch_pin(
+                range.path, range.offset, range.size, false);
         }
     }
     auto try_load = [&](std::string_view name) -> Texture {
@@ -209,6 +213,9 @@ Game::Game(
             return {};
         }
     };
+    // Every script up front: the walk needs them and they never change, so
+    // this is the one place the cost can be paid without a frame noticing.
+    preload_scripts();
     ui_sys_menu_bg_ = try_load("sys0100.tga");
     ui_sys_menu_btns_ = try_load("sys0110.tga");
     ui_sys_cancel_ = try_load("sys0111.tga");

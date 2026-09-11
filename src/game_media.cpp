@@ -292,74 +292,43 @@ void Game::set_character(const th2::Event& event)
     }
 }
 
-// Hands back the decoder for an asset, creating it if this is the first ask.
-// Creating one parses the container header only; the samples come later, a
-// few milliseconds per frame, through update_audio_decode().
-std::shared_ptr<th2::AudioDecoder> Game::audio_decoder(
-    const th2::Archive& archive, std::string_view name, int rank)
-{
-    std::string key(name);
-    if (const auto found = audio_decoders_.find(key);
-        found != audio_decoders_.end()) {
-        // A track that turns out to be needed sooner keeps the earlier rank.
-        found->second.rank = std::min(found->second.rank, rank);
-        return found->second.decoder;
-    }
-    const auto* entry = archive.find(name);
-    if (!entry) {
-        throw std::runtime_error("audio not found: " + key);
-    }
-    auto decoder = std::make_shared<th2::AudioDecoder>(archive.read(*entry));
-    audio_decoders_.emplace(
-        key, AudioDecodeEntry{decoder, rank, ++audio_decode_order_});
-    return decoder;
-}
-
 // The decoder a channel is about to play from.  Read-ahead usually means it
 // is already finished; when it is not, this pays a few milliseconds to get a
 // buffer in front of the device rather than the whole track at once.
 std::shared_ptr<th2::AudioDecoder> Game::ready_audio_decoder(
     const th2::Archive& archive, std::string_view name)
 {
-    auto decoder = audio_decoder(
-        archive, name, static_cast<int>(th2::PrefetchRank::imminent));
+    // Depth zero: it is being played now, so nothing outranks it.
+    auto decoder = audio_decoder(archive, name, 0);
     if (!decoder->done()) {
         decoder->decode(std::chrono::milliseconds(3));
     }
     return decoder;
 }
 
-void Game::request_audio_decode(
-    const th2::Archive& archive, std::string_view name, th2::PrefetchRank rank)
+std::shared_ptr<th2::AudioDecoder> Game::audio_decoder(
+    const th2::Archive& archive, std::string_view name, int rank)
 {
     std::string key(name);
-    if (audio_decoders_.contains(key)) {
-        return;
+    if (auto* held = audio_decoders_.find(key)) {
+        return *held;
     }
-    const auto queued = std::ranges::any_of(
-        audio_decode_queue_, [&](const AudioDecodeRequest& request) {
-            return request.name == key;
-        });
-    if (queued) {
-        return;
+    const auto* entry = archive.find(name);
+    if (!entry) {
+        throw std::runtime_error("audio not found: " + key);
     }
-    // Counted per archive: voice, music and effects each get their own five,
-    // so a run of voice lines cannot crowd out the music that is about to
-    // start.
-    const auto same_archive = std::ranges::count_if(
-        audio_decode_queue_, [&](const AudioDecodeRequest& request) {
-            return request.archive == &archive;
-        });
-    if (static_cast<std::size_t>(same_archive) >= audio_decode_queue_limit) {
-        return;
-    }
-    if (!archive.find(name)) {
-        return;  // A script can name a track the release does not ship.
-    }
-    audio_decode_queue_.push_back(AudioDecodeRequest{
-        &archive, std::move(key), static_cast<int>(rank),
-        ++audio_decode_order_});
+    auto decoder = std::make_shared<th2::AudioDecoder>(archive.read(*entry));
+    // Held only if there is room for it.  A decoder the cache refuses still
+    // works - the caller keeps the shared_ptr - it simply will not be found
+    // again, which for read-ahead means it is decoded when it is played
+    // instead of before.
+    audio_decoders_.insert(key, decoder, scan_generation_, rank);
+    return decoder;
 }
+
+// The decoder a channel is about to play from.  Read-ahead usually means it
+// is already finished; when it is not, this pays a few milliseconds to get a
+// buffer in front of the device rather than the whole track at once.
 
 void Game::update_audio_decode()
 {
@@ -402,30 +371,43 @@ void Game::update_audio_decode()
             return std::tie(left.rank, left.order)
                 < std::tie(right.rank, right.order);
         });
+    // Work the queue in order - nearest first - one piece at a time, until
+    // the frame's allowance runs out or everything the scan asked for is
+    // decoded.
     while (!audio_decode_queue_.empty()
            && remaining() > std::chrono::nanoseconds::zero()) {
         auto& request = audio_decode_queue_.front();
+        const auto* entry = request.archive->find(request.name);
+        if (!entry) {
+            audio_decode_queue_.erase(audio_decode_queue_.begin());
+            continue;
+        }
+        // Never off the network.  Read-ahead exists to get work done early,
+        // not to make the frame wait: reading bytes that have not arrived
+        // suspends the wasm stack, which would turn a decode nobody is
+        // waiting for into a stall everybody feels.  If the bytes are not in
+        // a cache yet, the range is already on its way and a later scan will
+        // pick this up.
+        if (!request.archive->resident(*entry)) {
+            audio_decode_queue_.erase(audio_decode_queue_.begin());
+            continue;
+        }
         try {
-            // Building the decoder reads the file, which on a streaming
-            // build can suspend, so the budget has to be re-read after it
-            // rather than assumed to be the one the loop tested.
-            // Opening builds the stream's VLC tables and cannot be cut
-            // short, so it is rationed by count rather than by clock: one a
-            // frame keeps a six-millisecond atomic step from landing twice on
-            // the same one.
-            if (!audio_decoders_.contains(request.name)) {
+            const bool held = audio_decoders_.contains(request.name);
+            if (!held) {
+                // Opening builds the stream's VLC tables and cannot be cut
+                // short, so it is rationed by count rather than by clock:
+                // one a frame keeps a six-millisecond atomic step from
+                // landing twice on the same one.
                 if (audio_opens_this_frame_ >= audio_opens_per_frame) {
                     break;
                 }
                 ++audio_opens_this_frame_;
-            }
-            if (th2app::trace_prefetch
-                && !audio_decoders_.contains(request.name)) {
-                ++trace_.audio_created;
-                if (++audio_seen_[request.name] > 1) {
-                    // Decoded once already and dropped: the cache is losing
-                    // things the script still wants.
-                    ++trace_.audio_recreated;
+                if (th2app::trace_prefetch) {
+                    ++trace_.audio_created;
+                    if (++audio_seen_[request.name] > 1) {
+                        ++trace_.audio_recreated;
+                    }
                 }
             }
             auto decoder = background_budget_.spend([&] {
@@ -433,135 +415,25 @@ void Game::update_audio_decode()
                     *request.archive, request.name, request.rank);
             });
             // A second, not the whole file.  Read-ahead exists so playback
-            // can start without waiting, and the rest arrives while it
-            // plays; decoding all of it filled the pool with audio nobody
-            // had asked to hear.
-            //
-            // And only if it fits without displacing something at least as
-            // urgent: decoding it in that case would evict what the script
-            // wants sooner, which the next scan would then ask for again.
-            const int depth = plan_.depth_of(request.name);
+            // can start without waiting; the rest arrives while it plays.
             const auto preroll = static_cast<std::size_t>(
                 std::max(1, decoder->sample_rate()))
                 * static_cast<std::size_t>(std::max(1, decoder->channels()));
-            if (!audio_admits(preroll * sizeof(float), depth)) {
-                audio_decode_queue_.erase(audio_decode_queue_.begin());
-                continue;
-            }
             if (background_budget_.spend([&] {
                     return decoder->decode(remaining(), preroll);
                 })) {
                 audio_decode_queue_.erase(audio_decode_queue_.begin());
             } else {
-                break;  // Out of time; the rest of this file waits a frame.
+                break;  // Out of time; the rest of this one waits a frame.
             }
         } catch (const std::exception&) {
             // A file that will not decode is not worth retrying every frame.
             audio_decode_queue_.erase(audio_decode_queue_.begin());
         }
     }
-    evict_audio_decoders();
 }
 
-bool Game::audio_admits(std::size_t bytes, int depth) const
-{
-    if (bytes >= audio_decode_budget_bytes) {
-        // Bigger than the whole pool: decoding it would evict everything and
-        // still not fit.  A track that size streams instead.
-        return false;
-    }
-    std::size_t held = 0;
-    std::size_t reclaimable = 0;
-    for (const auto& [key, entry] : audio_decoders_) {
-        const auto size = entry.decoder->clip().samples.size() * sizeof(float);
-        if (entry.decoder.use_count() > 1) {
-            continue;  // Playing; outside the pool entirely.
-        }
-        held += size;
-        if (plan_.depth_of(key) > depth) {
-            reclaimable += size;
-        }
-    }
-    return held + bytes <= audio_decode_budget_bytes + reclaimable;
-}
 
-void Game::evict_audio_decoders(int incoming_depth)
-{
-    std::size_t total = 0;
-    std::size_t largest = 0;
-    for (const auto& [key, entry] : audio_decoders_) {
-        const auto bytes = entry.decoder->clip().samples.size() * sizeof(float);
-        // A clip a channel is holding cannot be dropped, so counting it only
-        // forces everything droppable out to make room for something that is
-        // not going anywhere.  A 32MB track in a 96MB pool evicted every
-        // voice line the read-ahead had just decoded.
-        if (entry.decoder.use_count() > 1) {
-            largest = std::max(largest, bytes);
-            continue;
-        }
-        total += bytes;
-        largest = std::max(largest, bytes);
-    }
-    if (th2app::trace_prefetch) {
-        trace_.audio_cache_bytes = total;
-        trace_.largest_clip_bytes = largest;
-    }
-    if (total <= audio_decode_budget_bytes) {
-        return;
-    }
-    // Decoded PCM is bulky - minutes of BGM run to tens of megabytes - so the
-    // cache is bounded the way the byte prefetch is: the most speculative go
-    // first, and anything a channel still holds is untouchable.
-    std::vector<const std::string*> droppable;
-    for (const auto& [key, entry] : audio_decoders_) {
-        if (entry.decoder.use_count() == 1) {
-            droppable.push_back(&key);
-        }
-    }
-    // Least urgent first, by what the script is going to want rather than by
-    // when it was asked for.  Anything the walk no longer reaches answers
-    // `passed` and sorts to the front, so the first things dropped are the
-    // ones the story has gone by.  Within equal depth the oldest goes first;
-    // ordering both descending used to drop whatever had just been decoded,
-    // which the next scan promptly asked for again.
-    std::ranges::sort(droppable, [&](const auto* left, const auto* right) {
-        const int a = plan_.depth_of(*left);
-        const int b = plan_.depth_of(*right);
-        if (a != b) {
-            return a > b;
-        }
-        return audio_decoders_.at(*left).order
-            < audio_decoders_.at(*right).order;
-    });
-    for (const auto* key : droppable) {
-        if (total <= audio_decode_budget_bytes) {
-            break;
-        }
-        // Never at the expense of something the script wants as soon or
-        // sooner.  If the only things left are as urgent as what is asking
-        // for the room, the pool stays over budget and the newcomer is the
-        // one that does without - which admission control below prevents
-        // from arising in the first place.
-        // Only when something is actually asking for the room.  Tidying up
-        // has nothing to protect, and comparing passed against passed made
-        // that case evict nothing at all - the pool grew to 314MB against a
-        // 96MB budget before a counter caught it.
-        if (incoming_depth >= 0 && incoming_depth <= plan_.depth_of(*key)) {
-            // Deeper (less urgent) entries sort first, so everything after
-            // this one is at least as urgent.
-            break;
-        }
-        const auto found = audio_decoders_.find(*key);
-        if (th2app::trace_prefetch) {
-            ++trace_.audio_evicted;
-            if (!found->second.decoder->done()) {
-                ++trace_.audio_evicted_undecoded;
-            }
-        }
-        total -= found->second.decoder->clip().samples.size() * sizeof(float);
-        audio_decoders_.erase(found);
-    }
-}
 
 void Game::play_se(int channel, int sound, bool loop, int volume, int fade,
              bool wait_for_completion)
@@ -883,41 +755,6 @@ std::optional<std::size_t> Game::overlay_index(int requested) const
     return static_cast<std::size_t>(requested);
 }
 
-void Game::request_image_decode(bool background, std::string_view name)
-{
-    if (name.empty()) {
-        return;
-    }
-    const auto& source = background ? backgrounds_ : graphics_;
-    const auto* entry = source.find(name);
-    // Only once the bytes are here.  Reading them is what suspends the wasm
-    // stack for a fetch, and doing that from the decode-ahead would move the
-    // wait rather than remove it.
-    if (!entry || !source.resident(*entry)) {
-        return;
-    }
-    const std::string prefix = background ? "bak:" : "grp:";
-    auto key = prefix + std::string(name);
-    if (decoded_images_.contains(key)) {
-        return;
-    }
-    if (std::ranges::find(image_decode_queue_, key)
-        != image_decode_queue_.end()) {
-        return;
-    }
-    const auto same_kind = std::ranges::count_if(
-        image_decode_queue_, [&](const std::string& queued) {
-            return queued.starts_with(prefix);
-        });
-    if (static_cast<std::size_t>(same_kind) >= image_decode_kind_limit) {
-        return;
-    }
-    if (th2app::trace_prefetch) {
-        ++trace_.image_queued;
-    }
-    image_decode_queue_.push_back(std::move(key));
-}
-
 void Game::report_prefetch_trace()
 {
     if (!th2app::trace_prefetch) {
@@ -954,24 +791,36 @@ void Game::update_image_decode()
     }
 
     if (!pending_image_) {
-        const auto key = image_decode_queue_.front();
-        image_decode_queue_.pop_front();
-        if (decoded_images_.contains(key)) {
-            return;
+        const th2::Archive* source = nullptr;
+        const th2::ArchiveEntry* entry = nullptr;
+        std::string key;
+        std::string name;
+        // Take the nearest one whose bytes are here.  Never off the network:
+        // reading bytes that have not arrived suspends the wasm stack, which
+        // would turn a decode nobody is waiting for into a stall everybody
+        // feels.  Anything skipped is already on its way and the next scan
+        // queues it again, so passing over it costs nothing but keeps the
+        // frame's slot from going to waste.
+        while (!image_decode_queue_.empty()) {
+            key = image_decode_queue_.front();
+            image_decode_queue_.pop_front();
+            if (decoded_images_.contains(key)) {
+                continue;
+            }
+            name = key.substr(4);
+            source = key.starts_with("bak:") ? &backgrounds_ : &graphics_;
+            entry = source->find(name);
+            if (entry && source->resident(*entry)) {
+                break;
+            }
+            entry = nullptr;
         }
-        const bool background = key.starts_with("bak:");
-        const std::string name = key.substr(4);
-        const auto& source = background ? backgrounds_ : graphics_;
-        const auto* entry = source.find(name);
-        // Only once the bytes are here: reading them is what suspends the
-        // wasm stack for a fetch, and doing that from a decode-ahead would
-        // move the wait rather than remove it.
-        if (!entry || !source.resident(*entry)) {
+        if (!entry) {
             return;
         }
         try {
             auto stored = background_budget_.spend(
-                [&] { return source.read_stored(*entry); });
+                [&] { return source->read_stored(*entry); });
             PendingImage pending;
             pending.key = key;
             // Only TGA decodes in bands; a BMP goes through SDL, which has no
@@ -1029,19 +878,17 @@ void Game::update_image_decode()
             }));
         }
         if (surface) {
-            while (decoded_images_.size() >= decoded_image_limit
-                   && !decoded_image_order_.empty()) {
+            if (decoded_images_.insert(
+                    pending.key, std::move(surface), scan_generation_,
+                    plan_.depth_of(pending.key))) {
                 if (th2app::trace_prefetch) {
-                    ++trace_.image_evicted_unused;
+                    ++trace_.image_decoded;
                 }
-                decoded_images_.erase(decoded_image_order_.front());
-                decoded_image_order_.pop_front();
+            } else if (th2app::trace_prefetch) {
+                // Nothing held was worth less, so this was decoded for
+                // nothing.
+                ++trace_.image_evicted_unused;
             }
-            if (th2app::trace_prefetch) {
-                ++trace_.image_decoded;
-            }
-            decoded_image_order_.push_back(pending.key);
-            decoded_images_.emplace(pending.key, std::move(surface));
         }
     } catch (const std::exception& error) {
         // A picture that will not decode is not worth a crash here; the load
@@ -1056,21 +903,14 @@ Surface Game::take_predecoded_image(bool background, std::string_view name)
 {
     const auto key =
         std::string(background ? "bak:" : "grp:") + std::string(name);
-    const auto found = decoded_images_.find(key);
-    if (found == decoded_images_.end()) {
+    if (!decoded_images_.contains(key)) {
         return {};
     }
-    // Handed over rather than shared: the tone curves rewrite it in place.
     if (th2app::trace_prefetch) {
         ++trace_.image_used;
     }
-    Surface surface = std::move(found->second);
-    decoded_images_.erase(found);
-    if (const auto at = std::ranges::find(decoded_image_order_, key);
-        at != decoded_image_order_.end()) {
-        decoded_image_order_.erase(at);
-    }
-    return surface;
+    // Handed over rather than shared: the tone curves rewrite it in place.
+    return decoded_images_.take(key);
 }
 
 void Game::load_overlay(

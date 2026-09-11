@@ -59,31 +59,43 @@ bool interesting_opcode(std::string_view name)
 }  // namespace
 
 int Game::prefetch_event_assets(
-    const th2::Event& event, std::string_view script_name,
-    th2::PrefetchRank rank)
+    const th2::Event& event, std::string_view script_name)
 {
-    // Depth is recorded for every asset this event names, whether or not it
-    // still needs fetching: the plan describes what the script wants, and a
-    // resident asset is still wanted - it is what stops the caches treating
-    // it as passed and evicting it moments before it is used.
-    const auto note = [this](const char* prefix, std::string_view asset) {
-        plan_.note(std::string(prefix) + std::string(asset), scan_depth_);
+    // Every asset the event names is recorded at the depth the walk reached
+    // it, whether or not it still needs fetching: the plan describes what the
+    // script wants, and a resident asset is still wanted - recording it is
+    // what stops the caches treating it as passed and dropping it moments
+    // before it is used.
+    const auto note = [this](const char* prefix, std::string_view asset,
+                             bool background) {
+        auto key = std::string(prefix) + std::string(asset);
+        plan_.note(key, scanning_depth_);
+        scan_assets_.push_back(
+            ScanAsset{std::move(key), std::string(asset), nullptr,
+                      background, false, scanning_depth_});
     };
-    // The depth is read at the moment of the request, not captured when the
-    // event was decoded: each asset in an event advances it, so a background
-    // and the voice line after it are not treated as equally urgent.  A
-    // resident asset is still re-announced, which is how the store learns it
-    // is still on a reachable path.
+    // Collected, not requested.  The whole scan's wants are sorted and
+    // admitted in one pass afterwards, so a range three instructions away
+    // cannot lose its place to one two hundred instructions away that the
+    // walk happened to reach first.
     const auto request = [this](const th2::Archive& archive,
                                 std::string_view asset) {
         const auto* entry = archive.find(asset);
         if (!entry) {
             return 0;
         }
-        archive.prefetch(*entry, scan_depth_);
-        return archive.resident(*entry) ? 0 : 1;
+        const auto range = archive.range_of(*entry);
+        auto& want = scan_wants_[range.path + ':'
+                                 + std::to_string(range.offset) + ':'
+                                 + std::to_string(range.size)];
+        if (want.size == 0) {
+            want = WantedRange{range.path, range.offset, range.size,
+                               scanning_depth_};
+        } else {
+            want.depth = std::min(want.depth, scanning_depth_);
+        }
+        return 1;
     };
-    (void)rank;
 
     // Audio needs decoding as well as fetching, and decoding reads the bytes,
     // so the decode is only worth queuing once they have landed.  Scans
@@ -91,17 +103,11 @@ int Game::prefetch_event_assets(
     // decode queued by the next.
     const auto request_audio = [&](const th2::Archive& archive,
                                    std::string_view asset) {
-        plan_.note(std::string(asset), scan_depth_);
-        if (&archive == &voice_archive_) {
-            ++scan_.voices;
-        }
-        ++scan_depth_;
-        const int requested = request(archive, asset);
-        if (const auto* entry = archive.find(asset);
-            entry && archive.resident(*entry)) {
-            request_audio_decode(archive, asset, rank);
-        }
-        return requested;
+        plan_.note(std::string(asset), scanning_depth_);
+        scan_assets_.push_back(
+            ScanAsset{std::string(asset), std::string(asset), &archive,
+                      false, true, scanning_depth_});
+        return request(archive, asset);
     };
 
     const auto& name = event.instruction.name;
@@ -114,15 +120,12 @@ int Game::prefetch_event_assets(
             return 0;
         }
         const auto asset = th2::character_asset_name(*character, *pose);
-        note("grp:", asset);
-        ++scan_.sprites;
-        ++scan_depth_;
-        const int requested = request(graphics_, asset);
-        // Capped at five, unlike the first attempt at this: the lookahead
-        // sees every pose across every branch, and decoding all of them cost
-        // nine times what it used.
-        request_image_decode(false, asset);
-        return requested;
+        note("grp:", asset, false);
+        // note() is what puts this in front of the pre-decoder: the scan
+        // collects, and the one pass afterwards decides which twenty are
+        // nearest.  Queueing here as well only added work the rebuild threw
+        // away.
+        return request(graphics_, asset);
     }
     if (name == "B" || name == "BT" || name == "BC" || name == "BCT") {
         // A pattern wipe needs its mask prepared as well as its background
@@ -172,20 +175,8 @@ int Game::prefetch_event_assets(
             return 0;
         }
         const bool background = *pack == "bak";
-        note(background ? "bak:" : "grp:", *asset);
-        if (background) {
-            ++scan_.backgrounds;
-        } else {
-            ++scan_.sprites;
-        }
-        ++scan_depth_;
-        const int requested =
-            request(background ? backgrounds_ : graphics_, *asset);
-        // Queue the decode too.  request_image_decode() only takes it up once
-        // the bytes have arrived, so a miss here simply means the next scan
-        // catches it.
-        request_image_decode(background, *asset);
-        return requested;
+        note(background ? "bak:" : "grp:", *asset, background);
+        return request(background ? backgrounds_ : graphics_, *asset);
     }
     if (name == "M") {
         const auto* track = literal(event, 0);
@@ -263,124 +254,82 @@ std::string scenario_file_name(std::string name)
 
 }  // namespace
 
-int Game::prefetch_script_start(const std::string& name, int budget)
+void Game::preload_scripts()
 {
-    // Scripts come out of SDT.PAK, which is small enough that the browser
-    // build holds it whole, so opening one to look at it costs nothing.
-    const auto* entry = scripts_.find(scenario_file_name(name));
-    if (!entry) {
-        return 0;
+    const auto started = std::chrono::steady_clock::now();
+    std::size_t bytes = 0;
+    for (const auto& entry : scripts_.entries()) {
+        try {
+            auto contents = scripts_.read(entry);
+            // A script is a header followed by bytecode; anything that does
+            // not look like one is simply not offered to the walk.
+            if (contents.size() <= th2::Scenario::header_size
+                || contents[0] != 'L' || contents[2] != 'F') {
+                continue;
+            }
+            bytes += contents.size();
+            script_bytecode_.emplace(entry.name, std::move(contents));
+        } catch (const std::exception&) {
+            // One script that will not decompress is not a reason to fail
+            // the others; the walk simply will not follow into it.
+        }
     }
-    constexpr std::size_t opening_instructions = 128;
-    // Only the opening of the script is scanned, so only that much of it is
-    // decompressed: whole scripts run to hundreds of kilobytes, and this
-    // runs on the thread that draws.
-    constexpr std::size_t prefix_bytes = th2::Scenario::header_size + 32768;
-    int requests = 0;
-    try {
-        // The same handful of destinations recur as the player moves between
-        // scenes, so the last few prefixes are kept.
-        auto cached = script_prefix_cache_.find(entry->name);
-        if (cached == script_prefix_cache_.end()) {
-            constexpr std::size_t cache_limit = 8;
-            if (script_prefix_cache_.size() >= cache_limit) {
-                script_prefix_cache_.clear();
-            }
-            cached = script_prefix_cache_
-                         .emplace(
-                             entry->name,
-                             std::make_shared<const std::vector<std::uint8_t>>(
-                                 scripts_.read_prefix(*entry, prefix_bytes)))
-                         .first;
-        }
-        const auto& prefix = *cached->second;
-        // A prefix cannot go through Scenario, which checks the file against
-        // its declared size, so the header is stepped over here instead.
-        if (prefix.size() <= th2::Scenario::header_size
-            || prefix[0] != 'L' || prefix[2] != 'F') {
-            return 0;
-        }
-        const auto bytecode = std::span<const std::uint8_t>(prefix).subspan(
-            th2::Scenario::header_size);
-        // A script the interpreter has not entered yet has no register
-        // state worth guessing at, so only its literal references resolve.
-        static constexpr std::array<std::int32_t, 64> registers{};
-        std::size_t offset = 0;
-        for (std::size_t step = 0;
-             step < opening_instructions && offset < bytecode.size()
-             && requests < budget;
-             ++step) {
-            const auto instruction = th2::decode_instruction(bytecode, offset);
-            if (instruction.size == 0
-                || instruction.offset + instruction.size > bytecode.size()) {
-                break;
-            }
-            if (interesting_opcode(instruction.name)) {
-                try {
-                    const auto event = th2::decode_event(
-                        instruction,
-                        bytecode.subspan(instruction.offset, instruction.size),
-                        registers);
-                    requests += prefetch_event_assets(
-                        event, entry->name, th2::PrefetchRank::branch);
-                } catch (const std::exception&) {
-                }
-            }
-            offset += instruction.size;
-        }
-    } catch (const std::exception&) {
-        return requests;
-    }
-    return requests;
+    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    SDL_Log("scripts: %zu decompressed, %zu KB, %lld ms",
+            script_bytecode_.size(), bytes / 1024,
+            static_cast<long long>(took.count()));
 }
 
-void Game::prefetch_upcoming_assets()
+std::span<const std::uint8_t> Game::script_prefix_bytecode(
+    const std::string& name)
 {
-    // The queues are rebuilt rather than appended to, so they always hold the
-    // nearest few rather than whatever an earlier scan happened to leave
-    // behind.  Work already under way is held elsewhere - a part-decoded
-    // picture in pending_image_, an open decoder in audio_decoders_ - so
-    // nothing in progress is lost.
-    image_decode_queue_.clear();
-    audio_decode_queue_.clear();
-    // A fresh plan each scan.  Anything the walk below does not reach has
-    // been passed, and the caches will treat it as such.
-    plan_.begin();
-    scan_ = {};
-    scan_depth_ = 0;
-    // Everything this round does not ask for again has fallen off every path
-    // the script can still take.
-    th2::data_prefetch_new_round();
+    const auto* entry = scripts_.find(scenario_file_name(name));
+    if (!entry) {
+        return {};
+    }
+    auto found = script_bytecode_.find(entry->name);
+    if (found == script_bytecode_.end()) {
+        // Not in the preload.  The two entries that startup skips are not
+        // scripts at all - a stray vssver.scc and an empty record - so this
+        // should never fire, but a script the walk can reach and cannot read
+        // would silently prune a branch, and that is a worse failure than a
+        // one-off decompression.  Whatever comes back is kept, including
+        // nothing, so a bad entry is tried once rather than every scan.
+        std::vector<std::uint8_t> contents;
+        try {
+            contents = scripts_.read(*entry);
+            if (contents.size() <= th2::Scenario::header_size
+                || contents[0] != 'L' || contents[2] != 'F') {
+                contents.clear();
+            } else {
+                SDL_Log("script %s was not preloaded; read on demand",
+                        entry->name.c_str());
+            }
+        } catch (const std::exception&) {
+            contents.clear();
+        }
+        found = script_bytecode_.emplace(entry->name, std::move(contents))
+                    .first;
+    }
+    if (found->second.size() <= th2::Scenario::header_size) {
+        return {};
+    }
+    // A script is a header followed by bytecode; it cannot go through
+    // Scenario, which checks the file against its declared size, so the
+    // header is stepped over here instead.
+    return std::span<const std::uint8_t>(found->second)
+        .subspan(th2::Scenario::header_size);
+}
 
-
-
-    // Every archive read that misses costs a network round trip in the
-    // browser build, and a scene change makes a dozen of them back to back,
-    // each one freezing the frame it happens on.  The script says what is
-    // coming, so walk it ahead of the interpreter and start those transfers
-    // while the player is still reading the current line.  A guess that turns
-    // out wrong only costs a request; the bytes land in the same cache the
-    // reads use either way.
-    // Superseded by scan_limits_, which stops each path at whichever of its
-    // counts runs out first; this only bounds the raw decode loop.
-    const std::size_t instruction_budget =
-        static_cast<std::size_t>(scan_limits_.instructions);
-    // A scene change is a dozen or so entries; the follow into the next
-    // script needs room on top of that.  They travel in parallel, so the
-    // ceiling is about how much speculative traffic is acceptable, not
-    // about latency.
-    constexpr int request_budget = 20;
-    constexpr std::size_t target_budget = 4;
-    std::vector<std::string> targets;
-
-    const auto bytecode = runtime_.vm_bytecode();
-    const auto registers = runtime_.vm_registers();
-    std::size_t offset = runtime_.vm_pc();
-    int requests = 0;
-    for (std::size_t step = 0;
-         step < instruction_budget && offset < bytecode.size()
-         && requests < request_budget;
-         ++step) {
+void Game::explore(
+    std::span<const std::uint8_t> bytecode,
+    std::span<const std::int32_t> registers, const std::string& script,
+    std::size_t offset, int depth, int& requests, int request_budget,
+    std::unordered_set<std::string>& visited)
+{
+    while (depth < scan_depth_limit && offset < bytecode.size()
+           && requests < request_budget) {
         th2::Instruction instruction{};
         try {
             instruction = th2::decode_instruction(bytecode, offset);
@@ -391,88 +340,154 @@ void Game::prefetch_upcoming_assets()
             || instruction.offset + instruction.size > bytecode.size()) {
             return;
         }
-        ++scan_.instructions;
-        if (scan_.exhausted(scan_limits_)) {
-            break;  // This path has been looked at far enough.
-        }
-        if (!interesting_opcode(instruction.name)) {
-            offset += instruction.size;
-            continue;
-        }
-        try {
-            const auto event = th2::decode_event(
-                instruction,
-                bytecode.subspan(instruction.offset, instruction.size),
-                registers);
-            requests += prefetch_event_assets(
-                event, runtime_.script_name(),
-                th2::PrefetchRank::imminent);
-            // Where the script can go next: the branch it takes and the
-            // choices it offers all start a new script, and the first thing
-            // a script does is usually to load a background and play a
-            // sound.
-            const auto& opcode = event.instruction.name;
-            const std::string* target = nullptr;
-            if (opcode == "LoadScript") {
-                target = literal_text(event, 0);
-            } else if (opcode == "SetSelectMesEx") {
-                target = literal_text(event, 1);
-            } else if (opcode == "SetMapEvent") {
-                target = literal_text(event, 3);
+        ++depth;
+        if (interesting_opcode(instruction.name)) {
+            scanning_depth_ = depth;
+            try {
+                const auto event = th2::decode_event(
+                    instruction,
+                    bytecode.subspan(instruction.offset, instruction.size),
+                    registers);
+                requests += prefetch_event_assets(
+                    event, script);
+
+                // Follow where the script can go.  Depth carries across the
+                // jump, so what is just inside a branch three instructions
+                // away outranks what is two hundred instructions down this
+                // one - which is the whole point of counting steps rather
+                // than asking which script something lives in.
+                const auto& opcode = event.instruction.name;
+                const std::string* target = nullptr;
+                if (opcode == "LoadScript") {
+                    target = literal_text(event, 0);
+                } else if (opcode == "SetSelectMesEx") {
+                    target = literal_text(event, 1);
+                } else if (opcode == "SetMapEvent") {
+                    target = literal_text(event, 3);
+                }
+                if (target && !target->empty()
+                    && visited.insert(*target).second) {
+                    // A script the interpreter has not entered has no
+                    // register state worth guessing at, so only its literal
+                    // references resolve.
+                    static constexpr std::array<std::int32_t, 64> none{};
+                    const auto prefix = script_prefix_bytecode(*target);
+                    if (!prefix.empty()) {
+                        explore(prefix, none, *target, 0, depth, requests,
+                                request_budget, visited);
+                    }
+                }
+            } catch (const std::exception&) {
+                // One instruction this cannot make sense of is no reason to
+                // stop looking at the ones after it.
             }
-            if (target && !target->empty()
-                && targets.size() < target_budget) {
-                targets.push_back(*target);
-            }
-        } catch (const std::exception&) {
-            // An instruction this scan cannot make sense of is not a reason
-            // to stop looking at the ones after it.
         }
         offset += instruction.size;
     }
+}
 
-    if (scanned_from_ != runtime_.script_name()) {
-        scanned_from_ = runtime_.script_name();
-        scanned_scripts_.clear();
+void Game::submit_scan_wants()
+{
+    // Sorted by (depth, size, offset).  Depth is the point; size and offset
+    // only make the order total, so the same script position always admits
+    // the same ranges in the same sequence instead of depending on which
+    // instruction the walk happened to decode first.
+    std::vector<const WantedRange*> wanted;
+    wanted.reserve(scan_wants_.size());
+    for (const auto& [key, want] : scan_wants_) {
+        wanted.push_back(&want);
     }
-    const bool anything_to_follow = std::ranges::any_of(
-        targets, [this](const std::string& target) {
-            return !scanned_scripts_.contains(target);
-        });
-    // Following into another script is the expensive half of this - it
-    // decompresses and parses one - so it waits for a frame with nothing
-    // else going on.  Doing it during a transition would trade a download
-    // stall for a rendering one, which is exactly the thing being fixed.
-    const bool idle = waiting_for_input_ && !transition_ && !background_fade_
-        && !screen_flash_ && !background_scroll_ && !movie_
-        && !character_animation_active();
-    if (!idle) {
-        prefetch_follow_pending_ = anything_to_follow;
-        return;
+    std::ranges::sort(wanted, [](const WantedRange* a, const WantedRange* b) {
+        return std::tie(a->depth, a->size, a->offset)
+            < std::tie(b->depth, b->size, b->offset);
+    });
+
+    std::string lines;
+    lines.reserve(wanted.size() * 64);
+    for (const WantedRange* want : wanted) {
+        lines += want->path;
+        lines += '\t';
+        lines += std::to_string(want->offset);
+        lines += '\t';
+        lines += std::to_string(want->size);
+        lines += '\t';
+        lines += std::to_string(want->depth);
+        lines += '\n';
     }
-    prefetch_follow_pending_ = false;
+    th2::data_prefetch_submit(lines);
+}
+
+void Game::update_predecode_queues()
+{
+    // Nearest first, and each asset once at its shallowest sighting.
+    std::ranges::sort(scan_assets_, [](const ScanAsset& a, const ScanAsset& b) {
+        return std::tie(a.depth, a.key) < std::tie(b.depth, b.key);
+    });
+    const auto last = std::ranges::unique(
+        scan_assets_, {}, &ScanAsset::key).begin();
+    scan_assets_.erase(last, scan_assets_.end());
+
+    image_decode_queue_.clear();
+    audio_decode_queue_.clear();
+    std::size_t images = 0;
+    std::size_t audio = 0;
+
+    for (const ScanAsset& asset : scan_assets_) {
+        if (asset.audio) {
+            // Whatever is held is still wanted, so it keeps its place; what
+            // is not held is work, up to the nearest twenty.
+            audio_decoders_.touch(asset.name, scan_generation_, asset.depth);
+            if (audio >= th2::PredecodeCache<int>::live_limit) {
+                continue;
+            }
+            ++audio;
+            if (audio_decoders_.contains(asset.name)) {
+                continue;
+            }
+            if (!asset.archive->find(asset.name)) {
+                continue;  // A script can name a track the release omits.
+            }
+            audio_decode_queue_.push_back(AudioDecodeRequest{
+                asset.archive, asset.name, asset.depth,
+                ++audio_decode_order_});
+            continue;
+        }
+        decoded_images_.touch(asset.key, scan_generation_, asset.depth);
+        if (images >= th2::PredecodeCache<int>::live_limit) {
+            continue;
+        }
+        ++images;
+        if (decoded_images_.contains(asset.key)) {
+            continue;
+        }
+        if (th2app::trace_prefetch) {
+            ++trace_.image_queued;
+        }
+        image_decode_queue_.push_back(asset.key);
+    }
+}
+
+void Game::prefetch_upcoming_assets()
+{
+    image_decode_queue_.clear();
+    audio_decode_queue_.clear();
+    plan_.begin();
+    scan_wants_.clear();
+    scan_assets_.clear();
+    ++scan_generation_;
+
     prepare_pending_transition_mask();
-    // Each branch is walked from the depth of the branch point, with its own
-    // fresh per-path counts.  Two ways out of a choice are equally likely to
-    // be the next thing needed, so the first asset down each carries the same
-    // depth rather than one of them being demoted for being "another script".
-    const int branch_depth = scan_depth_;
-    for (const auto& target : targets) {
-        if (requests >= request_budget) {
-            break;
-        }
-        if (!scanned_scripts_.insert(target).second) {
-            continue;  // Already looked at while in this script.
-        }
-        scan_depth_ = branch_depth;
-        scan_ = {};
-        prefetch_script_start(target, request_budget - requests);
-        // One script per scan: opening one costs a decompression and a few
-        // hundred instruction decodes, and this runs on the thread that
-        // draws.  The rest are picked up by the scans of the lines that
-        // follow, which is still long before the player can reach them.
-        break;
-    }
+    prefetch_follow_pending_ = false;
+
+    constexpr int request_budget = 200;
+    int requests = 0;
+    std::unordered_set<std::string> visited;
+    explore(runtime_.vm_bytecode(), runtime_.vm_registers(),
+            runtime_.script_name(), runtime_.vm_pc(), 0, requests,
+            request_budget, visited);
+
+    submit_scan_wants();
+    update_predecode_queues();
 }
 
 }  // namespace th2app

@@ -46,14 +46,20 @@ enum class PrefetchRank : int {
 // same range does not have to wait for the network.  Native builds, where a
 // read is a disk read, ignore it.  Safe to call repeatedly: a range already
 // in flight, already fetched, or already cached is not requested again.
-void data_prefetch(
-    const std::filesystem::path& path, std::uint64_t offset, std::size_t size,
-    int depth = prefetch_depth::imminent);
+// One scan's worth of wanted ranges, already sorted, handed over together.
+//
+// Each line is `path\toffset\tsize\tdepth`.  Ranges the region already holds
+// are repriced; the rest are admitted in order, each evicting only what the
+// script wants later than itself, until one will not fit even after that -
+// at which point the pass stops, because everything after it in the list is
+// at least as far off.
+void data_prefetch_submit(const std::string& sorted_lines);
 
-// Starts a new round of exploration.  Ranges the round does not ask for again
-// are, by that fact, no longer on any path the script can take, and become
-// the first candidates for eviction whatever depth they were fetched at.
-void data_prefetch_new_round();
+// A range the engine is about to read, admitted whatever the budget says.
+void data_prefetch_pin(
+    const std::filesystem::path& path, std::uint64_t offset, std::size_t size,
+    bool keep);
+
 
 // Like data_prefetch(), but for a span that covers many later reads - an
 // archive header and directory, say.  It is kept after being read from, and

@@ -12,6 +12,7 @@
 #include "imgui_layer.hpp"
 #include "message.hpp"
 #include "persistent_state.hpp"
+#include "predecode_cache.hpp"
 #include "player_name.hpp"
 #include "script_runtime.hpp"
 #include "soak.hpp"
@@ -438,7 +439,6 @@ private:
     // Decoding an upcoming background before the script asks for it.  The
     // bytes are already being prefetched; this is the other half, and it is
     // the half that lands on the frame where the scene changes.
-    void request_image_decode(bool background, std::string_view name);
     void update_image_decode();
     void report_prefetch_trace();
     Surface take_predecoded_image(bool background, std::string_view name);
@@ -522,12 +522,18 @@ private:
     bool touch_mouse_active_ = false;
     bool touch_mouse_dragging_ = false;
     // Scripts already looked into while running the current one, and the
-    // last few parsed, so following the same destination again is free.
-    std::unordered_set<std::string> scanned_scripts_;
-    std::string scanned_from_;
-    std::unordered_map<
-        std::string, std::shared_ptr<const std::vector<std::uint8_t>>>
-        script_prefix_cache_;
+    // Every script, decompressed once at startup and kept.
+    //
+    // The walk follows jumps, so it needs whatever script a branch leads to,
+    // and decompressing one on demand put an LZS pass on the frame that was
+    // drawing - repeatedly, because the cache that held them was eight
+    // entries cleared wholesale on overflow, and a scene with nine reachable
+    // destinations re-decompressed all of them every scan.  All 1275 of them
+    // come to 7.1MB, against a container that is already held whole at
+    // 3.1MB, so there is nothing to gain by being clever about which to keep.
+    std::unordered_map<std::string, std::vector<std::uint8_t>>
+        script_bytecode_;
+    void preload_scripts();
     // Set when a scan is due; it runs on the next frame rather than on the
     // one the player's click landed on.
     bool prefetch_scan_pending_ = false;
@@ -538,16 +544,13 @@ private:
     std::vector<std::uint8_t> transition_pixels_;
     // Keyed by archive and name.  Small: a couple of backgrounds in flight,
     // not a history of everything seen.
-    std::unordered_map<std::string, Surface> decoded_images_;
-    // Insertion order, kept as a tiebreak among entries the plan rates
-    // equally.
-    std::deque<std::string> decoded_image_order_;
+    th2::PredecodeCache<Surface> decoded_images_;
+    // The nearest few the latest scan found, in order.  Work happens on the
+    // front one until it is finished, then the next.
     std::deque<std::string> image_decode_queue_;
-    static constexpr std::size_t decoded_image_limit = 12;
     // Five backgrounds and five sprites: enough for the next screen whichever
     // branch is taken, and no more.  An unbounded sprite lookahead decoded
     // nine times as much as it used, most of it discarded.
-    static constexpr std::size_t image_decode_kind_limit = 5;
     // Opening a Vorbis stream builds its VLC tables - about six milliseconds,
     // atomic, and three times the whole frame allowance.  The budget cannot
     // interrupt it, so the only control is how often it is allowed to happen.
@@ -576,26 +579,53 @@ private:
     // What the script will want next, graded by how soon.  Rebuilt by each
     // scan; everything not in it has been passed and is first to go.
     th2::AssetPlan plan_;
-    th2::ScanLimits scan_limits_{};
-    // Counters for the walk in progress, so each path stops at whichever of
-    // its limits runs out first.
-    struct ScanCounters {
-        int voices = 0;
-        int backgrounds = 0;
-        int sprites = 0;
-        int instructions = 0;
-        bool exhausted(const th2::ScanLimits& limits) const
-        {
-            return voices >= limits.voices
-                || backgrounds >= limits.backgrounds
-                || sprites >= limits.sprites
-                || instructions >= limits.instructions;
-        }
+    // How far ahead the walk goes, in instructions, along any one path.
+    static constexpr int scan_depth_limit = 200;
+    // Depth of the instruction being looked at, so assets it names are graded
+    // by how far the walk had to come to reach them.
+    int scanning_depth_ = 0;
+    // The byte-store key for each planned asset, captured when it is
+    // requested.  data_prefetch() ignores a repeat request, so this is the
+    // only way the store can be told what a range is worth now rather than
+    // what it was worth when it was fetched.
+    // Everything one scan decided it wants, keyed by store key so the same
+    // range named twice keeps its nearest depth.
+    struct WantedRange {
+        std::string path;
+        std::uint64_t offset = 0;
+        std::size_t size = 0;
+        int depth = 0;
     };
-    ScanCounters scan_{};
-    // Depth of the asset being requested, so the caches can record what the
-    // plan thought of it at the time.
-    int scan_depth_ = 0;
+    std::unordered_map<std::string, WantedRange> scan_wants_;
+    void submit_scan_wants();
+
+    // Everything one scan found, whatever layer it is already sitting in.
+    // The predecoders work from this rather than from what still needs
+    // fetching: an asset already in the byte store is exactly the one worth
+    // decoding early, and leaving it out was how they ended up working on
+    // whatever happened to miss instead of on what comes next.
+    struct ScanAsset {
+        std::string key;                 // cache key, prefixed for images
+        std::string name;                // the asset's own name
+        const th2::Archive* archive = nullptr;   // audio only
+        bool background = false;         // images only
+        bool audio = false;
+        int depth = 0;
+    };
+    std::vector<ScanAsset> scan_assets_;
+    // Bumped once per scan.  An entry carries the generation that last named
+    // it, so how stale it is falls straight out of the difference.
+    int scan_generation_ = 0;
+    void update_predecode_queues();
+    // Depth-first from the interpreter, following branches and script loads,
+    // stopping any path at scan_depth_limit instructions.
+    void explore(std::span<const std::uint8_t> bytecode,
+                 std::span<const std::int32_t> registers,
+                 const std::string& script, std::size_t offset, int depth,
+                 int& requests, int request_budget,
+                 std::unordered_set<std::string>& visited);
+    std::span<const std::uint8_t> script_prefix_bytecode(
+        const std::string& name);
     // Names seen before, so re-creating a decoder for one already decoded and
     // dropped can be told apart from meeting it for the first time.
     std::unordered_map<std::string, int> audio_seen_;
@@ -1052,46 +1082,23 @@ private:
         int rank = 0;
         std::uint64_t order = 0;
     };
-    struct AudioDecodeEntry {
-        std::shared_ptr<th2::AudioDecoder> decoder;
-        int rank = 0;
-        std::uint64_t order = 0;
-    };
     std::vector<AudioDecodeRequest> audio_decode_queue_;
-    std::unordered_map<std::string, AudioDecodeEntry> audio_decoders_;
+    // Twenty live and ten stale, the same policy the pictures and the byte
+    // store use.  Counted in objects rather than bytes because read-ahead
+    // decodes a second of a clip, not the whole of it.
+    th2::PredecodeCache<std::shared_ptr<th2::AudioDecoder>> audio_decoders_;
     std::uint64_t audio_decode_order_ = 0;
-
-    // Read-ahead only: what a channel is playing is never evicted.
-    static constexpr std::size_t audio_decode_budget_bytes = 96ull << 20;
-    // Five per archive, not ten overall.  Everything queued here is already
-    // in the byte cache, so depth buys nothing against the network - it only
-    // decides how much speculative decoding happens, and five covers the next
-    // line whichever way a branch goes.
-    static constexpr std::size_t audio_decode_queue_limit = 5;
 
     std::shared_ptr<th2::AudioDecoder> audio_decoder(
         const th2::Archive& archive, std::string_view name, int rank);
     std::shared_ptr<th2::AudioDecoder> ready_audio_decoder(
         const th2::Archive& archive, std::string_view name);
-    void request_audio_decode(
-        const th2::Archive& archive, std::string_view name,
-        th2::PrefetchRank rank);
     void update_audio_decode();
-    // incoming_depth is what is asking for the room; nothing as urgent or
-    // more so is dropped for it.  Negative means nothing is asking and the
-    // budget is the only constraint, which is the end-of-frame tidy.
-    void evict_audio_decoders(int incoming_depth = -1);
-    // Whether a clip of this size at this depth can be admitted at all: if
-    // making room would mean dropping something the script wants as soon,
-    // it is better not to decode it than to decode it and thrash.
-    bool audio_admits(std::size_t bytes, int depth) const;
 
     int prefetch_event_assets(
-        const th2::Event& event, std::string_view script_name,
-        th2::PrefetchRank rank);
+        const th2::Event& event, std::string_view script_name);
     // Prefetches what a script loads when it starts, for the scripts the
     // current one can reach.  Returns how many transfers it started.
-    int prefetch_script_start(const std::string& name, int budget);
 
     void handle_touch_actions();
     // Turns one finger's events into the mouse press, motion and release the
