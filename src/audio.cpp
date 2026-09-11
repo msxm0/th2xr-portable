@@ -16,6 +16,124 @@ extern "C" {
 #include <utility>
 #include <vector>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+
+namespace {
+
+// Ogg Vorbis decoded by the browser instead of by ffmpeg.
+//
+// ffmpeg builds a stream's Huffman tables on open - about six milliseconds,
+// atomic, and three times a frame's whole allowance for work nobody is
+// waiting on.  Across a playthrough that is thirty seconds of rebuilding the
+// same tables, because every voice line carries the same codebooks.
+// decodeAudioData does the whole job on a thread of the browser's choosing,
+// so none of it lands on the frame at all; what is left here is a memcpy,
+// which can be sliced.
+EM_JS(void, th2_audio_init, (), {
+    if (Module.__th2Audio) {
+        return;
+    }
+    var Context = window.AudioContext || window.webkitAudioContext;
+    Module.__th2Audio = {
+        context: Context ? new Context() : null,
+        next: 1,
+        pending: new Map(),
+    };
+});
+
+// The context's rate, which everything is resampled to on the way out, so the
+// engine can know a clip's rate before a sample of it has been decoded.
+EM_JS(int, th2_audio_rate, (), {
+    var audio = Module.__th2Audio;
+    return (audio && audio.context) ? audio.context.sampleRate | 0 : 0;
+});
+
+// Starts a decode and returns a handle, or 0 if the browser cannot take it.
+EM_JS(int, th2_audio_start, (const unsigned char* bytes, int size), {
+    var audio = Module.__th2Audio;
+    if (!audio || !audio.context) {
+        return 0;
+    }
+    // decodeAudioData detaches the buffer it is given, and this one is a view
+    // on the wasm heap, so it has to be a copy.
+    var copy = new Uint8Array(size);
+    copy.set(HEAPU8.subarray(bytes, bytes + size));
+    var handle = audio.next++;
+    var record = {state: 0, buffer: null};
+    audio.pending.set(handle, record);
+    audio.context.decodeAudioData(copy.buffer,
+        function (decoded) { record.buffer = decoded; record.state = 1; },
+        function () { record.state = -1; });
+    return handle;
+});
+
+// 0 still working, 1 ready, -1 failed.
+EM_JS(int, th2_audio_poll, (int handle, int* frames, int* channels), {
+    var audio = Module.__th2Audio;
+    var record = audio && audio.pending.get(handle);
+    if (!record) {
+        return -1;
+    }
+    if (record.state === 1) {
+        HEAP32[frames >> 2] = record.buffer.length;
+        HEAP32[channels >> 2] = record.buffer.numberOfChannels;
+    }
+    return record.state;
+});
+
+// Interleaves [first, first + count) into dest, which is float samples in the
+// wasm heap.
+EM_JS(void, th2_audio_copy,
+      (int handle, float* dest, int first, int count), {
+    var audio = Module.__th2Audio;
+    var record = audio && audio.pending.get(handle);
+    if (!record || record.state !== 1) {
+        return;
+    }
+    var buffer = record.buffer;
+    var channels = buffer.numberOfChannels;
+    var out = dest >> 2;
+    for (var c = 0; c < channels; ++c) {
+        var data = buffer.getChannelData(c);
+        var at = out + c;
+        for (var i = 0; i < count; ++i) {
+            HEAPF32[at] = data[first + i];
+            at += channels;
+        }
+    }
+});
+
+EM_JS(void, th2_audio_release, (int handle), {
+    var audio = Module.__th2Audio;
+    if (audio) {
+        audio.pending.delete(handle);
+    }
+});
+
+// Channels, from the Vorbis identification header, so the format is known
+// before the browser has finished.  The first packet of an Ogg stream is the
+// identification header: "\x01vorbis", version, channels, rate.
+int ogg_channels(std::span<const std::uint8_t> bytes)
+{
+    static const std::uint8_t marker[7] = {1, 'v', 'o', 'r', 'b', 'i', 's'};
+    const std::size_t limit = std::min<std::size_t>(bytes.size(), 128);
+    for (std::size_t i = 0; i + 16 < limit; ++i) {
+        if (std::memcmp(bytes.data() + i, marker, sizeof(marker)) == 0) {
+            return bytes[i + 11];
+        }
+    }
+    return 0;
+}
+
+bool looks_like_ogg(std::span<const std::uint8_t> bytes)
+{
+    return bytes.size() > 64 && std::memcmp(bytes.data(), "OggS", 4) == 0;
+}
+
+}  // namespace
+#endif
+
 namespace th2 {
 namespace {
 
@@ -122,9 +240,27 @@ struct AudioDecoder::State {
     SwrContext* resampler = nullptr;
     int stream_index = -1;
     bool drained = false;
+#ifdef __EMSCRIPTEN__
+    // Non-zero when the browser is decoding this one; ffmpeg is then untouched
+    // and its fields stay null.
+    int browser_handle = 0;
+    int browser_frames = 0;
+    int browser_copied = 0;
+#endif
 
     ~State()
     {
+#ifdef __EMSCRIPTEN__
+        // The browser holds the decoded buffer until this says otherwise, so
+        // a decoder thrown away before its copy finished - evicted under the
+        // cache budget, or simply never reached - would strand the whole clip
+        // in JS.  Half the handles in a short run ended up that way before
+        // this was here.
+        if (browser_handle != 0) {
+            th2_audio_release(browser_handle);
+            browser_handle = 0;
+        }
+#endif
         swr_free(&resampler);
         avcodec_free_context(&codec);
         if (format) {
@@ -147,6 +283,38 @@ AudioDecoder::AudioDecoder(std::vector<std::uint8_t> bytes)
     // State is heap allocated and never moved, so the span stays valid.
     state.input.bytes = state.bytes;
 
+#ifdef __EMSCRIPTEN__
+    // Hand Ogg to the browser, which decodes it off this thread.  Anything
+    // else - the WAV effects, or a file it will not take - goes to ffmpeg
+    // below, so this is an optimisation rather than a dependency.
+    if (looks_like_ogg(state.bytes)) {
+        th2_audio_init();
+        const int rate = th2_audio_rate();
+        const int channels = ogg_channels(state.bytes);
+        if (rate > 0 && channels > 0) {
+            const int handle = th2_audio_start(
+                state.bytes.data(), static_cast<int>(state.bytes.size()));
+            if (handle != 0) {
+                state.browser_handle = handle;
+                // The context resamples everything to its own rate on the way
+                // out, so that is the clip's rate whatever the file says.
+                clip_.sample_rate = rate;
+                clip_.channels = channels;
+                return;
+            }
+        }
+    }
+#endif
+
+    open_stream();
+}
+
+// The ffmpeg path, used for anything the browser will not decode and as the
+// fallback when it refuses one it was offered.  Separated from the
+// constructor so both can reach it.
+void AudioDecoder::open_stream()
+{
+    auto& state = *state_;
     state.frame = av_frame_alloc();
     state.packet = av_packet_alloc();
     if (!state.frame || !state.packet) {
@@ -208,8 +376,83 @@ bool AudioDecoder::decode_all()
     return decode(std::chrono::nanoseconds::max());
 }
 
-bool AudioDecoder::decode(std::chrono::nanoseconds budget)
+#ifdef __EMSCRIPTEN__
+bool AudioDecoder::decode_browser(std::chrono::nanoseconds budget,
+                                  std::size_t target_samples)
 {
+    auto& state = *state_;
+    if (done_) {
+        return true;
+    }
+    if (budget <= std::chrono::nanoseconds::zero()) {
+        return false;
+    }
+    if (state.browser_frames == 0) {
+        int frames = 0;
+        int channels = 0;
+        const int status = th2_audio_poll(
+            state.browser_handle, &frames, &channels);
+        if (status == 0) {
+            return false;  // Still decoding, on a thread that is not this one.
+        }
+        if (status < 0 || frames <= 0 || channels <= 0) {
+            // The browser would not take it; fall back rather than lose the
+            // sound.  open_stream() rebuilds the ffmpeg side from the bytes,
+            // which are still here.
+            th2_audio_release(state.browser_handle);
+            state.browser_handle = 0;
+            open_stream();
+            return decode(budget, target_samples);
+        }
+        state.browser_frames = frames;
+        clip_.channels = channels;
+        clip_.samples.resize(
+            static_cast<std::size_t>(frames) * channels);
+    }
+
+    // What remains is a copy, so it is sliced: a few minutes of music is tens
+    // of megabytes and would otherwise be one long memcpy on the frame that
+    // happened to notice it was ready.
+    const auto started = std::chrono::steady_clock::now();
+    constexpr int slice = 8192;
+    while (state.browser_copied < state.browser_frames) {
+        const int count =
+            std::min(slice, state.browser_frames - state.browser_copied);
+        th2_audio_copy(
+            state.browser_handle,
+            clip_.samples.data()
+                + static_cast<std::size_t>(state.browser_copied)
+                    * clip_.channels,
+            state.browser_copied, count);
+        state.browser_copied += count;
+        if (target_samples != 0
+            && clip_.samples.size() >= target_samples
+            && state.browser_copied < state.browser_frames) {
+            return true;
+        }
+        if (std::chrono::steady_clock::now() - started >= budget) {
+            return state.browser_copied >= state.browser_frames;
+        }
+    }
+    th2_audio_release(state.browser_handle);
+    state.browser_handle = 0;
+    done_ = true;
+    return true;
+}
+#endif
+
+bool AudioDecoder::decode(std::chrono::nanoseconds budget,
+                          std::size_t target_samples)
+{
+    if (target_samples != 0 && clip_.samples.size() >= target_samples) {
+        return true;  // Enough in hand for now; not the same as finished.
+    }
+#ifdef __EMSCRIPTEN__
+    if (state_->browser_handle != 0) {
+        return decode_browser(budget, target_samples);
+    }
+#endif
+
     if (done_) {
         return true;
     }
@@ -231,6 +474,9 @@ bool AudioDecoder::decode(std::chrono::nanoseconds budget)
             int result = avcodec_send_packet(state.codec, state.packet);
             if (result < 0 && result != AVERROR(EAGAIN)) {
                 av_packet_unref(state.packet);
+        if (target_samples != 0 && clip_.samples.size() >= target_samples) {
+            return true;
+        }
                 throw ffmpeg_error("send audio packet", result);
             }
             while (result >= 0) {
@@ -621,7 +867,20 @@ void AudioChannel::advance_playback_end(std::size_t samples)
 
 bool AudioChannel::starving() const
 {
-    return stream_ && active_ && source_ && !source_->done();
+    return stream_ && active_ && source_ && !source_->done()
+        && source_->decoded_samples() < desired_samples();
+}
+
+std::size_t AudioChannel::desired_samples() const
+{
+    const auto& clip = active_clip();
+    // Five seconds beyond what the device already has.  Enough that a frame
+    // or two of nothing being decoded is inaudible, and far less than the
+    // whole track.
+    const auto per_second = static_cast<std::size_t>(
+        std::max(1, clip.sample_rate))
+        * static_cast<std::size_t>(std::max(1, clip.channels));
+    return queued_samples_ + per_second * 5;
 }
 
 }  // namespace th2

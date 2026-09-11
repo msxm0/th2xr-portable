@@ -36,10 +36,22 @@ public:
     // once there is nothing left.  A budget that has already run out does
     // nothing: an exhausted budget must not read as "no limit", or a caller
     // that is out of time ends up decoding the whole file.
-    bool decode(std::chrono::nanoseconds budget);
+    // Decodes until the budget is spent, the input ends, or the clip holds
+    // target_samples - whichever comes first.  A target of zero means the
+    // whole file.
+    //
+    // The target is what separates reading ahead from playing back.  Work
+    // done on the chance a line will be reached only needs enough to start
+    // instantly; the track actually playing needs to stay ahead of the
+    // device and nothing else.  Decoding every speculative clip in full put
+    // a 32MB track in a pool sized for guesses and evicted everything else
+    // to make room.
+    bool decode(std::chrono::nanoseconds budget,
+                std::size_t target_samples = 0);
     // The whole of what is left, however long that takes.
     bool decode_all();
     bool done() const { return done_; }
+    std::size_t decoded_samples() const { return clip_.samples.size(); }
 
     // The format is known as soon as the decoder exists, so a stream can be
     // opened before a single sample has been decoded.
@@ -49,6 +61,13 @@ public:
     AudioClip take();
 
 private:
+    void open_stream();
+#ifdef __EMSCRIPTEN__
+    // Ogg goes to the browser, which decodes it off this thread; what is left
+    // on this one is a copy, sliced to the budget like everything else.
+    bool decode_browser(std::chrono::nanoseconds budget,
+                        std::size_t target_samples);
+#endif
     struct State;
     std::unique_ptr<State> state_;
     AudioClip clip_{};
@@ -79,6 +98,10 @@ public:
     // True while the channel is playing ahead of its own decoder, so the
     // caller knows to give this one decoding time before any read-ahead.
     bool starving() const;
+    // How much decoded audio this channel wants to have in hand: what it has
+    // already handed the device plus a few seconds.  The track being played
+    // streams on its own terms rather than out of the read-ahead pool.
+    std::size_t desired_samples() const;
     AudioDecoder* decoder() const { return source_.get(); }
     void stop();
     void pause(bool paused);
