@@ -62,15 +62,28 @@ int Game::prefetch_event_assets(
     const th2::Event& event, std::string_view script_name,
     th2::PrefetchRank rank)
 {
-    const auto request = [rank](const th2::Archive& archive,
+    // Depth is recorded for every asset this event names, whether or not it
+    // still needs fetching: the plan describes what the script wants, and a
+    // resident asset is still wanted - it is what stops the caches treating
+    // it as passed and evicting it moments before it is used.
+    const auto note = [this](const char* prefix, std::string_view asset) {
+        plan_.note(std::string(prefix) + std::string(asset), scan_depth_);
+    };
+    // The depth is read at the moment of the request, not captured when the
+    // event was decoded: each asset in an event advances it, so a background
+    // and the voice line after it are not treated as equally urgent.  A
+    // resident asset is still re-announced, which is how the store learns it
+    // is still on a reachable path.
+    const auto request = [this](const th2::Archive& archive,
                                 std::string_view asset) {
         const auto* entry = archive.find(asset);
-        if (!entry || archive.resident(*entry)) {
+        if (!entry) {
             return 0;
         }
-        archive.prefetch(*entry, rank);
-        return 1;
+        archive.prefetch(*entry, scan_depth_);
+        return archive.resident(*entry) ? 0 : 1;
     };
+    (void)rank;
 
     // Audio needs decoding as well as fetching, and decoding reads the bytes,
     // so the decode is only worth queuing once they have landed.  Scans
@@ -78,6 +91,11 @@ int Game::prefetch_event_assets(
     // decode queued by the next.
     const auto request_audio = [&](const th2::Archive& archive,
                                    std::string_view asset) {
+        plan_.note(std::string(asset), scan_depth_);
+        if (&archive == &voice_archive_) {
+            ++scan_.voices;
+        }
+        ++scan_depth_;
         const int requested = request(archive, asset);
         if (const auto* entry = archive.find(asset);
             entry && archive.resident(*entry)) {
@@ -96,6 +114,9 @@ int Game::prefetch_event_assets(
             return 0;
         }
         const auto asset = th2::character_asset_name(*character, *pose);
+        note("grp:", asset);
+        ++scan_.sprites;
+        ++scan_depth_;
         const int requested = request(graphics_, asset);
         // Capped at five, unlike the first attempt at this: the lookahead
         // sees every pose across every branch, and decoding all of them cost
@@ -151,6 +172,13 @@ int Game::prefetch_event_assets(
             return 0;
         }
         const bool background = *pack == "bak";
+        note(background ? "bak:" : "grp:", *asset);
+        if (background) {
+            ++scan_.backgrounds;
+        } else {
+            ++scan_.sprites;
+        }
+        ++scan_depth_;
         const int requested =
             request(background ? backgrounds_ : graphics_, *asset);
         // Queue the decode too.  request_image_decode() only takes it up once
@@ -315,6 +343,14 @@ void Game::prefetch_upcoming_assets()
     // nothing in progress is lost.
     image_decode_queue_.clear();
     audio_decode_queue_.clear();
+    // A fresh plan each scan.  Anything the walk below does not reach has
+    // been passed, and the caches will treat it as such.
+    plan_.begin();
+    scan_ = {};
+    scan_depth_ = 0;
+    // Everything this round does not ask for again has fallen off every path
+    // the script can still take.
+    th2::data_prefetch_new_round();
 
 
 
@@ -325,7 +361,10 @@ void Game::prefetch_upcoming_assets()
     // while the player is still reading the current line.  A guess that turns
     // out wrong only costs a request; the bytes land in the same cache the
     // reads use either way.
-    constexpr std::size_t instruction_budget = 512;
+    // Superseded by scan_limits_, which stops each path at whichever of its
+    // counts runs out first; this only bounds the raw decode loop.
+    const std::size_t instruction_budget =
+        static_cast<std::size_t>(scan_limits_.instructions);
     // A scene change is a dozen or so entries; the follow into the next
     // script needs room on top of that.  They travel in parallel, so the
     // ceiling is about how much speculative traffic is acceptable, not
@@ -351,6 +390,10 @@ void Game::prefetch_upcoming_assets()
         if (instruction.size == 0
             || instruction.offset + instruction.size > bytecode.size()) {
             return;
+        }
+        ++scan_.instructions;
+        if (scan_.exhausted(scan_limits_)) {
+            break;  // This path has been looked at far enough.
         }
         if (!interesting_opcode(instruction.name)) {
             offset += instruction.size;
@@ -409,6 +452,11 @@ void Game::prefetch_upcoming_assets()
     }
     prefetch_follow_pending_ = false;
     prepare_pending_transition_mask();
+    // Each branch is walked from the depth of the branch point, with its own
+    // fresh per-path counts.  Two ways out of a choice are equally likely to
+    // be the next thing needed, so the first asset down each carries the same
+    // depth rather than one of them being demoted for being "another script".
+    const int branch_depth = scan_depth_;
     for (const auto& target : targets) {
         if (requests >= request_budget) {
             break;
@@ -416,6 +464,8 @@ void Game::prefetch_upcoming_assets()
         if (!scanned_scripts_.insert(target).second) {
             continue;  // Already looked at while in this script.
         }
+        scan_depth_ = branch_depth;
+        scan_ = {};
         prefetch_script_start(target, request_budget - requests);
         // One script per scan: opening one costs a decompression and a few
         // hundred instruction decodes, and this runs on the thread that

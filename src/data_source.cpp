@@ -80,8 +80,15 @@ EM_ASYNC_JS(int, fetch_range,
 // about to need while the player is still reading the current line.  The
 // budget is generous but bounded: prefetches are guesses, and a wrong guess
 // must not be able to push the tab out of memory.
+EM_JS(void, bump_prefetch_round, (), {
+    const store = Module.th2Prefetch;
+    if (store) {
+        store.round = (store.round || 0) + 1;
+    }
+});
+
 EM_JS(void, start_prefetch,
-    (const char* url, double offset, double size, int keep, int rank), {
+    (const char* url, double offset, double size, int keep, int depth), {
     const path = UTF8ToString(url);
     const key = path + ":" + offset + ":" + size;
     if (!Module.th2Prefetch) {
@@ -151,7 +158,8 @@ EM_JS(void, start_prefetch,
             }
             if (store.queue.length > 1) {
                 store.queue.sort(
-                    (a, b) => (a.rank - b.rank) || (a.order - b.order));
+                    (a, b) => (store.priority(a) - store.priority(b))
+                           || (a.order - b.order));
             }
             while (store.active < store.limit && store.queue.length
                    && store.issuedThisFrame < store.perFrameLimit) {
@@ -177,7 +185,17 @@ EM_JS(void, start_prefetch,
         store.queue_limit = 64;
         store.trim = () => {
             while (store.queue.length > store.queue_limit) {
-                const dropped = store.queue.pop();
+                // The queue is sorted least-urgent-last only after pump()
+                // runs, so pick the worst explicitly rather than trusting
+                // position.
+                let worst = 0;
+                for (let i = 1; i < store.queue.length; ++i) {
+                    if (store.priority(store.queue[i])
+                        > store.priority(store.queue[worst])) {
+                        worst = i;
+                    }
+                }
+                const dropped = store.queue.splice(worst, 1)[0];
                 store.entries.delete(
                     dropped.path + ":" + dropped.offset + ":" + dropped.size);
                 dropped.settle(null);
@@ -185,6 +203,23 @@ EM_JS(void, start_prefetch,
         };
         // A range stops being a guess the moment the engine blocks on it, so
         // it leaves the queue and goes out immediately, over the limit.
+        // Exploration happens in rounds.  An entry asked for again this
+        // round is still on a path the script can take; one that is not has
+        // been passed or the branch carrying it abandoned, and is the first
+        // thing to go however urgent it was when it was fetched.
+        store.round = 0;
+        store.PASSED = 1000000;
+        // Rounds are recorded but do not by themselves demote an entry.
+        // data_prefetch() returns early for a range already in the C++ cache,
+        // so a still-wanted range often cannot be re-announced at all: making
+        // one missed round mean "unreachable" evicted prefetched bytes before
+        // the engine read them, and the refetches cost more than the space
+        // ever saved.  Demotion needs a signal that a path was abandoned, not
+        // the absence of a signal.
+        store.staleRounds = 8;
+        store.priority = (entry) => (
+            (store.round - entry.round) > store.staleRounds
+                ? store.PASSED : entry.rank);
         store.promote = (entry) => {
             if (entry.started) {
                 return;
@@ -198,7 +233,13 @@ EM_JS(void, start_prefetch,
         Module.th2Prefetch = store;
     }
     const store = Module.th2Prefetch;
-    if (store.entries.has(key)) {
+    const existing = store.entries.get(key);
+    if (existing) {
+        // Already here or on its way.  Re-asking is how the explorer says
+        // "still wanted, and this is how soon now" - the script has moved
+        // since this was fetched, so the depth it carried is stale.
+        existing.rank = depth;
+        existing.round = store.round;
         return;
     }
     const budget = 256 * 1024 * 1024;
@@ -209,11 +250,24 @@ EM_JS(void, start_prefetch,
         // the next few lines need was requested earliest at the lowest rank,
         // so it is the last thing to go.  Only entries that have arrived can
         // be dropped; a request still in flight has nothing to reclaim.
+        // Least urgent first, by what the script is going to want rather
+        // than by when it was asked for.  Within equal urgency the oldest
+        // goes: ordering both descending dropped whatever had just been
+        // fetched, which the next round promptly asked for again.  Only
+        // arrived entries can be dropped - a request in flight has nothing
+        // to reclaim yet.
         const droppable = [...store.entries]
             .filter(([, entry]) => entry.body && !entry.keep)
-            .sort((a, b) => (b[1].rank - a[1].rank) || (b[1].order - a[1].order));
+            .sort((a, b) => (store.priority(b[1]) - store.priority(a[1]))
+                         || (a[1].order - b[1].order));
         for (const [oldKey, entry] of droppable) {
             if (store.bytes + size <= budget) {
+                break;
+            }
+            // Never for something the script wants as soon or sooner.  The
+            // list is least-urgent-first, so everything after this is at
+            // least as urgent as the range asking for the room.
+            if (store.priority(entry) <= depth) {
                 break;
             }
             store.bytes -= entry.body.length;
@@ -227,8 +281,8 @@ EM_JS(void, start_prefetch,
     // directory, say - so it stays after it has been read from.
     store.counter = (store.counter || 0) + 1;
     const entry = {body: null, path: path, offset: offset, size: size,
-                   keep: keep != 0, rank: rank, order: store.counter,
-                   started: false};
+                   keep: keep != 0, rank: depth, round: store.round,
+                   order: store.counter, started: false};
     entry.promise = new Promise((resolve) => { entry.settle = resolve; });
     store.entries.set(key, entry);
     store.queue.push(entry);
@@ -481,9 +535,14 @@ bool data_read(
     return true;
 }
 
+void data_prefetch_new_round()
+{
+    bump_prefetch_round();
+}
+
 void data_prefetch(
     const std::filesystem::path& path, std::uint64_t offset, std::size_t size,
-    PrefetchRank rank)
+    int depth)
 {
     if (size == 0 || size > range_cache_entry_limit) {
         return;  // Movie-sized reads are streamed, not cached.
@@ -499,7 +558,7 @@ void data_prefetch(
     }
     start_prefetch(
         key.c_str(), static_cast<double>(offset), static_cast<double>(size),
-        0, static_cast<int>(rank));
+        0, depth);
 }
 
 void data_prefetch_chunk(
@@ -542,8 +601,10 @@ bool data_exists(const std::filesystem::path& path)
     return std::filesystem::exists(path, error);
 }
 
+void data_prefetch_new_round() {}
+
 void data_prefetch(
-    const std::filesystem::path&, std::uint64_t, std::size_t, PrefetchRank)
+    const std::filesystem::path&, std::uint64_t, std::size_t, int)
 {
     // Reads come off the disk here; the OS cache is the whole story.
 }

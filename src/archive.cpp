@@ -273,9 +273,9 @@ const ArchiveEntry* Archive::find(std::string_view name) const
     return found == index_.end() ? nullptr : &entries_[found->second];
 }
 
-void Archive::prefetch(const ArchiveEntry& entry, PrefetchRank rank) const
+void Archive::prefetch(const ArchiveEntry& entry, int depth) const
 {
-    data_prefetch(path_, entry.offset, entry.stored_size, rank);
+    data_prefetch(path_, entry.offset, entry.stored_size, depth);
 }
 
 bool Archive::resident(const ArchiveEntry& entry) const

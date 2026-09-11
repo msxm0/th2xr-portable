@@ -103,7 +103,7 @@ public:
     // how speculative the guess is; see PrefetchRank.
     void prefetch(
         const ArchiveEntry& entry,
-        PrefetchRank rank = PrefetchRank::imminent) const;
+        int depth = prefetch_depth::imminent) const;
     // True when read() would not have to go to the network for this entry.
     bool resident(const ArchiveEntry& entry) const;
 

@@ -4,6 +4,7 @@
 #include "character.hpp"
 #include "config.hpp"
 #include "font.hpp"
+#include "asset_plan.hpp"
 #include "frame_budget.hpp"
 #include "image.hpp"
 #include "gl_transition.hpp"
@@ -43,6 +44,8 @@ namespace th2app {
 // Set by --cpu-transitions.  Forces the CPU blend even where the shader
 // would work, so the two paths can be compared without rebuilding.
 extern bool force_cpu_transitions;
+// --trace-prefetch: report what the lookahead guessed against what was used.
+extern bool trace_prefetch;
 
 struct TextureDeleter {
     void operator()(SDL_Texture* texture) const;
@@ -437,6 +440,7 @@ private:
     // the half that lands on the frame where the scene changes.
     void request_image_decode(bool background, std::string_view name);
     void update_image_decode();
+    void report_prefetch_trace();
     Surface take_predecoded_image(bool background, std::string_view name);
 #ifdef __EMSCRIPTEN__
     void web_published_sizes(int* box_width, int* box_height,
@@ -535,9 +539,8 @@ private:
     // Keyed by archive and name.  Small: a couple of backgrounds in flight,
     // not a history of everything seen.
     std::unordered_map<std::string, Surface> decoded_images_;
-    // Insertion order, so the cache can drop the oldest rather than whichever
-    // one the hash table happens to hand back first - evicting at random can
-    // throw away the picture that is about to be drawn and pay for it twice.
+    // Insertion order, kept as a tiebreak among entries the plan rates
+    // equally.
     std::deque<std::string> decoded_image_order_;
     std::deque<std::string> image_decode_queue_;
     static constexpr std::size_t decoded_image_limit = 12;
@@ -550,6 +553,53 @@ private:
     // interrupt it, so the only control is how often it is allowed to happen.
     static constexpr int audio_opens_per_frame = 1;
     int audio_opens_this_frame_ = 0;
+
+    // What the lookahead asked for against what was actually used.  A guess
+    // that is never used costs a decode and a cache slot, and at the scale
+    // this runs at a wrong guess repeated every line is invisible in a
+    // profile but ruinous in aggregate - so it is counted rather than
+    // reasoned about.
+    struct PrefetchTrace {
+        int audio_created = 0;
+        int audio_evicted = 0;
+        int audio_evicted_undecoded = 0;
+        int audio_recreated = 0;
+        int image_queued = 0;
+        int image_decoded = 0;
+        int image_used = 0;
+        int image_evicted_unused = 0;
+        std::size_t audio_cache_bytes = 0;
+        std::size_t largest_clip_bytes = 0;
+    };
+    PrefetchTrace trace_{};
+
+    // What the script will want next, graded by how soon.  Rebuilt by each
+    // scan; everything not in it has been passed and is first to go.
+    th2::AssetPlan plan_;
+    th2::ScanLimits scan_limits_{};
+    // Counters for the walk in progress, so each path stops at whichever of
+    // its limits runs out first.
+    struct ScanCounters {
+        int voices = 0;
+        int backgrounds = 0;
+        int sprites = 0;
+        int instructions = 0;
+        bool exhausted(const th2::ScanLimits& limits) const
+        {
+            return voices >= limits.voices
+                || backgrounds >= limits.backgrounds
+                || sprites >= limits.sprites
+                || instructions >= limits.instructions;
+        }
+    };
+    ScanCounters scan_{};
+    // Depth of the asset being requested, so the caches can record what the
+    // plan thought of it at the time.
+    int scan_depth_ = 0;
+    // Names seen before, so re-creating a decoder for one already decoded and
+    // dropped can be told apart from meeting it for the first time.
+    std::unordered_map<std::string, int> audio_seen_;
+    std::chrono::steady_clock::time_point last_trace_report_{};
 
     // A picture part-way through being decoded.  Held across frames, because
     // a large one is twenty milliseconds of work and no frame can take that
@@ -1027,7 +1077,14 @@ private:
         const th2::Archive& archive, std::string_view name,
         th2::PrefetchRank rank);
     void update_audio_decode();
-    void evict_audio_decoders();
+    // incoming_depth is what is asking for the room; nothing as urgent or
+    // more so is dropped for it.  Negative means nothing is asking and the
+    // budget is the only constraint, which is the end-of-frame tidy.
+    void evict_audio_decoders(int incoming_depth = -1);
+    // Whether a clip of this size at this depth can be admitted at all: if
+    // making room would mean dropping something the script wants as soon,
+    // it is better not to decode it than to decode it and thrash.
+    bool audio_admits(std::size_t bytes, int depth) const;
 
     int prefetch_event_assets(
         const th2::Event& event, std::string_view script_name,

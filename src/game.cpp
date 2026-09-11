@@ -30,6 +30,7 @@ extern "C" {
 namespace th2app {
 
 bool force_cpu_transitions = false;
+bool trace_prefetch = false;
 
 namespace {
 
@@ -568,6 +569,7 @@ void Game::iterate()
     // they ask.  Reset here so it covers the whole frame.
     background_budget_.begin_frame();
     audio_opens_this_frame_ = 0;
+    report_prefetch_trace();
     update_image_decode();
     if (prefetch_scan_pending_ || prefetch_follow_pending_) {
         const auto now = std::chrono::steady_clock::now();
@@ -1095,6 +1097,8 @@ int main(int argc, char** argv)
                 scenario = argv[index];
             } else if (argument == "--cpu-transitions") {
                 th2app::force_cpu_transitions = true;
+            } else if (argument == "--trace-prefetch") {
+                th2app::trace_prefetch = true;
             } else if (argument == "--soak") {
                 soak_directory = writable_directory() / "logs" / "soak";
             } else if (argument == "--soak-state") {
