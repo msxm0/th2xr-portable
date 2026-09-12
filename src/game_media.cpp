@@ -46,6 +46,10 @@ void Game::begin_background_scroll(
 
 void Game::load_character_texture(const th2::CharacterState& character)
 {
+    // A new pose is a new bake: AVG_LoadChar is followed by a restore from
+    // BMP_BACK2 and a fresh AVG_SetBackChar, because what is already in the
+    // bitmap cannot be taken back out.
+    background_baked_dirty_ = true;
     auto& loaded = character_texture(character.number);
     if (loaded.pose != character.pose || !loaded.texture) {
         const auto asset =
@@ -76,6 +80,7 @@ void Game::apply_staged_characters()
         }
         character_pending_removal_[index] = false;
         character_staged_[index] = false;
+        background_baked_dirty_ = true;
     }
 }
 
@@ -176,6 +181,7 @@ void Game::start_character_animation(
             characters_.remove(character_number);
             character_textures_[index] = {};
             character_staged_[index] = false;
+            background_baked_dirty_ = true;
             character_pending_removal_[index] = false;
         }
         return;
@@ -213,6 +219,7 @@ void Game::update_character_animations()
             characters_.remove(static_cast<int>(index));
             character_textures_[index] = {};
             character_staged_[index] = false;
+            background_baked_dirty_ = true;
             character_pending_removal_[index] = false;
         }
         resume |= animation.blocking;
@@ -238,6 +245,20 @@ void Game::set_character(const th2::Event& event)
             ? previous->locate : 1;
     }
     const bool wait_form = event.instruction.name == "CW";
+    // AVG_SetChar():
+    //     if(in_type!=CHAR_TYPE_WAIT){
+    //         AVG_ResetHalfTone();
+    //         AVG_SetNovelMessageDisp(OFF);
+    //     }
+    // Before the equality check below, so it happens even when the call
+    // changes nothing.  This is what guarantees BMP_BACKHALF is never a copy
+    // of a plate that has since been re-baked: a character cannot change
+    // without the wash being torn down first, and the next message rebuilds
+    // it from the plate as it is by then.
+    if (!wait_form) {
+        reset_half_tone();
+        hide_message_for_animation();
+    }
     const std::size_t layer_index = wait_form ? 3 : 4;
     const std::size_t brightness_index = wait_form ? 4 : 5;
     const std::size_t alpha_index = wait_form ? 5 : 6;
@@ -287,6 +308,7 @@ void Game::set_character(const th2::Event& event)
     load_character_texture(character);
     character_pending_removal_[index] = false;
     character_staged_[index] = stage;
+    background_baked_dirty_ = true;
     if (!stage && event.instruction.name != "SetChar") {
         start_character_animation(character_number, std::move(animation));
     }
@@ -699,6 +721,7 @@ void Game::set_background(const th2::Event& event, bool keep_characters)
 {
     if (number(event, 1) < 0) {
         background_.reset();
+        background_baked_dirty_ = true;
         bg_scene_ = -1;
         background_kind_ = BackgroundKind::background;
         background_tone_curve_.clear();
@@ -732,6 +755,7 @@ void Game::set_background(const th2::Event& event, bool keep_characters)
         std::filesystem::path(name).replace_extension(".amp").string();
     background_tone_curve_ =
         graphics_.find(curve_name) ? curve_name : std::string{};
+    background_baked_dirty_ = true;
     background_ = load_toned_texture(
         renderer_, backgrounds_, name, graphics_,
         background_tone_curves());
@@ -757,6 +781,7 @@ void Game::set_cg(
     };
     background_scroll_.reset();
     update_background_sakura(visual, false);
+    background_baked_dirty_ = true;
     background_ = load_toned_texture(
         renderer_, graphics_, std::format("{}{:06d}.tga", prefix, visual),
         graphics_, background_tone_curves());
@@ -786,6 +811,7 @@ void Game::restore_background()
     if (background_kind_ != BackgroundKind::background) {
         const char prefix =
             background_kind_ == BackgroundKind::visual ? 'v' : 'h';
+        background_baked_dirty_ = true;
         background_ = load_toned_texture(
             renderer_, graphics_,
             std::format("{}{:06d}.tga", prefix, bg_scene_),
@@ -799,6 +825,7 @@ void Game::restore_background()
             std::filesystem::path(name).replace_extension(".amp").string();
         background_tone_curve_ =
             graphics_.find(curve_name) ? curve_name : std::string{};
+        background_baked_dirty_ = true;
         background_ = load_toned_texture(
             renderer_, backgrounds_, name, graphics_,
             background_tone_curves());

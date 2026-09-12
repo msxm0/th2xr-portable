@@ -272,6 +272,7 @@ bool Game::handle(const th2::Event& event)
                 character->pose = number(event, 1);
                 load_character_texture(*character);
                 character_staged_[character_index(character_number)] = true;
+                background_baked_dirty_ = true;
                 return true;
             }
             hide_message_for_animation();

@@ -973,32 +973,77 @@ Game::ShakeSample Game::shake_sample()
     if (!shake_) {
         return result;
     }
-    const float frame = static_cast<float>(
+    // AVG_ControlShake() runs once per frame and increments sk_cnt before it
+    // does anything, so the first frame of a shake is count 1.
+    const float elapsed = static_cast<float>(
         std::chrono::duration<double>(
             std::chrono::steady_clock::now() - shake_->started).count()
         * 60.0);
-    const int frame_index = std::max(1, static_cast<int>(frame) + 1);
-    const float decay = shake_->frames > 0
-        ? std::clamp(
-            1.0f - static_cast<float>(frame_index) / shake_->frames,
-            0.0f, 1.0f)
+    const int count = std::max(1, static_cast<int>(elapsed) + 1);
+    const int span = shake_->frames;  // AVG_EffCnt4(sk_speed)
+    const int pitch = shake_->pitch;
+
+    // COS(X) is SinTbl[X%256] and SIN(X) is SinTbl[(X+64)%256], so despite
+    // the names the engine's COS is a sine - COS(0) is zero, not the peak.
+    // Taking it for a cosine put every sine shake a quarter period out.
+    const auto wave = [](int phase) {
+        return std::sin(static_cast<float>(((phase % 256) + 256) % 256)
+                        * 2.0f * std::numbers::pi_v<float> / 256.0f);
+    };
+    // x = x*(back_max-sk_cnt)/back_max, and only when back_max is non-zero:
+    // a shake with no duration runs at full strength forever.
+    const float taper = span > 0
+        ? std::clamp(static_cast<float>(span - count)
+                         / static_cast<float>(span), 0.0f, 1.0f)
         : 1.0f;
-    const int phase = frame_index * shake_->swing / 8;
-    const float cosine = std::cos(
-        static_cast<float>(phase % 256)
-        * 2.0f * std::numbers::pi_v<float> / 256.0f);
-    float amount = static_cast<float>(shake_->pitch);
-    if (shake_->type == 0 || shake_->type == 3
-        || shake_->type == 6 || shake_->type == 15
-        || shake_->type == 16) {
-        amount *= cosine;
-        amount *= decay;
-    } else if (shake_->type == 1 || shake_->type == 4
-               || shake_->type == 7) {
-        amount *= (frame_index & 1) ? 1.0f : -1.0f;
-    } else if (shake_->type == 9 || shake_->type == 10
-               || shake_->type == 11) {
-        while (shake_->sampled_frame < frame_index) {
+    // STD_LimitLoop: a triangle, not a sawtooth - it mirrors back down once
+    // it passes the limit.
+    const auto limit_loop = [](float value, float limit) {
+        if (limit <= 0.0f) {
+            return 0.0f;
+        }
+        float wrapped = std::fmod(value, limit * 2.0f);
+        if (wrapped < 0.0f) {
+            wrapped += limit * 2.0f;
+        }
+        return wrapped >= limit ? limit * 2.0f - wrapped : wrapped;
+    };
+    // A rate in the engine's 256-unit circle, as DSP_SetGraphRoll takes it.
+    const auto degrees = [](float rate) {
+        return static_cast<double>(rate) * 360.0 / 256.0;
+    };
+
+    const int type = shake_->type;
+    bool translates = false;
+    float amount = 0.0f;
+
+    switch (type) {
+    case 0:   // SHAKE_SIN
+    case 3:   // SHAKE_TXT_SIN
+    case 6:   // SHAKE_ALL_SIN
+    case 15:  // SHAKE_SIN_SET
+    case 16:  // SHAKE_ALL_SIN_SET
+        // COS(cnt2)*pich/4096 with COS peaking at 4096, so simply pitch
+        // scaled by the wave.  Both branches of the original divide by the
+        // same 4096; only the taper differs.
+        amount = static_cast<float>(pitch)
+            * wave(count * shake_->swing / 8) * taper;
+        translates = true;
+        break;
+    case 1:   // SHAKE_2TI
+    case 4:   // SHAKE_TXT_2TI
+    case 7:   // SHAKE_ALL_2TI
+        // cnt = (sk_cnt%2)*2-1: hard alternation, no taper.
+        amount = static_cast<float>(pitch) * ((count % 2) ? 1.0f : -1.0f);
+        translates = true;
+        break;
+    case 9:   // SHAKE_RAND
+    case 10:  // SHAKE_TXT_RAND
+    case 11:  // SHAKE_ALL_RAND
+        // A fresh direction every frame, never the one just used, at full
+        // pitch.  Advanced per frame rather than per call so a frame that
+        // samples twice does not roll twice.
+        while (shake_->sampled_frame < count) {
             int direction = std::rand() % 8;
             while (direction == shake_->direction) {
                 direction = std::rand() % 8;
@@ -1006,49 +1051,73 @@ Game::ShakeSample Game::shake_sample()
             shake_->direction = direction;
             ++shake_->sampled_frame;
         }
-    } else if (shake_->type == 2) {
-        const float root = std::sqrt(std::max(0, shake_->pitch));
-        const float cycle = std::fmod(
-            frame_index * root * 2.0f / std::max(1, shake_->frames),
-            std::max(1.0f, root));
-        result.scale = 1.0f + cycle * cycle / 256.0f;
-    } else if (shake_->type == 12) {
-        const float inverse = std::clamp(
-            1.0f - static_cast<float>(frame_index)
-                / std::max(1, shake_->frames),
-            0.0f, 1.0f);
-        const float eased = 1.0f - inverse * inverse;
-        float turn = std::fmod(eased * shake_->pitch / 2.0f, 256.0f);
-        if ((shake_->direction & 1) == 0) {
-            turn = 256.0f - turn;
+        amount = static_cast<float>(pitch);
+        translates = true;
+        break;
+    case 2: {  // SHAKE_ZOOM
+        const float root = std::sqrt(static_cast<float>(std::max(0, pitch)));
+        const float swept = span > 0
+            ? static_cast<float>(count) * root * 2.0f
+                / static_cast<float>(span)
+            : 0.0f;
+        const float step = limit_loop(swept, root);
+        // DSP_SetGraphZoom2's zoom is 256ths: sw*(zoom+256)/256.
+        result.scale = 1.0f + step * step / 256.0f;
+        result.half_blend = true;
+        break;
+    }
+    case 12: {  // SHAKE_ROLL
+        // cnt = 256 - sk_cnt*256/back_max; cnt = 256 - cnt*cnt/256.  Kept in
+        // the engine's 0..256 units rather than normalised, because the
+        // modulo below is taken in those units - dividing first made the
+        // rotation 256 times too small.
+        const float linear = span > 0
+            ? 256.0f - static_cast<float>(count) * 256.0f
+                / static_cast<float>(span)
+            : 0.0f;
+        const float eased = 256.0f - linear * linear / 256.0f;
+        float rate = std::fmod(eased * static_cast<float>(pitch) / 2.0f,
+                               256.0f);
+        if ((shake_->direction % 2) == 0) {
+            rate = 256.0f - rate;
         }
-        result.angle = turn * 360.0 / 256.0;
-    } else if (shake_->type == 13) {
-        const float turn = -cosine * shake_->pitch * decay;
-        result.angle = turn * 360.0 / 256.0;
-    } else if (shake_->type == 14) {
+        result.angle = degrees(rate);
+        break;
+    }
+    case 13: {  // SHAKE_ROLL_SIN
+        const float rate =
+            -wave(count * shake_->swing / 8) * static_cast<float>(pitch)
+            * taper;
+        result.angle = degrees(rate);
+        break;
+    }
+    case 14: {  // SHAKE_ROLL_2TI
+        // sk_cnt%4 gives -pich, 0, +pich, 0.  The two flat frames are what
+        // wipe the corners the rotation leaves uncovered, so they have to
+        // land exactly - smoothing this into a curve would let the
+        // uncovered region accumulate.
         static constexpr std::array<int, 4> steps{-1, 0, 1, 0};
-        result.angle = steps[frame_index & 3]
-            * shake_->pitch * 360.0 / 256.0;
+        result.angle = degrees(static_cast<float>(
+            steps[static_cast<std::size_t>(count % 4)] * pitch));
+        break;
+    }
+    default:
+        break;
     }
 
-    if (result.x == 0.0f && result.y == 0.0f
-        && result.scale == 1.0f && result.angle == 0.0) {
-        const bool left = shake_->direction == 1
-            || shake_->direction == 2 || shake_->direction == 3;
-        const bool right = shake_->direction == 5
-            || shake_->direction == 6 || shake_->direction == 7;
-        const bool up = shake_->direction == 3
-            || shake_->direction == 4 || shake_->direction == 5;
-        const bool down = shake_->direction == 0
-            || shake_->direction == 1 || shake_->direction == 7;
+    if (translates) {
+        // DIR_D 0, DIR_DL 1, DIR_L 2, DIR_UL 3, DIR_U 4, DIR_UR 5, DIR_R 6,
+        // DIR_DR 7.
+        const int dir = shake_->direction;
+        const bool left = dir == 1 || dir == 2 || dir == 3;
+        const bool right = dir == 5 || dir == 6 || dir == 7;
+        const bool up = dir == 3 || dir == 4 || dir == 5;
+        const bool down = dir == 0 || dir == 1 || dir == 7;
         result.x = left ? -amount : right ? amount : 0.0f;
         result.y = up ? -amount : down ? amount : 0.0f;
     }
-    result.text_only = shake_->type == 3 || shake_->type == 4
-        || shake_->type == 10;
-    result.includes_text = shake_->type == 6 || shake_->type == 7
-        || shake_->type == 11 || shake_->type == 16;
+    result.text_only = type == 3 || type == 4 || type == 10;
+    result.includes_text = type == 6 || type == 7 || type == 11 || type == 16;
     return result;
 }
 

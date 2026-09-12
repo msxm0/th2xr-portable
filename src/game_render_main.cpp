@@ -1,3 +1,4 @@
+#include <functional>
 #include "game.hpp"
 
 #include "icon.hpp"
@@ -148,14 +149,31 @@ float Game::half_tone_pulse() const
     }
 }
 
+void Game::reset_half_tone()
+{
+    half_tone_count_ = 0.0f;
+    half_tone_fading_ = false;
+    half_tone_armed_ = false;
+}
+
 void Game::raise_half_tone()
 {
-    // AVG_SetHalfTone(): from nothing it starts the ramp, but called again
-    // while the ramp is running it goes straight to the dimmed state.
-    if (half_tone_fading_) {
+
+    // AVG_SetHalfTone().  From TONE_NODISP it copies the background and
+    // starts the ramp with the copy still hidden; called again while the
+    // ramp is running, or once it is shown, it goes straight to TONE_DISP
+    // without copying again.
+    const bool from_nothing =
+        !half_tone_armed_ || (!half_tone_fading_ && half_tone_count_ <= 0.0f);
+    half_tone_armed_ = true;
+    if (from_nothing) {
+        build_half_tone_background();
         half_tone_fading_ = false;
-        half_tone_count_ = half_tone_steps;
+        half_tone_count_ = 0.0f;
+        return;
     }
+    half_tone_fading_ = false;
+    half_tone_count_ = half_tone_steps;
 }
 
 void Game::update_half_tone()
@@ -167,7 +185,16 @@ void Game::update_half_tone()
             * 60.0),
         0.0f, 8.0f);
     half_tone_updated_ = now;
-    if (!message_visible_ || message_.empty()) {
+    if (transition_) {
+        // AVG_ControlBackChange drives the wipe through GRP_BACK and parks
+        // the outgoing background in GRP_BACK+1, so the darkened copy has
+        // nowhere to be drawn while one runs.
+        half_tone_count_ = 0.0f;
+        half_tone_fading_ = false;
+        half_tone_armed_ = false;
+        return;
+    }
+    if (!half_tone_armed_ || !message_visible_ || message_.empty()) {
         // AVG_ResetHalfTone() drops it in one go; the fade back in is
         // commented out in the original and never runs.
         half_tone_count_ = 0.0f;
@@ -317,6 +344,142 @@ void Game::begin_authentic_text()
     SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
 }
 
+float Game::half_tone_factor() const
+{
+    if (ui_mode_ != UiMode::game || transition_ || !half_tone_armed_
+        || !message_visible_ || message_.empty()) {
+        return 1.0f;
+    }
+    const int half_tone = std::clamp(
+        config_.message_half_tone,
+        th2::GameConfig::min_message_half_tone,
+        th2::GameConfig::max_message_half_tone);
+    const float ramp =
+        std::clamp(half_tone_count_ / half_tone_steps, 0.0f, 1.0f);
+    return 1.0f - (128.0f - static_cast<float>(half_tone)) / 128.0f * ramp;
+}
+
+bool Game::half_tone_settled() const
+{
+    return half_tone_factor() < 1.0f
+        && half_tone_count_ >= half_tone_steps;
+}
+
+float Game::half_tone_target_factor() const
+{
+    const int half_tone = std::clamp(
+        config_.message_half_tone,
+        th2::GameConfig::min_message_half_tone,
+        th2::GameConfig::max_message_half_tone);
+    return static_cast<float>(half_tone) / 128.0f;
+}
+
+SDL_Texture* Game::half_tone_background() const
+{
+    return half_tone_background_.get();
+}
+
+void Game::build_half_tone_background()
+{
+    // DSP_CopyBmp2( BMP_BACKHALF, BMP_BACK, NULL, 256,
+    //               BackStruct.r*Avg.half_tone/128, ... ) - the whole
+    // darkness at once.  What ramps is the background's own brightness,
+    // separately, until this copy takes over from it.
+    if (!background_) {
+        half_tone_background_.reset();
+        return;
+    }
+    float width = 0.0f;
+    float height = 0.0f;
+    SDL_GetTextureSize(background_.get(), &width, &height);
+    if (width <= 0.0f || height <= 0.0f) {
+        half_tone_background_.reset();
+        return;
+    }
+    float held_width = 0.0f;
+    float held_height = 0.0f;
+    if (half_tone_background_) {
+        SDL_GetTextureSize(half_tone_background_.get(),
+                           &held_width, &held_height);
+    }
+    if (!half_tone_background_ || held_width != width
+        || held_height != height) {
+        half_tone_background_.reset(SDL_CreateTexture(
+            renderer_, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET,
+            static_cast<int>(width), static_cast<int>(height)));
+        if (!half_tone_background_) {
+            return;
+        }
+        SDL_SetTextureBlendMode(
+            half_tone_background_.get(), SDL_BLENDMODE_NONE);
+    }
+    // Built from raise_half_tone(), during event handling - the scale there
+    // belongs to ImGui, not to the art.
+    SDL_Texture* const previous_target = SDL_GetRenderTarget(renderer_);
+    float scale_x = 1.0f;
+    float scale_y = 1.0f;
+    SDL_GetRenderScale(renderer_, &scale_x, &scale_y);
+    SDL_SetRenderTarget(renderer_, half_tone_background_.get());
+    SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
+    const auto shade = static_cast<Uint8>(std::clamp(
+        half_tone_target_factor() * 255.0f, 0.0f, 255.0f));
+    // From BMP_BACK, not BMP_BACK2: the characters are already in it, which
+    // is how they come to be darkened without anything darkening them.
+    SDL_Texture* const plate =
+        background_baked_ ? background_baked_.get() : background_.get();
+    SDL_SetTextureColorMod(plate, shade, shade, shade);
+    SDL_SetTextureBlendMode(plate, SDL_BLENDMODE_NONE);
+    SDL_RenderTexture(renderer_, plate, nullptr, nullptr);
+    SDL_SetTextureColorMod(plate, 255, 255, 255);
+    SDL_SetTextureBlendMode(plate, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderScale(renderer_, scale_x, scale_y);
+    SDL_SetRenderTarget(renderer_, previous_target);
+}
+
+Uint8 Game::apply_background_fade(SDL_Texture* texture, float extra) const
+{
+    // 128 is normal, below it darkens, above it brightens.  The darkening
+    // half is a plain colour modulation; the brightening half has to be
+    // added on afterwards, because modulation cannot exceed the source.
+    const auto& fade = background_brightness_;
+    float highest = 0.0f;
+    for (const float channel : fade) {
+        highest = std::max(highest, std::clamp(channel, 0.0f, 256.0f));
+    }
+    std::array<Uint8, 3> modulate{};
+    Uint8 brighten = 0;
+    for (std::size_t i = 0; i < fade.size(); ++i) {
+        const float channel = std::clamp(fade[i], 0.0f, 256.0f);
+        modulate[i] = static_cast<Uint8>(
+            std::clamp(std::min(channel, 128.0f) * 255.0f / 128.0f * extra,
+                       0.0f, 255.0f));
+    }
+    if (highest > 128.0f) {
+        brighten = static_cast<Uint8>(
+            std::clamp((highest - 128.0f) * 255.0f / 128.0f, 0.0f, 255.0f));
+    }
+    SDL_SetTextureColorMod(texture, modulate[0], modulate[1], modulate[2]);
+    return brighten;
+}
+
+void Game::finish_background_fade(
+    SDL_Texture* texture, Uint8 brighten, const SDL_FRect* source,
+    const SDL_FRect* destination, double angle, SDL_FlipMode flip)
+{
+    if (brighten > 0) {
+        // The same picture again, added on: additive keeps the object's own
+        // shape, where a screen-blended rectangle over the destination would
+        // light up everything transparent in it as well.
+        const auto previous = SDL_BLENDMODE_BLEND;
+        SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_ADD);
+        SDL_SetTextureColorMod(texture, brighten, brighten, brighten);
+        SDL_RenderTextureRotated(
+            renderer_, texture, source, destination, angle, nullptr, flip);
+        SDL_SetTextureBlendMode(texture, previous);
+    }
+    SDL_SetTextureColorMod(texture, 255, 255, 255);
+}
+
 void Game::draw_overlay(std::size_t slot)
 {
     if (!overlays_[slot] || !overlay_states_[slot].visible) {
@@ -365,8 +528,11 @@ void Game::draw_overlay(std::size_t slot)
     if ((state.reverse & 0x20) != 0) {
         flip = static_cast<SDL_FlipMode>(flip | SDL_FLIP_VERTICAL);
     }
+    const Uint8 brighten = apply_background_fade(texture);
     SDL_RenderTextureRotated(
         renderer_, texture, &source, &destination, 0.0, nullptr, flip);
+    finish_background_fade(
+        texture, brighten, &source, &destination, 0.0, flip);
 }
 
 float Game::imgui_display_scale() const
@@ -379,6 +545,16 @@ float Game::imgui_display_scale() const
 
 void Game::present_frame()
 {
+    // Kept every frame, not only during a shake: the first frame of one has
+    // to find the frame before it already there.  One 800x600 blit, entirely
+    // on the GPU.
+    //
+    // The art layer only.  The engine's buffer holds the composited screen
+    // including its text, but ours keeps text on a separate monitor-
+    // resolution layer, and the uncovered region is at the screen edges
+    // where the text is redrawn in place every frame regardless.
+    capture_previous_frame(upscaler_->art_target());
+
     upscaler_->present();
 
     // ImGui is rendered directly to the window backbuffer using a capped
@@ -399,6 +575,11 @@ void Game::reset_render_state()
         upscaler_->reset();
     }
     shake_target_.reset();
+    background_baked_.reset();
+    background_baked_dirty_ = true;
+    previous_frame_.reset();
+    previous_frame_valid_ = false;
+    half_tone_background_.reset();
     title_masked_.reset();
     if (imgui_) {
         imgui_->rebuild_font_atlas(imgui_display_scale());
@@ -471,23 +652,57 @@ bool Game::ensure_pose_blend_target()
         pose_blend_target_.get(), SDL_BLENDMODE_BLEND_PREMULTIPLIED);
 }
 
-void Game::ensure_wash_texture()
+void Game::ensure_previous_frame()
 {
-    if (wash_texture_) {
+    // Sized from the art target rather than from 800x600: both upscalers
+    // happen to author the scene at that size and magnify at present time,
+    // so the two agree today - but a capture that did not match would
+    // quietly resample the frame twice every frame, and that is not a
+    // failure anyone would see coming.
+    SDL_Texture* const art = upscaler_ ? upscaler_->art_target() : nullptr;
+    float width = 800.0f;
+    float height = 600.0f;
+    if (art) {
+        SDL_GetTextureSize(art, &width, &height);
+    }
+    if (previous_frame_) {
+        float held_width = 0.0f;
+        float held_height = 0.0f;
+        SDL_GetTextureSize(previous_frame_.get(), &held_width, &held_height);
+        if (held_width == width && held_height == height) {
+            return;
+        }
+        previous_frame_valid_ = false;
+    }
+    previous_frame_.reset(SDL_CreateTexture(
+        renderer_, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET,
+        static_cast<int>(width), static_cast<int>(height)));
+    if (previous_frame_) {
+        SDL_SetTextureBlendMode(previous_frame_.get(), SDL_BLENDMODE_NONE);
+        SDL_SetTextureScaleMode(previous_frame_.get(), SDL_SCALEMODE_NEAREST);
+    }
+    previous_frame_valid_ = false;
+}
+
+void Game::capture_previous_frame(SDL_Texture* art_target)
+{
+    ensure_previous_frame();
+    if (!previous_frame_ || !art_target) {
         return;
     }
-    Surface pixel(SDL_CreateSurface(1, 1, SDL_PIXELFORMAT_ARGB8888));
-    if (!pixel) {
-        return;
-    }
-    SDL_FillSurfaceRect(pixel.get(), nullptr,
-                        SDL_MapSurfaceRGBA(pixel.get(), 0, 0, 0, 255));
-    wash_texture_.reset(
-        SDL_CreateTextureFromSurface(renderer_, pixel.get()));
-    if (wash_texture_) {
-        SDL_SetTextureBlendMode(wash_texture_.get(), SDL_BLENDMODE_BLEND);
-        SDL_SetTextureScaleMode(wash_texture_.get(), SDL_SCALEMODE_NEAREST);
-    }
+    // Called from present_frame(), where the scale is whatever the overlay
+    // pass left behind - and a scaled copy would capture a magnified corner
+    // of the frame rather than the frame.
+    float scale_x = 1.0f;
+    float scale_y = 1.0f;
+    SDL_GetRenderScale(renderer_, &scale_x, &scale_y);
+    SDL_SetRenderTarget(renderer_, previous_frame_.get());
+    SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
+    SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
+    SDL_RenderTexture(renderer_, art_target, nullptr, nullptr);
+    SDL_SetRenderScale(renderer_, scale_x, scale_y);
+    SDL_SetRenderTarget(renderer_, art_target);
+    previous_frame_valid_ = true;
 }
 
 void Game::ensure_shake_target()
@@ -504,173 +719,113 @@ void Game::ensure_shake_target()
     SDL_SetTextureBlendMode(shake_target_.get(), SDL_BLENDMODE_NONE);
 }
 
-void Game::draw_frame()
+void Game::rebuild_baked_background()
 {
-    // present() composites these two layers over the art on every path, so
-    // they have to start empty here rather than in the game-mode branch
-    // below: otherwise the last message and sidebar stay on screen after
-    // returning to the title, or during a movie or a gallery.
-    clear_authentic_text();
-    clear_sidebar();
+    // DSP_CopyBmp( BMP_BACK, BMP_BACK2 ): back to the clean plate, then the
+    // settled characters go in again.  The engine does this whenever a
+    // character changes, because a bake cannot be undone in place.
+    if (!background_) {
+        background_baked_.reset();
+        background_baked_dirty_ = false;
+        return;
+    }
+    float width = 0.0f;
+    float height = 0.0f;
+    SDL_GetTextureSize(background_.get(), &width, &height);
+    if (width <= 0.0f || height <= 0.0f) {
+        background_baked_.reset();
+        background_baked_dirty_ = false;
+        return;
+    }
+    float held_width = 0.0f;
+    float held_height = 0.0f;
+    if (background_baked_) {
+        SDL_GetTextureSize(background_baked_.get(), &held_width, &held_height);
+    }
+    if (!background_baked_ || held_width != width || held_height != height) {
+        background_baked_.reset(SDL_CreateTexture(
+            renderer_, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET,
+            static_cast<int>(width), static_cast<int>(height)));
+        if (!background_baked_) {
+            background_baked_dirty_ = false;
+            return;
+        }
+        SDL_SetTextureBlendMode(background_baked_.get(), SDL_BLENDMODE_NONE);
+    }
+    SDL_Texture* const previous_target = SDL_GetRenderTarget(renderer_);
+    float scale_x = 1.0f;
+    float scale_y = 1.0f;
+    SDL_GetRenderScale(renderer_, &scale_x, &scale_y);
+    SDL_SetRenderTarget(renderer_, background_baked_.get());
     SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
-    SDL_Texture* art_target = upscaler_->art_target();
-    const auto shake = shake_sample();
-    const bool shake_background = shake_
-        && (shake_->type == 0 || shake_->type == 1
-            || shake_->type == 2 || shake_->type == 9
-            || shake_->type == 12 || shake_->type == 13
-            || shake_->type == 14);
-    const bool shake_characters = shake_ && shake_->type == 0;
-    const bool shake_art = shake_
-        && (shake_->type == 6 || shake_->type == 7
-            || shake_->type == 11 || shake_->type == 16);
-    if (shake_art) {
-        ensure_shake_target();
-        SDL_SetRenderTarget(renderer_, shake_target_.get());
-    } else {
-        SDL_SetRenderTarget(renderer_, art_target);
-    }
-    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
-    SDL_RenderClear(renderer_);
-    if (movie_) {
-        movie_->draw();
-        begin_overlay();
+    SDL_SetTextureBlendMode(background_.get(), SDL_BLENDMODE_NONE);
+    SDL_RenderTexture(renderer_, background_.get(), nullptr, nullptr);
+    SDL_SetTextureBlendMode(background_.get(), SDL_BLENDMODE_BLEND);
 
-        present_frame();
-        return;
-    }
-    if (name_input_open_) {
-        begin_overlay();
-
-        present_frame();
-        return;
-    }
-    if (ui_mode_ == UiMode::title) {
-        draw_title();
-        draw_active_transition();
-        begin_overlay();
-        present_frame();
-        return;
-    }
-    if (ui_mode_ == UiMode::cg_gallery) {
-        draw_cg_gallery();
-        draw_active_transition();
-        begin_overlay();
-        present_frame();
-        return;
-    }
-    if (ui_mode_ == UiMode::music_room) {
-        draw_music_room();
-        draw_active_transition();
-        begin_overlay();
-        present_frame();
-        return;
-    }
-    if (ui_mode_ == UiMode::replay_gallery) {
-        draw_replay_gallery();
-        draw_active_transition();
-        begin_overlay();
-        present_frame();
-        return;
-    }
-    if (ui_mode_ == UiMode::map) {
-        draw_map(false);
-        begin_overlay();
-        draw_map(true);
-        draw_script_position();
-
-        present_frame();
-        return;
-    }
-    for (std::size_t i = 0; i < overlays_.size(); ++i) {
-        if (overlay_states_[i].layer < 1) {
-            draw_overlay(i);
-        }
-    }
-    if (background_) {
-        const auto view = current_background_view();
-        SDL_FRect source{
-            view.x, view.y, view.width, view.height};
-        SDL_FRect destination{0.0f, 0.0f, 800.0f, 600.0f};
-        double angle = 0.0;
-        if (shake_background) {
-            destination = {
-                -shake.x + 400.0f * (1.0f - shake.scale),
-                -shake.y + 300.0f * (1.0f - shake.scale),
-                800.0f * shake.scale,
-                600.0f * shake.scale,
-            };
-            angle = shake.angle;
-        }
-        if (clip_texture_source(
-                background_.get(), source, destination)) {
-            SDL_RenderTextureRotated(
-                renderer_, background_.get(), &source, &destination,
-                angle, nullptr, SDL_FLIP_NONE);
-        }
-    } else if (bg_scene_ == 0) {
-        SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
-        const SDL_FRect game_area{0.0f, 0.0f, 800.0f, 600.0f};
-        SDL_RenderFillRect(renderer_, &game_area);
-    }
-    for (std::size_t i = 0; i < overlays_.size(); ++i) {
-        if (overlay_states_[i].layer >= 1
-            && overlay_states_[i].layer < 5) {
-            draw_overlay(i);
-        }
-    }
-    if (background_brightness_ != std::array<float, 3>{
-            128.0f, 128.0f, 128.0f}) {
-        const SDL_FRect game_area{0.0f, 0.0f, 800.0f, 600.0f};
-        std::array<Uint8, 3> multiply{};
-        std::array<Uint8, 3> screen{};
-        bool needs_multiply = false;
-        bool needs_screen = false;
-        for (std::size_t i = 0; i < background_brightness_.size(); ++i) {
-            const float value =
-                std::clamp(background_brightness_[i], 0.0f, 256.0f);
-            multiply[i] = static_cast<Uint8>(
-                value < 128.0f ? value * 255.0f / 128.0f : 255.0f);
-            screen[i] = static_cast<Uint8>(
-                value > 128.0f
-                    ? (value - 128.0f) * 255.0f / 128.0f
-                    : 0.0f);
-            needs_multiply |= value < 128.0f;
-            needs_screen |= value > 128.0f;
-        }
-        if (needs_multiply) {
-            SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_MOD);
-            SDL_SetRenderDrawColor(
-                renderer_, multiply[0], multiply[1], multiply[2], 255);
-            SDL_RenderFillRect(renderer_, &game_area);
-        }
-        if (needs_screen) {
-            const auto screen_blend = SDL_ComposeCustomBlendMode(
-                SDL_BLENDFACTOR_ONE,
-                SDL_BLENDFACTOR_ONE_MINUS_SRC_COLOR,
-                SDL_BLENDOPERATION_ADD,
-                SDL_BLENDFACTOR_ZERO,
-                SDL_BLENDFACTOR_ONE,
-                SDL_BLENDOPERATION_ADD);
-            SDL_SetRenderDrawBlendMode(renderer_, screen_blend);
-            SDL_SetRenderDrawColor(
-                renderer_, screen[0], screen[1], screen[2], 0);
-            SDL_RenderFillRect(renderer_, &game_area);
-        }
-    }
-    for (std::size_t i = 0; i < overlays_.size(); ++i) {
-        if (overlay_states_[i].layer >= 5
-            && overlay_states_[i].layer < 18) {
-            draw_overlay(i);
-        }
-    }
+    // Every settled character that is due to be baked goes in now, in the
+    // order AVG_SetBackChar walks them - by layer, then by slot.
+    bool animating_below = false;
+    const ShakeSample still;
     for (const auto& character : characters_.ordered()) {
         if (character_staged_.at(character.number)) {
             continue;
         }
+        auto& mode = character_cut_mode_.at(character.number);
+        if (mode == CutMode::live) {
+            continue;
+        }
+        const auto& animation = character_animations_.at(character.number);
+        if (animation.kind != CharacterAnimationKind::none) {
+            // Mid-animation: AVG_SetBackChar bakes only CHAR_COND_NOMAL and
+            // CHAR_COND_WAIT, and AVG_ControlChar leaves everything else
+            // drawn live.  Say so, or it is left marked as baked while not
+            // being in the plate - in neither place, and so invisible for
+            // the length of the animation.
+            mode = CutMode::bake;
+            // And everything ordered above it stays a layer too, or the
+            // plate would draw over the one that is animating:
+            //     if( CharStruct[j].layer*MAX_CHAR+j > ...+i )
+            //         CharStruct[j].disp = 1;
+            animating_below = true;
+            continue;
+        }
+        if (animating_below) {
+            mode = CutMode::bake;
+            continue;
+        }
+        // Baked without the shake offset: the transform belongs to the
+        // background it is now part of.
+        // Only once it is really in the bitmap.  A texture that has not
+        // loaded yet leaves it to be tried again, rather than marking it
+        // baked and never drawing it anywhere.
+        if (draw_character(character, still, false)) {
+            mode = CutMode::baked;
+        }
+    }
+    SDL_SetRenderScale(renderer_, scale_x, scale_y);
+    SDL_SetRenderTarget(renderer_, previous_target);
+    background_baked_dirty_ = false;
+    // AVG_SetBackChar() bakes, AVG_SetHalfTone() copies, in that order - so
+    // BMP_BACKHALF is always of a plate that already has its characters.
+    //
+    // The engine gets that from the call sequence because AVG_ControlChar
+    // bakes in the same update pass that runs the script.  Ours runs the
+    // script first and renders after, so a copy taken while the script is
+    // executing precedes the bake by a frame.  Re-copying here is the same
+    // ordering expressed the only way this frame structure allows: the copy
+    // is never older than the plate it is of.
+    if (half_tone_armed_ && half_tone_background_) {
+        build_half_tone_background();
+    }
+}
+
+bool Game::draw_character(
+    const th2::CharacterState& character, const ShakeSample& shake,
+    bool shake_characters)
+{
         auto& loaded = character_texture(character.number);
         if (!loaded.texture) {
-            continue;
+            return false;
         }
         auto& animation = character_animations_.at(character.number);
         float progress = 1.0f;
@@ -731,6 +886,9 @@ void Game::draw_frame()
             alpha_value = static_cast<int>(
                 animation.to_alpha * progress);
         }
+        // No half tone here.  A baked character is darkened by being inside
+        // the copy; a live one is a graph at LAY_CHAR, which the half tone -
+        // a background layer - never touches.
         const auto brightness = static_cast<Uint8>(
             std::clamp(brightness_value * 2, 0, 255));
         SDL_SetTextureColorMod(
@@ -758,7 +916,7 @@ void Game::draw_frame()
                     brightness,
                     std::clamp(animation.to_alpha, 0, 256) * 255 / 256,
                     destination)) {
-                continue;
+                return true;
             }
             SDL_SetTextureColorMod(
                 animation.previous.get(),
@@ -773,6 +931,327 @@ void Game::draw_frame()
                 renderer_, animation.previous.get(), nullptr, &destination);
         }
         SDL_RenderTexture(renderer_, loaded.texture.get(), nullptr, &destination);
+        return true;
+}
+
+void Game::draw_frame()
+{
+    // present() composites these two layers over the art on every path, so
+    // they have to start empty here rather than in the game-mode branch
+    // below: otherwise the last message and sidebar stay on screen after
+    // returning to the title, or during a movie or a gallery.
+    clear_authentic_text();
+    clear_sidebar();
+    SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
+    SDL_Texture* art_target = upscaler_->art_target();
+    const auto shake = shake_sample();
+    const bool shake_background = shake_
+        && (shake_->type == 0 || shake_->type == 1
+            || shake_->type == 2 || shake_->type == 9
+            || shake_->type == 12 || shake_->type == 13
+            || shake_->type == 14);
+    // Characters are normally baked into BMP_BACK by DSP_SetGraphTarget,
+    // which draws them into the bitmap once and switches their graph off, so
+    // they travel with the background's source offset for free.  A sine
+    // shake is the exception: it swaps the background to BMP_BACK2, the copy
+    // taken before the bake, and SetCharPosShake sets cut_mode 2 to bring the
+    // character graphs back live and move them itself.  Either way they
+    // follow, which is what this reproduces - we never bake, so they always
+    // have to be moved by hand.
+    // SetCharPosShake(x, y, ON) - only the SIN cases call it - sets cut_mode
+    // 2, taking the characters out of the bitmap and moving them itself,
+    // while GRP_BACK swaps to BMP_BACK2, the plate without them.  Every
+    // other shake leaves them baked, so they travel with the background.
+    const bool shake_characters = shake_
+        && (shake_->type == 0 || shake_->type == 15);
+    for (std::size_t i = 0; i < character_cut_mode_.size(); ++i) {
+        auto& mode = character_cut_mode_[i];
+        if (shake_characters) {
+            if (mode != CutMode::live) {
+                mode = CutMode::live;
+                background_baked_dirty_ = true;
+            }
+        } else if (mode == CutMode::live) {
+            mode = CutMode::bake;
+            background_baked_dirty_ = true;
+        }
+    }
+    // AVG_ControlChar:
+    //     if( cond!=CHAR_COND_NOMAL && cut_mode ){ disp = 1; break; }
+    //     if(disp){ AVG_CopyBack(OFF); for(i..) cut_mode = 0; }
+    //
+    // A character that starts animating while it is still in the plate takes
+    // the whole plate back to the clean copy and resets every cut_mode: they
+    // all come out, and the settled ones go back in next pass.  Without it a
+    // character fading out is still in the bitmap at full strength and the
+    // fade has nothing to show - which is why a cross-fade looked right (a
+    // pose change reloads a texture, and that invalidated the plate by luck)
+    // while a fade-out did not.
+    for (const auto& character : characters_.ordered()) {
+        if (character_staged_.at(character.number)) {
+            continue;
+        }
+        if (character_animations_.at(character.number).kind
+                != CharacterAnimationKind::none
+            && character_cut_mode_.at(character.number) != CutMode::bake) {
+            for (auto& mode : character_cut_mode_) {
+                mode = CutMode::bake;
+            }
+            background_baked_dirty_ = true;
+            break;
+        }
+    }
+    if (background_baked_dirty_) {
+        rebuild_baked_background();
+    }
+    const bool shake_art = shake_
+        && (shake_->type == 6 || shake_->type == 7
+            || shake_->type == 11 || shake_->type == 16);
+    if (shake_art) {
+        ensure_shake_target();
+        SDL_SetRenderTarget(renderer_, shake_target_.get());
+    } else {
+        SDL_SetRenderTarget(renderer_, art_target);
+    }
+    // The engine never clears: DSP_DrawGraph composites straight over the
+    // framebuffer it drew last time, and GetGraph only restores a saved
+    // image when DSP_GetDispBmp has armed it.  So whatever a transform
+    // leaves uncovered keeps the previous frame, and that is visible in the
+    // original.  Restoring it is the same cost as the clear it replaces and
+    // covers every pixel, so there is nothing to clear first.
+    //
+    // Done for every frame rather than only for shakes, because that is what
+    // the engine does - the background simply covers the screen the rest of
+    // the time, which is why it gets away with it.
+    if (previous_frame_valid_ && previous_frame_) {
+        SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
+        SDL_RenderTexture(renderer_, previous_frame_.get(), nullptr, nullptr);
+    } else {
+        SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
+        SDL_RenderClear(renderer_);
+    }
+    if (movie_) {
+        movie_->draw();
+        begin_overlay();
+
+        present_frame();
+        return;
+    }
+    if (name_input_open_) {
+        begin_overlay();
+
+        present_frame();
+        return;
+    }
+    if (ui_mode_ == UiMode::title) {
+        draw_title();
+        draw_active_transition();
+        begin_overlay();
+        present_frame();
+        return;
+    }
+    if (ui_mode_ == UiMode::cg_gallery) {
+        draw_cg_gallery();
+        draw_active_transition();
+        begin_overlay();
+        present_frame();
+        return;
+    }
+    if (ui_mode_ == UiMode::music_room) {
+        draw_music_room();
+        draw_active_transition();
+        begin_overlay();
+        present_frame();
+        return;
+    }
+    if (ui_mode_ == UiMode::replay_gallery) {
+        draw_replay_gallery();
+        draw_active_transition();
+        begin_overlay();
+        present_frame();
+        return;
+    }
+    if (ui_mode_ == UiMode::map) {
+        draw_map(false);
+        begin_overlay();
+        draw_map(true);
+        draw_script_position();
+
+        present_frame();
+        return;
+    }
+    for (std::size_t i = 0; i < overlays_.size(); ++i) {
+        if (overlay_states_[i].layer < 1) {
+            draw_overlay(i);
+        }
+    }
+    std::function<void(SDL_Texture*, float)> draw_background_layer;
+    if (background_) {
+        const auto view = current_background_view();
+        SDL_FRect source{
+            view.x, view.y, view.width, view.height};
+        SDL_FRect destination{0.0f, 0.0f, 800.0f, 600.0f};
+        double angle = 0.0;
+        if (shake_background) {
+            // A slide is DSP_SetGraphSMove, which moves the *source* - the
+            // window onto the bitmap - and leaves the destination at the
+            // full screen.  The picture does not travel; the view does.
+            // Moving the destination instead swept the picture off the edge
+            // and left a gap the engine never has.
+            //
+            // The background is exactly screen-sized, so the source runs off
+            // the bitmap, and ClipRect handles that by narrowing the blit
+            // and pushing the destination in by the same amount - it does
+            // not clamp or wrap.  The strip that leaves uncovered keeps the
+            // previous frame, which is restored above.
+            // BackStruct.x - x, not + x.  Lowering the source offset
+            // starts the sample that much earlier and so slides the picture
+            // the *same* way the characters go, which move by
+            // DSP_SetGraphMove(GRP_CHAR+i, ... +shx, ...).  Adding it moved
+            // the two in opposite directions.
+            source.x -= shake.x;
+            source.y -= shake.y;
+            if (source.x < 0.0f) {
+                destination.x -= source.x;
+                destination.w += source.x;
+                source.w += source.x;
+                source.x = 0.0f;
+            }
+            if (source.y < 0.0f) {
+                destination.y -= source.y;
+                destination.h += source.y;
+                source.h += source.y;
+                source.y = 0.0f;
+            }
+            float width = 0.0f;
+            float height = 0.0f;
+            SDL_GetTextureSize(background_.get(), &width, &height);
+            if (source.x + source.w > width) {
+                const float over = source.x + source.w - width;
+                source.w -= over;
+                destination.w -= over;
+            }
+            if (source.y + source.h > height) {
+                const float over = source.y + source.h - height;
+                source.h -= over;
+                destination.h -= over;
+            }
+            // A zoom or a roll is a destination transform, unlike a slide.
+            if (shake.scale != 1.0f) {
+                destination.x += 400.0f * (1.0f - shake.scale);
+                destination.y += 300.0f * (1.0f - shake.scale);
+                destination.w *= shake.scale;
+                destination.h *= shake.scale;
+            }
+            angle = shake.angle;
+        }
+        if (source.w <= 0.0f || source.h <= 0.0f) {
+            source = {0.0f, 0.0f, 0.0f, 0.0f};
+        }
+        // Once the ramp has finished, the engine turns GRP_BACK off and
+        // shows GRP_BACK+1 - the darkened copy - in its place.  Before then
+        // it dims GRP_BACK live, so the ordinary texture is used with the
+        // factor folded into its modulation.
+        draw_background_layer = [this, source, destination, angle, shake](
+                                    SDL_Texture* surface, float shade) mutable {
+        if (surface && source.w > 0.0f && source.h > 0.0f
+            && clip_texture_source(
+                surface, source, destination)) {
+            if (shake.half_blend) {
+                // SHAKE_ZOOM sets DRW_BLD(128) on the background for the
+                // duration, so the zoomed picture is half strength over
+                // whatever it is covering.
+                SDL_SetTextureAlphaMod(surface, 128);
+            } else {
+                // Opaque: GRP_BACK and GRP_BACK+1 are both plain bitmap
+                // layers, so the darkened copy hides what is beneath it
+                // rather than tinting it.
+                SDL_SetTextureBlendMode(surface, SDL_BLENDMODE_NONE);
+            }
+            const Uint8 brighten = apply_background_fade(surface, shade);
+            SDL_RenderTextureRotated(
+                renderer_, surface, &source, &destination,
+                angle, nullptr, SDL_FLIP_NONE);
+            finish_background_fade(
+                surface, brighten, &source, &destination, angle,
+                SDL_FLIP_NONE);
+            SDL_SetTextureAlphaMod(surface, 255);
+            SDL_SetTextureBlendMode(surface, SDL_BLENDMODE_BLEND);
+        }
+        };
+        // GRP_BACK, at LAY_BACK.  Switched off once the ramp finishes and
+        // the darkened copy takes over below.
+        // GRP_BACK: BMP_BACK normally - the plate with the characters baked
+        // into it - but BMP_BACK2, the clean one, while a sine shake has
+        // them out as their own layer.
+        SDL_Texture* const plate =
+            (shake_characters || !background_baked_)
+                ? background_.get() : background_baked_.get();
+        // Without a copy - the wash armed before a background existed -
+        // there is nothing to switch to, so the live dimming stands in.
+        if (!half_tone_settled() || !half_tone_background()) {
+            draw_background_layer(plate, half_tone_factor());
+        }
+    } else if (bg_scene_ == 0) {
+        SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
+        const SDL_FRect game_area{0.0f, 0.0f, 800.0f, 600.0f};
+        SDL_RenderFillRect(renderer_, &game_area);
+    }
+    // A wipe happens down here, not over the finished frame.  AVG_SetBack
+    // parks a snapshot of the screen in GRP_BACK+1 at LAY_BACK and lifts the
+    // incoming background to LAY_BACK+1 above it, so both sit at the bottom
+    // of the scene: the characters and overlays of the *new* moment draw on
+    // top and are not part of the dissolve.  Compositing it last instead put
+    // the old screen - which the snapshot still contains - over the new
+    // characters, so they faded in with the background rather than being
+    // there from the first frame.
+    draw_active_transition();
+    // The half tone sits at LAY_BACK+2, so layers 1 and 2 are beneath it and
+    // layers 3 and 4 above.  With the copy opaque that is the difference
+    // between an overlay being hidden and being visible, so the band the
+    // engine happens to group as "background-ish" has to be split there.
+    for (std::size_t i = 0; i < overlays_.size(); ++i) {
+        if (overlay_states_[i].layer >= 1 && overlay_states_[i].layer < 3) {
+            draw_overlay(i);
+        }
+    }
+    // GRP_BACK+1, at LAY_BACK+2: the darkened copy, opaque, covering
+    // everything drawn below it.
+    if (background_ && half_tone_settled() && half_tone_background()
+        && draw_background_layer) {
+        draw_background_layer(half_tone_background(), 1.0f);
+    }
+    for (std::size_t i = 0; i < overlays_.size(); ++i) {
+        if (overlay_states_[i].layer >= 3 && overlay_states_[i].layer < 5) {
+            draw_overlay(i);
+        }
+    }
+    for (std::size_t i = 0; i < overlays_.size(); ++i) {
+        if (overlay_states_[i].layer >= 5
+            && overlay_states_[i].layer < 18) {
+            draw_overlay(i);
+        }
+    }
+    // AVG_ControlChar: a settled character is baked into the background
+    // bitmap and its graph switched off, so only the live ones are drawn
+    // here.  Anything mid-animation is live by definition - AVG_SetBackChar
+    // only bakes CHAR_COND_NOMAL and CHAR_COND_WAIT.
+    for (const auto& character : characters_.ordered()) {
+        if (character_staged_.at(character.number)) {
+            continue;
+        }
+        auto& mode = character_cut_mode_.at(character.number);
+        if (mode == CutMode::baked) {
+            continue;
+        }
+        const auto& animation = character_animations_.at(character.number);
+        if (mode == CutMode::bake
+            && animation.kind == CharacterAnimationKind::none) {
+            // Settled since the plate was built - it belongs in the bitmap
+            // now, so rebuild rather than draw it twice.
+            background_baked_dirty_ = true;
+        }
+        draw_character(character, shake, shake_characters);
     }
     for (std::size_t i = 0; i < overlays_.size(); ++i) {
         if (overlay_states_[i].layer >= 18) {
@@ -784,52 +1263,8 @@ void Game::draw_frame()
     } else if (ui_mode_ == UiMode::save || ui_mode_ == UiMode::load) {
         draw_save_load();
     }
-    draw_active_transition();
-    // Drawn after the transition, not before it: AVG_SetHalfTone() rebuilds
-    // BMP_BACKHALF from whatever BMP_BACK now holds, so the wash applies to
-    // the background the wipe is arriving at, not only the one it is leaving.
-    //
-    // The half tone belongs to the picture, not to the text.  In the original
-    // it is not an overlay at all: GRP_BACK is switched off and GRP_BACK+1, a
-    // darkened copy of the same bitmap, is switched on in its place, so it is
-    // moved, zoomed and rotated by whatever moves the background and can
-    // never come away from it.  Drawing it here, with the background's own
-    // destination and angle, is the same arrangement - and it is why nothing
-    // has to be extended to cover an edge: there is no edge to cover, because
-    // the wash and the background are the same shape.
-    if (ui_mode_ == UiMode::game && message_visible_ && !message_.empty()) {
-        if (const auto alpha = message_backdrop_alpha(); alpha > 0) {
-            SDL_FRect wash{0.0f, 0.0f, 800.0f, 600.0f};
-            double wash_angle = 0.0;
-            if (shake_background) {
-                wash = {
-                    -shake.x + 400.0f * (1.0f - shake.scale),
-                    -shake.y + 300.0f * (1.0f - shake.scale),
-                    800.0f * shake.scale,
-                    600.0f * shake.scale,
-                };
-                wash_angle = shake.angle;
-            }
-            SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
-            if (wash_angle == 0.0) {
-                SDL_SetRenderDrawColor(renderer_, 0, 0, 0, alpha);
-                SDL_RenderFillRect(renderer_, &wash);
-            } else {
-                // A rotated fill needs a texture; a one-pixel black one
-                // stretched over the same rect costs nothing and takes the
-                // same rotation the background did.
-                ensure_wash_texture();
-                SDL_SetTextureAlphaMod(wash_texture_.get(), alpha);
-                SDL_RenderTextureRotated(
-                    renderer_, wash_texture_.get(), nullptr, &wash,
-                    wash_angle, nullptr, SDL_FLIP_NONE);
-            }
-        }
-    }
     if (shake_art) {
         SDL_SetRenderTarget(renderer_, art_target);
-        SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
-        SDL_RenderClear(renderer_);
         SDL_FRect destination{
             shake.x + 400.0f * (1.0f - shake.scale),
             shake.y + 300.0f * (1.0f - shake.scale),
@@ -837,6 +1272,34 @@ void Game::draw_frame()
         SDL_RenderTextureRotated(
             renderer_, shake_target_.get(), nullptr, &destination,
             shake.angle, nullptr, SDL_FLIP_NONE);
+        // DSP_SetGraphGlobalPos shifts the whole composited screen, and
+        // DSP_DrawGraph fills the strip it pulls away from with four black
+        // rectangles - written with signed widths so the same four calls
+        // cover an offset in any direction, two of them collapsing to
+        // nothing each time:
+        //
+        //   (0, 0, x, DISP_Y)            (x, 0, DISP_X-x, y)
+        //   (DISP_X+x, y, -x, DISP_Y-y)  (x, DISP_Y+y, DISP_X-x, -y)
+        const float x = shake.x;
+        const float y = shake.y;
+        // DISP_X and DISP_Y, taken from the target rather than assumed.
+        float span_x = 800.0f;
+        float span_y = 600.0f;
+        SDL_GetTextureSize(art_target, &span_x, &span_y);
+        const std::array<SDL_FRect, 4> bands{{
+            {0.0f, 0.0f, x, span_y},
+            {x, 0.0f, span_x - x, y},
+            {span_x + x, y, -x, span_y - y},
+            {x, span_y + y, span_x - x, -y},
+        }};
+        SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
+        SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
+        for (const auto& band : bands) {
+            // A negative extent draws nothing, as it does in the original.
+            if (band.w > 0.0f && band.h > 0.0f) {
+                SDL_RenderFillRect(renderer_, &band);
+            }
+        }
     }
     begin_overlay();
     if (clock_state_ || calendar_state_) {

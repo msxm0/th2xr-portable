@@ -299,6 +299,7 @@ void Game::begin_calendar(int month, int day)
             load_texture(renderer_, graphics_, "cal011.tga");
     }
     background_.reset();
+    background_baked_dirty_ = true;
     characters_.clear();
     character_textures_ = {};
     calendar_state_ = CalendarState{

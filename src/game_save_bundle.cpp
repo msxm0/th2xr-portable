@@ -97,6 +97,7 @@ void Game::reset_play_state()
     movie_mode_ = -1;
 
     background_.reset();
+    background_baked_dirty_ = true;
     bg_scene_ = -1;
     background_kind_ = BackgroundKind::background;
     background_view_ = {0.0f, 0.0f, 800.0f, 600.0f};

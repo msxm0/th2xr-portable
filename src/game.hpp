@@ -265,6 +265,9 @@ private:
         double angle = 0.0;
         bool text_only = false;
         bool includes_text = false;
+        // SHAKE_ZOOM alone sets DRW_BLD(128) on the background while it
+        // runs, so the zoomed picture is composited at half strength.
+        bool half_blend = false;
     };
     struct BackgroundView {
         float x = 0.0f;
@@ -402,6 +405,32 @@ private:
     std::array<CharacterTexture, 32> character_textures_{};
     std::array<CharacterAnimation, 32> character_animations_{};
     std::array<bool, 32> character_staged_{};
+    // CharStruct[i].cut_mode, driven by AVG_ControlChar.  A settled
+    // character is normally *baked into the background bitmap* rather than
+    // drawn as a layer: mode 0 means "bake me next frame", 1 means "I am in
+    // the bitmap, do not draw me", 2 means "draw me live".  Only a shake
+    // sets 2, which is why a character stops being part of the background
+    // for the duration of one.
+    //
+    // Modelling this rather than always drawing characters as a layer is
+    // what makes the derived bitmaps come out right without special cases:
+    // the half tone is a copy of the background *after* baking, so it
+    // contains the characters, and a background transform moves them because
+    // they are the background.
+    enum class CutMode { bake = 0, baked = 1, live = 2 };
+    std::array<CutMode, 32> character_cut_mode_{};
+    // BMP_BACK: the background with the baked characters in it.  background_
+    // is BMP_BACK2, the clean copy taken before any of them were added, and
+    // is what this is rebuilt from.
+    Texture background_baked_;
+    bool background_baked_dirty_ = true;
+    void rebuild_baked_background();
+    // Draws one character, either onto the scene or into the baked bitmap.
+    // False when there was nothing to draw - the texture has not loaded yet -
+    // so a bake can tell the difference between "in the bitmap" and "never
+    // made it in", which is otherwise a character that disappears for good.
+    bool draw_character(const th2::CharacterState& character,
+                        const ShakeSample& shake, bool shake_characters);
     std::array<bool, 32> character_pending_removal_{};
     th2::AudioChannel bgm_;
     int bgm_track_ = -1;
@@ -680,6 +709,12 @@ private:
     // Set while a character animation has the message window hidden.
     bool message_restore_after_animation_ = false;
     float half_tone_count_ = 0.0f;
+    // AVG_SetHalfTone() is called when a message is set, not every frame the
+    // message happens to be up - so the wash is armed by a line arriving and
+    // stays off until one does.  A transition disarms it: the engine hands
+    // GRP_BACK+1, the graph the darkened copy lives in, to the outgoing
+    // background for the duration, and resets it when the wipe ends.
+    bool half_tone_armed_ = false;
     bool half_tone_fading_ = false;
     std::chrono::steady_clock::time_point half_tone_updated_{};
     std::array<float, 3> background_brightness_{128.0f, 128.0f, 128.0f};
@@ -1296,6 +1331,10 @@ private:
     static constexpr float half_tone_steps = 16.0f;
     float half_tone_pulse() const;
     void raise_half_tone();
+    // AVG_ResetHalfTone(): the wash goes away outright.  Setting a character
+    // does this, which is what keeps BMP_BACKHALF from ever being a copy of
+    // a plate that has since changed.
+    void reset_half_tone();
     void update_half_tone();
     bool handle_message_scroll_press(float x, float y);
     void set_message_scroll_from_y(float y);
@@ -1316,12 +1355,67 @@ private:
     // Hides the message window for a character animation, remembering to
     // put it back when the animation ends.
     void hide_message_for_animation();
+    // AVG_ControlBackFade() is DSP_SetGraphBright() on the background and on
+    // every script bitmap - a property of each object, not a wash over the
+    // screen.  Applied per texture it follows whatever transform that object
+    // has and respects its alpha, so a faded scene cannot tint the black
+    // behind a shaken background or the transparent parts of an overlay.
+    //
+    // Returns how much has to be added back on a second pass: colour
+    // modulation can only darken, and the fade also brightens.
+    Uint8 apply_background_fade(SDL_Texture* texture,
+                                float extra = 1.0f) const;
+    // What the half tone multiplies the picture by while the message window
+    // is up: BackStruct.r * Avg.half_tone / 128, ramped over the sixteen
+    // steps of TONE_FADEOUT.  One, when there is no wash.
+    //
+    // It is a property of the picture, not a sheet laid over the scene.  The
+    // original builds BMP_BACKHALF by copying BMP_BACK at this factor and
+    // displays that instead - and since AVG_SetBackChar composites the
+    // characters into BMP_BACK first, they are inside the copy and darken
+    // with it.  Overlays are GRP_SCRIPT objects, never in that bitmap, so
+    // they keep full brightness.
+    float half_tone_factor() const;
+    // True once TONE_FADEOUT has run its sixteen steps and the engine swaps
+    // GRP_BACK off for GRP_BACK+1.  Before that it dims GRP_BACK in place
+    // with DSP_SetGraphBright and the copy is not shown at all.
+    bool half_tone_settled() const;
+    // BMP_BACKHALF: the background copied at the half-tone factor and shown
+    // *instead of* the background, not over it.  Being an opaque layer at
+    // LAY_BACK+2 it also hides anything at layers 1 and 2, which a
+    // modulation on the background alone cannot do.
+    //
+    // Built once, where AVG_SetHalfTone() builds it - the TONE_NODISP branch,
+    // when the wash appears from nothing.  Called again while the ramp is
+    // running it only switches the copy on; it does not copy again.  So the
+    // copy is of the background as it was when the line arrived, and a
+    // background that changes underneath it without a new message is not
+    // reflected.  That is the engine's behaviour, not an oversight here.
+    void build_half_tone_background();
+    SDL_Texture* half_tone_background() const;
+    Texture half_tone_background_;
+    // The full darkness the copy is made at: half_tone/128, with no ramp.
+    // The ramp is done live on the background instead, which is why the two
+    // are separate.
+    float half_tone_target_factor() const;
+    void finish_background_fade(SDL_Texture* texture, Uint8 brighten,
+                                const SDL_FRect* source,
+                                const SDL_FRect* destination, double angle,
+                                SDL_FlipMode flip);
     void ensure_shake_target();
-    // A single black pixel, stretched to stand in for a rotated fill: SDL can
-    // rotate a texture but not a filled rectangle, and the half tone has to
-    // take the same rotation the background does.
-    void ensure_wash_texture();
-    Texture wash_texture_;
+    // The engine never clears its framebuffer, so whatever a transform fails
+    // to cover keeps the pixels from the frame before.  That is visible in
+    // the original - the corners a rotation leaves behind hold the previous
+    // picture - so it is reproduced rather than papered over with black.
+    //
+    // Done as an explicit copy rather than by simply not clearing: a render
+    // target surviving between frames is not contractual, and an FBO
+    // attachment can be invalidated on the web build.  Both blits stay on
+    // the GPU; there is no readback.
+    void ensure_previous_frame();
+    void capture_previous_frame(SDL_Texture* art_target);
+    Texture previous_frame_;
+    bool previous_frame_valid_ = false;
     // Cross-dissolves two character poses through a scratch target, the way
     // the original blends the pair inside one sprite.  False when the
     // renderer cannot do it, so the caller falls back.
