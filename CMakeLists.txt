@@ -241,6 +241,15 @@ if(BUILD_TESTING AND NOT EMSCRIPTEN)
     target_link_libraries(th2-dsp-test PRIVATE SDL3::SDL3)
     add_test(NAME display-geometry COMMAND th2-dsp-test)
 
+    add_executable(th2-avg-char-test
+        src/avg_char_test.cpp
+        src/avg_char.cpp
+        src/dsp.cpp
+        src/texture.cpp
+    )
+    target_link_libraries(th2-avg-char-test PRIVATE SDL3::SDL3)
+    add_test(NAME character-machine COMMAND th2-avg-char-test)
+
     add_executable(th2-lzs-test
         src/lzs_test.cpp
         src/image.cpp
@@ -337,6 +346,7 @@ if(ANDROID)
         src/game_support.cpp
         src/texture.cpp
         src/dsp.cpp
+        src/avg_char.cpp
         src/game_title_draw.cpp
         src/icon.cpp
         src/image.cpp
@@ -371,6 +381,7 @@ else()
         src/game_support.cpp
         src/texture.cpp
         src/dsp.cpp
+        src/avg_char.cpp
         src/game_title_draw.cpp
         src/icon.cpp
         src/image.cpp

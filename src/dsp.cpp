@@ -61,7 +61,12 @@ Uint8 fold_bright(int own, int global, bool brt_flag)
 
 int draw_alpha_of(std::uint32_t param)
 {
-    return draw_mode_of(param) == drw_bld ? draw_param_of(param) : 256;
+    const std::uint32_t mode = draw_mode_of(param);
+    if (mode == drw_bld || mode == drw_ami
+        || (mode >= drw_lcf && mode < drw_dio + 3)) {
+        return draw_param_of(param);
+    }
+    return 256;
 }
 
 SDL_BlendMode blend_of(std::uint32_t param)

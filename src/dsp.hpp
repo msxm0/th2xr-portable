@@ -200,10 +200,31 @@ enum : std::uint32_t {
     drw_bom = 0x10,
     drw_gnm = 0x11,
     drw_flt = 0x12,
+    drw_rpl = 0x13,
+    drw_rp2 = 0x14,
+    drw_rp3 = 0x15,
+    drw_sui = 0x16,
+    drw_sbl = 0x17,
+    drw_wav = 0x18,
+    drw_wbl = 0x19,
+    drw_lst = 0x1a,
+    drw_lbl = 0x1b,
+    drw_wap = 0x1c,
+    // The pattern wipes.  Each is a base plus a direction (UP 0, DO 1,
+    // RI 2, LE 3, CE 4, OU 5) with the rate in the high half.
+    drw_lcf = 29,
+    drw_lpp = drw_lcf + 6,
+    drw_dia = drw_lpp + 6,
+    drw_dio = drw_dia + 3,
 };
 
-// DRW_BLD(0..256) is the only one that carries an alpha; everything else
-// draws solid.  Returns 256 when the mode has no alpha of its own.
+// Directions for the pattern wipes.
+enum { dir_up = 0, dir_do = 1, dir_ri = 2, dir_le = 3, dir_ce = 4, dir_ou = 5 };
+
+// The rate carried in the high half, as an alpha.  DRW_BLD means it
+// exactly; AMI's dither mesh and the LCF/LPP/DIA/DIO pattern wipes carry a
+// 0..256 rate in the same place and are approximated by it, since none of
+// them has an SDL equivalent.  Returns 256 for a mode that draws solid.
 int draw_alpha_of(std::uint32_t param);
 
 // The SDL blend mode standing in for a DRW_ selector.  Modes with no SDL
