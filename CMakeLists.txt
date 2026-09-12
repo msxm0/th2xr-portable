@@ -233,6 +233,14 @@ add_custom_target(th2-conformance ALL
 endif()
 
 if(BUILD_TESTING AND NOT EMSCRIPTEN)
+    add_executable(th2-dsp-test
+        src/dsp_test.cpp
+        src/dsp.cpp
+        src/texture.cpp
+    )
+    target_link_libraries(th2-dsp-test PRIVATE SDL3::SDL3)
+    add_test(NAME display-geometry COMMAND th2-dsp-test)
+
     add_executable(th2-lzs-test
         src/lzs_test.cpp
         src/image.cpp
@@ -327,6 +335,8 @@ if(ANDROID)
         src/game_save_ui.cpp
         src/game_state.cpp
         src/game_support.cpp
+        src/texture.cpp
+        src/dsp.cpp
         src/game_title_draw.cpp
         src/icon.cpp
         src/image.cpp
@@ -359,6 +369,8 @@ else()
         src/game_save_ui.cpp
         src/game_state.cpp
         src/game_support.cpp
+        src/texture.cpp
+        src/dsp.cpp
         src/game_title_draw.cpp
         src/icon.cpp
         src/image.cpp

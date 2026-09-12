@@ -7,6 +7,7 @@
 #include "asset_plan.hpp"
 #include "frame_budget.hpp"
 #include "image.hpp"
+#include "texture.hpp"
 #include "gl_transition.hpp"
 #include "gamepad_input.hpp"
 #include "imgui_layer.hpp"
@@ -48,26 +49,6 @@ extern bool force_cpu_transitions;
 // --trace-prefetch: report what the lookahead guessed against what was used.
 extern bool trace_prefetch;
 
-struct TextureDeleter {
-    void operator()(SDL_Texture* texture) const;
-};
-using Texture = std::unique_ptr<SDL_Texture, TextureDeleter>;
-struct SurfaceDeleter {
-    void operator()(SDL_Surface* surface) const;
-};
-using Surface = std::unique_ptr<SDL_Surface, SurfaceDeleter>;
-struct WindowDeleter {
-    void operator()(SDL_Window* window) const;
-};
-struct RendererDeleter {
-    void operator()(SDL_Renderer* renderer) const;
-};
-struct IoDeleter {
-    void operator()(SDL_IOStream* stream) const;
-};
-using WindowPtr = std::unique_ptr<SDL_Window, WindowDeleter>;
-using RendererPtr = std::unique_ptr<SDL_Renderer, RendererDeleter>;
-using IoPtr = std::unique_ptr<SDL_IOStream, IoDeleter>;
 std::filesystem::path writable_directory();
 std::filesystem::path profile_directory();
 std::optional<std::filesystem::path> discover_game_data_path(

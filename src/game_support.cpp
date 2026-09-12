@@ -16,16 +16,6 @@
 
 namespace th2app {
 
-void TextureDeleter::operator()(SDL_Texture* texture) const { SDL_DestroyTexture(texture); }
-void SurfaceDeleter::operator()(SDL_Surface* surface) const { SDL_DestroySurface(surface); }
-void WindowDeleter::operator()(SDL_Window* window) const { SDL_DestroyWindow(window); }
-void RendererDeleter::operator()(SDL_Renderer* renderer) const { SDL_DestroyRenderer(renderer); }
-void IoDeleter::operator()(SDL_IOStream* stream) const
-{
-    if (stream) {
-        SDL_CloseIO(stream);
-    }
-}
 
 // Directory for writable files (config, saves, logs). On Android the current
 // working directory is not writable, so use the app-internal storage path.
