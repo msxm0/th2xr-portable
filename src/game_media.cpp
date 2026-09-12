@@ -298,8 +298,19 @@ void Game::set_character(const th2::Event& event)
 std::shared_ptr<th2::AudioDecoder> Game::ready_audio_decoder(
     const th2::Archive& archive, std::string_view name)
 {
-    // Depth zero: it is being played now, so nothing outranks it.
-    auto decoder = audio_decoder(archive, name, 0);
+    // Not kept.  A track being played now is not a prediction, and the cache
+    // it would go into is governed entirely by the explorer: entries live by
+    // being named again on each scan, and the instruction that started this
+    // one is behind the interpreter, so it can never be named again.  It
+    // would be stamped with the current generation, fall behind on the very
+    // next scan, and become the first thing evicted - while playing.  Worse,
+    // a track the explorer missed altogether, which is exactly why this path
+    // had to read it, would take a slot from one the explorer got right.
+    //
+    // The channel holds the decoder for as long as it plays, so nothing is
+    // lost by leaving it out; the cost is a re-decode if the same sound is
+    // played again after the channel lets go.
+    auto decoder = audio_decoder(archive, name, 0, false);
     if (!decoder->done()) {
         decoder->decode(std::chrono::milliseconds(3));
     }
@@ -307,7 +318,7 @@ std::shared_ptr<th2::AudioDecoder> Game::ready_audio_decoder(
 }
 
 std::shared_ptr<th2::AudioDecoder> Game::audio_decoder(
-    const th2::Archive& archive, std::string_view name, int rank)
+    const th2::Archive& archive, std::string_view name, int rank, bool keep)
 {
     std::string key(name);
     if (auto* held = audio_decoders_.find(key)) {
@@ -317,12 +328,28 @@ std::shared_ptr<th2::AudioDecoder> Game::audio_decoder(
     if (!entry) {
         throw std::runtime_error("audio not found: " + key);
     }
-    auto decoder = std::make_shared<th2::AudioDecoder>(archive.read(*entry));
-    // Held only if there is room for it.  A decoder the cache refuses still
-    // works - the caller keeps the shared_ptr - it simply will not be found
-    // again, which for read-ahead means it is decoded when it is played
-    // instead of before.
-    audio_decoders_.insert(key, decoder, scan_generation_, rank);
+    if (!keep) {
+        note_asset_use(key);
+    }
+    // Blocking on a whole track freezes everything - the read suspends the
+    // wasm stack, so nothing draws until it lands.  Take the first 64KB
+    // instead, which is about two and a half seconds of Vorbis and one round
+    // trip, and collect the rest while it plays.  read_head() falls back to
+    // the whole entry when splitting would not pay.
+    auto split = archive.read_head(*entry, audio_head_bytes);
+    auto decoder = std::make_shared<th2::AudioDecoder>(
+        std::move(split.bytes), split.ready);
+    if (decoder->awaiting_rest()) {
+        pending_audio_rest_.push_back(
+            PendingAudioRest{&archive, entry, decoder, split.ready});
+    }
+    // Held only if this is read-ahead, and then only if there is room.  A
+    // decoder the cache refuses still works - the caller keeps the
+    // shared_ptr - it simply will not be found again, which for read-ahead
+    // means it is decoded when it is played instead of before.
+    if (keep) {
+        audio_decoders_.insert(key, decoder, scan_generation_, rank);
+    }
     return decoder;
 }
 
@@ -330,8 +357,35 @@ std::shared_ptr<th2::AudioDecoder> Game::audio_decoder(
 // is already finished; when it is not, this pays a few milliseconds to get a
 // buffer in front of the device rather than the whole track at once.
 
+void Game::collect_audio_rests()
+{
+    for (auto at = pending_audio_rest_.begin();
+         at != pending_audio_rest_.end();) {
+        auto decoder = at->decoder.lock();
+        if (!decoder || !decoder->awaiting_rest()) {
+            at = pending_audio_rest_.erase(at);
+            continue;
+        }
+        if (!at->archive->resident_rest(*at->entry, at->ready)) {
+            ++at;  // Still on the wire; nothing here blocks on it.
+            continue;
+        }
+        // Resident, so this is a copy rather than a wait - the whole point
+        // is that the frame never blocks a second time.
+        try {
+            at->archive->read_rest_into(
+                *at->entry, at->ready, decoder->rest_buffer());
+            decoder->supply_rest();
+        } catch (const std::exception& error) {
+            SDL_Log("audio tail failed: %s", error.what());
+        }
+        at = pending_audio_rest_.erase(at);
+    }
+}
+
 void Game::update_audio_decode()
 {
+    collect_audio_rests();
     // Drawn from the frame's shared allowance rather than a private two
     // milliseconds, so decoding ahead cannot pile on top of a picture being
     // decoded ahead and hand the frame more than either of them intended.
@@ -415,8 +469,11 @@ void Game::update_audio_decode()
                 }
             }
             auto decoder = background_budget_.spend([&] {
+                // Read-ahead: this one does belong in the cache the
+                // explorer governs, because the explorer is what named
+                // it and what will keep naming it while it stays ahead.
                 return audio_decoder(
-                    *request.archive, request.name, request.rank);
+                    *request.archive, request.name, request.rank, true);
             });
             // Two seconds, not the whole file.  Read-ahead exists so
             // playback can start instantly and stay ahead through the frames
@@ -761,6 +818,18 @@ std::optional<std::size_t> Game::overlay_index(int requested) const
     return static_cast<std::size_t>(requested);
 }
 
+bool Game::note_asset_use(const std::string& key)
+{
+    const auto found = named_recently_.find(key);
+    const bool predicted = found != named_recently_.end()
+        && scan_generation_ - found->second <= named_recently_generations;
+    if (!predicted && th2app::trace_prefetch) {
+        ++trace_.unpredicted_uses;
+        SDL_Log("unpredicted: %s", key.c_str());
+    }
+    return !predicted;
+}
+
 void Game::report_prefetch_trace()
 {
     if (!th2app::trace_prefetch) {
@@ -772,15 +841,25 @@ void Game::report_prefetch_trace()
         return;
     }
     last_trace_report_ = now;
-    SDL_Log("prefetch: audio created %d (of which %d were decoded before and "
-            "dropped), evicted %d (%d never finished decoding); cache %zuMB "
-            "largest clip %zuMB; images queued %d decoded %d used %d "
-            "evicted-unused %d",
-            trace_.audio_created, trace_.audio_recreated, trace_.audio_evicted,
-            trace_.audio_evicted_undecoded,
-            trace_.audio_cache_bytes >> 20, trace_.largest_clip_bytes >> 20,
+    SDL_Log("prefetch: audio created %d (%d of them a second time); "
+            "images queued %d decoded %d used %d evicted-unused %d; "
+            "held: %zu audio, %zu images",
+            trace_.audio_created, trace_.audio_recreated,
             trace_.image_queued, trace_.image_decoded, trace_.image_used,
-            trace_.image_evicted_unused);
+            trace_.image_evicted_unused,
+            audio_decoders_.size(), decoded_images_.size());
+    const auto& reads = th2::data_cache_stats();
+    SDL_Log("reads: %llu total = pinned %llu + lru %llu (+%llu assembled) + "
+            "store %llu + BLOCKED %llu (%lluKB); scan named %zu assets, "
+            "%d unpredicted uses",
+            static_cast<unsigned long long>(reads.reads),
+            static_cast<unsigned long long>(reads.pinned_hits),
+            static_cast<unsigned long long>(reads.lru_exact),
+            static_cast<unsigned long long>(reads.lru_assembled),
+            static_cast<unsigned long long>(reads.store_hits),
+            static_cast<unsigned long long>(reads.blocking),
+            static_cast<unsigned long long>(reads.blocking_bytes >> 10),
+            plan_.size(), trace_.unpredicted_uses);
 }
 
 void Game::update_image_decode()
@@ -910,6 +989,7 @@ Surface Game::take_predecoded_image(bool background, std::string_view name)
     const auto key =
         std::string(background ? "bak:" : "grp:") + std::string(name);
     if (!decoded_images_.contains(key)) {
+        note_asset_use(key);
         return {};
     }
     if (th2app::trace_prefetch) {

@@ -287,6 +287,17 @@ Texture load_toned_texture(
     // pixel - and it is what lands on the frame where the scene changes.  A
     // caller that decoded it earlier hands the surface in; the tone curves
     // below rewrite it, so what arrives must already be a private copy.
+    if (!predecoded && th2app::trace_prefetch) {
+        // Not decoded ahead.  Whether that also means a wait depends on
+        // whether the bytes arrived, which is the distinction worth logging:
+        // a decode we did not do in advance is cheap, a read we did not
+        // fetch in advance stalls the frame.
+        const auto* entry = image_archive.find(image_name);
+        SDL_Log("image not predecoded: %.*s%s",
+                static_cast<int>(image_name.size()), image_name.data(),
+                (entry && !image_archive.resident(*entry))
+                    ? "  AND NOT FETCHED" : "");
+    }
     Surface surface = predecoded
         ? std::move(predecoded)
         : decode_image(image_archive, image_name);

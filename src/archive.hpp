@@ -108,6 +108,29 @@ public:
         std::size_t size = 0;
     };
     Range range_of(const ArchiveEntry& entry) const;
+
+    // An entry read in two pieces, for a caller that can start on the
+    // beginning of a file and does not want to wait for the rest.
+    //
+    // Only for entries stored uncompressed - the audio archives, where a
+    // byte range is the .OGG itself, so a prefix of the range is a prefix of
+    // the file.  A compressed entry's head is a prefix of the LZS stream and
+    // means nothing on its own.
+    struct SplitRead {
+        std::vector<std::uint8_t> bytes;  // sized whole, filled to `ready`
+        std::size_t ready = 0;
+    };
+    // Blocks only for the first `head` bytes, and asks for the rest in the
+    // background.  `ready` comes back as the whole size when the entry was
+    // too small to be worth splitting or is compressed, in which case there
+    // is nothing left to collect.
+    SplitRead read_head(const ArchiveEntry& entry, std::size_t head) const;
+    // Fills `destination` with everything from `ready` to the end of the
+    // entry.  Blocks if that has not arrived; resident_rest() says whether
+    // it would, and the caller is expected to ask first.
+    void read_rest_into(const ArchiveEntry& entry, std::size_t ready,
+                        std::span<std::uint8_t> destination) const;
+    bool resident_rest(const ArchiveEntry& entry, std::size_t ready) const;
     // True when read() would not have to go to the network for this entry.
     bool resident(const ArchiveEntry& entry) const;
 

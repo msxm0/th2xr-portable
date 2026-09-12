@@ -73,6 +73,20 @@ bool data_is_resident(
     const std::filesystem::path& path, std::uint64_t offset,
     std::size_t size);
 
+// How the reads that have happened were answered.  Kept so a run can say
+// whether the prefetcher is covering what the script actually asks for, as
+// opposed to how much it fetched.
+struct DataCacheStats {
+    std::uint64_t reads = 0;
+    std::uint64_t pinned_hits = 0;
+    std::uint64_t lru_exact = 0;
+    std::uint64_t lru_assembled = 0;  // served from other ranges' bytes
+    std::uint64_t store_hits = 0;
+    std::uint64_t blocking = 0;       // nobody had it; the frame waited
+    std::uint64_t blocking_bytes = 0;
+};
+DataCacheStats& data_cache_stats();
+
 // Reads a whole (small) file; empty when it cannot be read.
 std::vector<std::uint8_t> read_data_file(const std::filesystem::path& path);
 

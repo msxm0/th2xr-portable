@@ -8,7 +8,6 @@
 #include <string>
 #include <unordered_map>
 #include <limits>
-#include <unordered_set>
 #else
 #include <fstream>
 #include <iterator>
@@ -113,25 +112,120 @@ EM_JS(void, th2InitPrefetchStore, (), {
                 store.queue.splice(queued, 1);
             }
             if (entry.abort && !entry.body) {
-                // Still on the wire and nobody wants it any more.
-                try {
-                    entry.abort.abort();
-                } catch (error) {
-                    // An abort that cannot be delivered is not worth failing
-                    // the eviction for.
+                // Still on the wire and nobody wants it any more - but a run
+                // shares one request, so it only dies once every range in it
+                // has been let go.  Cancelling on the first would throw away
+                // bytes the others are still waiting for.
+                const run = entry.run || [entry];
+                const wanted = run.some((member) => store.entries.has(
+                    member.path + ":" + member.offset + ":" + member.size));
+                if (!wanted) {
+                    try {
+                        entry.abort.abort();
+                    } catch (error) {
+                        // An abort that cannot be delivered is not worth
+                        // failing the eviction for.
+                    }
                 }
             }
         };
-        store.begin = (entry) => {
-            entry.started = true;
-            store.active++;
-            entry.abort = typeof AbortController === "function"
+        // One request for a run of ranges that touch.  A scene's voice lines
+        // sit next to each other in the archive in script order, so the walk
+        // names forty-odd ranges that are one contiguous stretch of bytes and
+        // the store asked for each of them separately.  Measured over a
+        // 5000-advance run: 1713 requests where 306 would do, voice.pak alone
+        // 1321 where 111 would do.  Each of those is a fetch, a Response, an
+        // ArrayBuffer and a copy, and the frame-drop bursts line up with them.
+        //
+        // Only ranges that actually touch are joined.  Allowing a gap would
+        // fold the 111 down to 23, but the bytes in the gaps belong to lines
+        // the walk did not name, and they would be fetched and thrown away.
+        store.joinSlack = 0;
+        // No single request larger than this, however long the run is: one
+        // huge fetch would hold a slot for its whole duration and delay
+        // everything behind it.
+        store.joinLimit = 8 << 20;
+
+        // Takes the queued, unstarted neighbours of `lead` that continue its
+        // stretch of the file, in both directions, and removes them from the
+        // queue.  Returns the run in offset order, `lead` always included.
+        store.collect = (lead) => {
+            const near = [lead];
+            for (const other of store.queue) {
+                if (other.started || other.path !== lead.path) {
+                    continue;
+                }
+                near.push(other);
+            }
+            if (near.length === 1) {
+                return near;
+            }
+            near.sort((a, b) => a.offset - b.offset);
+            const at = near.indexOf(lead);
+            const run = [lead];
+            let first = lead.offset;
+            let last = lead.offset + lead.size;
+            for (let i = at + 1; i < near.length; ++i) {
+                const next = near[i];
+                if (next.offset - last > store.joinSlack) {
+                    break;
+                }
+                const end = Math.max(last, next.offset + next.size);
+                if (end - first > store.joinLimit) {
+                    break;
+                }
+                last = end;
+                run.push(next);
+            }
+            for (let i = at - 1; i >= 0; --i) {
+                const prev = near[i];
+                const end = prev.offset + prev.size;
+                if (first - end > store.joinSlack) {
+                    break;
+                }
+                if (last - Math.min(first, prev.offset) > store.joinLimit) {
+                    break;
+                }
+                first = Math.min(first, prev.offset);
+                run.unshift(prev);
+            }
+            for (const entry of run) {
+                if (entry === lead) {
+                    continue;
+                }
+                const queued = store.queue.indexOf(entry);
+                if (queued >= 0) {
+                    store.queue.splice(queued, 1);
+                }
+            }
+            return run;
+        };
+
+        store.begin = (run) => {
+            const entries = Array.isArray(run) ? run : [run];
+            const lead = entries[0];
+            let first = lead.offset;
+            let last = lead.offset + lead.size;
+            for (const entry of entries) {
+                first = Math.min(first, entry.offset);
+                last = Math.max(last, entry.offset + entry.size);
+            }
+            const span = last - first;
+            const abort = typeof AbortController === "function"
                 ? new AbortController() : null;
-            const last = entry.offset + entry.size - 1;
-            fetch(entry.path, {
-                headers: {Range: `bytes=${entry.offset}-${last}`},
+            for (const entry of entries) {
+                entry.started = true;
+                entry.abort = abort;
+                // Releasing one member of a run must not cancel the bytes
+                // the others are still waiting on, so the request is only
+                // aborted once every member has let go.
+                entry.run = entries;
+            }
+            store.active++;
+            fetch(lead.path, {
+                headers: {Range: `bytes=${first}-${last - 1}`},
                 priority: "low",
-                signal: entry.abort ? entry.abort.signal : undefined,
+                signal: abort ? abort.signal : undefined,
             })
                 .then(async (response) => {
                     if (!response.ok) {
@@ -140,27 +234,38 @@ EM_JS(void, th2InitPrefetchStore, (), {
                     if (response.status !== 206) {
                         const length =
                             Number(response.headers.get("Content-Length"));
-                        if (length && length !== entry.size) {
+                        if (length && length !== span) {
                             return null;
                         }
                     }
                     const body = new Uint8Array(await response.arrayBuffer());
-                    if (body.length !== entry.size) {
+                    if (body.length !== span) {
                         return null;
                     }
-                    entry.body = body;
                     return body;
                 })
                 .catch(() => null)
                 .then((body) => {
                     store.active--;
-                    if (!body) {
-                        // Failed, or aborted because the range left the
-                        // graph.  Either way the space set aside for it goes
-                        // back, or the budget would shrink with every miss.
-                        store.release(entry);
+                    for (const entry of entries) {
+                        // Each range keeps a view on the one arrival rather
+                        // than a copy of it: the slices do not overlap, and
+                        // take_prefetched copies out of them anyway.
+                        const slice = body
+                            ? body.subarray(entry.offset - first,
+                                            entry.offset - first + entry.size)
+                            : null;
+                        if (slice) {
+                            entry.body = slice;
+                        } else {
+                            // Failed, or aborted because the range left the
+                            // graph.  Either way the space set aside for it
+                            // goes back, or the budget would shrink with
+                            // every miss.
+                            store.release(entry);
+                        }
+                        entry.settle(slice);
                     }
-                    entry.settle(body);
                     store.pump();
                 });
         };
@@ -194,7 +299,10 @@ EM_JS(void, th2InitPrefetchStore, (), {
             while (store.active < store.limit && store.queue.length
                    && store.issuedThisFrame < store.perFrameLimit) {
                 store.issuedThisFrame++;
-                store.begin(store.queue.shift());
+                // One issue covers the whole contiguous run, so the
+                // per-frame cap counts requests rather than ranges - which
+                // is what it was always meant to bound.
+                store.begin(store.collect(store.queue.shift()));
             }
         };
         // A hidden tab stops painting, and stops prefetching with it; a read
@@ -255,7 +363,10 @@ EM_JS(void, th2InitPrefetchStore, (), {
             if (at >= 0) {
                 store.queue.splice(at, 1);
             }
-            store.begin(entry);
+            // Alone, not as a run: the engine is blocked on this one range,
+            // and joining it to neighbours would make it wait for bytes
+            // nobody is asking for yet.
+            store.begin([entry]);
         };
         Module.th2Prefetch = store;
 });
@@ -403,11 +514,13 @@ EM_ASYNC_JS(int, take_prefetched,
     let entry = store.entries.get(path + ":" + offset + ":" + size);
     let start = 0;
     if (!entry) {
-        // No exact match: a kept chunk that spans this range serves it just
-        // as well, which is how one request covers a whole archive
-        // directory.
+        // No entry of exactly this shape.  Any single one that spans the
+        // request serves it just as well - which is how one request covers a
+        // whole archive directory, and how a track fetched whole answers a
+        // read of its first 64KB.  An entry still in flight counts: waiting
+        // on a request already going is cheaper than opening another.
         for (const candidate of store.entries.values()) {
-            if (candidate.keep && candidate.path === path
+            if (candidate.path === path
                 && candidate.offset <= offset
                 && candidate.offset + candidate.size >= offset + size) {
                 entry = candidate;
@@ -417,7 +530,48 @@ EM_ASYNC_JS(int, take_prefetched,
         }
     }
     if (!entry) {
-        return 0;
+        // Still nothing whole, but the bytes may be spread over several
+        // arrived ranges - the two halves of a split read, or neighbours
+        // from a coalesced run that were admitted separately.  Only ranges
+        // that have landed can contribute: stitching would otherwise mean
+        // waiting on several requests at once, and a single fresh fetch
+        // beats that.
+        const pieces = [];
+        for (const candidate of store.entries.values()) {
+            if (candidate.path === path && candidate.body
+                && candidate.offset < offset + size
+                && candidate.offset + candidate.size > offset) {
+                pieces.push(candidate);
+            }
+        }
+        pieces.sort((a, b) => a.offset - b.offset);
+        let at = offset;
+        const used = [];
+        for (const piece of pieces) {
+            if (piece.offset > at) {
+                break;  // A hole; the rest cannot help.
+            }
+            if (piece.offset + piece.size <= at) {
+                continue;  // Entirely behind what is already covered.
+            }
+            used.push(piece);
+            at = piece.offset + piece.size;
+            if (at >= offset + size) {
+                break;
+            }
+        }
+        if (at < offset + size) {
+            return 0;
+        }
+        let filled = 0;
+        for (const piece of used) {
+            const from = (offset + filled) - piece.offset;
+            const count = Math.min(piece.size - from, size - filled);
+            HEAPU8.set(piece.body.subarray(from, from + count),
+                       destination + filled);
+            filled += count;
+        }
+        return 1;
     }
     if (!entry.body) {
         store.promote(entry);
@@ -447,10 +601,30 @@ EM_JS(int, prefetch_pending, (const char* url, double offset, double size), {
     if (store.entries.has(path + ":" + offset + ":" + size)) {
         return 1;
     }
+    // Must agree with take_prefetched, or a caller that asks first and reads
+    // second gets a different answer than the read would have given.
+    const pieces = [];
     for (const candidate of store.entries.values()) {
-        if (candidate.keep && candidate.path === path
-            && candidate.offset <= offset
+        if (candidate.path !== path) {
+            continue;
+        }
+        if (candidate.offset <= offset
             && candidate.offset + candidate.size >= offset + size) {
+            return 1;
+        }
+        if (candidate.body && candidate.offset < offset + size
+            && candidate.offset + candidate.size > offset) {
+            pieces.push(candidate);
+        }
+    }
+    pieces.sort((a, b) => a.offset - b.offset);
+    let at = offset;
+    for (const piece of pieces) {
+        if (piece.offset > at) {
+            break;
+        }
+        at = Math.max(at, piece.offset + piece.size);
+        if (at >= offset + size) {
             return 1;
         }
     }
@@ -476,8 +650,14 @@ constexpr std::uint64_t pinned_file_limit = 16ull << 20;
 // Larger archives keep an LRU of the ranges already read, so a background or
 // CG that comes back on screen does not go to the network again.  Single
 // reads above the entry limit (movies) bypass it rather than evict it.
+//
+// The entry limit is set above the largest thing worth caching rather than at
+// a round number: BGM tracks run to 6.3MB, and at the old 4MB the longest of
+// them were fetched, played and forgotten, so every replay went back to the
+// network.  Movies are the case it exists for, and those are hundreds of
+// megabytes - nowhere near this.
 constexpr std::size_t range_cache_budget = 64ull << 20;
-constexpr std::size_t range_cache_entry_limit = 4ull << 20;
+constexpr std::size_t range_cache_entry_limit = 32ull << 20;
 
 std::unordered_map<std::string, std::vector<std::uint8_t>>& pinned_files()
 {
@@ -487,8 +667,36 @@ std::unordered_map<std::string, std::vector<std::uint8_t>>& pinned_files()
 
 struct RangeEntry {
     std::string key;
+    // The extent, kept alongside the key rather than parsed back out of it:
+    // serving a read from bytes that were fetched under some other range
+    // means comparing extents on every candidate.
+    std::string path;
+    std::uint64_t offset = 0;
     std::vector<std::uint8_t> bytes;
+
+    std::uint64_t end() const { return offset + bytes.size(); }
 };
+
+// Copies whatever part of [offset, offset+destination.size()) this entry
+// holds, and returns how far the request is now satisfied from its start.
+// Zero when the entry does not reach the wanted bytes at all.
+std::size_t take_from(
+    const RangeEntry& entry, const std::string& path, std::uint64_t offset,
+    std::span<std::uint8_t> destination, std::size_t filled)
+{
+    if (entry.path != path) {
+        return filled;
+    }
+    const std::uint64_t want_at = offset + filled;
+    if (entry.offset > want_at || entry.end() <= want_at) {
+        return filled;
+    }
+    const auto from = static_cast<std::size_t>(want_at - entry.offset);
+    const auto count = std::min(
+        entry.bytes.size() - from, destination.size() - filled);
+    std::memcpy(destination.data() + filled, entry.bytes.data() + from, count);
+    return filled + count;
+}
 
 std::list<RangeEntry>& range_cache()
 {
@@ -502,14 +710,6 @@ range_index()
     static std::unordered_map<std::string, std::list<RangeEntry>::iterator>
         index;
     return index;
-}
-
-// Ranges already asked for.  Checking this in C++ keeps data_is_resident()
-// off the JS side, which the lookahead calls dozens of times per scan.
-std::unordered_set<std::string>& requested_ranges()
-{
-    static std::unordered_set<std::string> keys;
-    return keys;
 }
 
 std::size_t& range_cache_bytes()
@@ -535,7 +735,8 @@ std::string data_range_key(
 namespace {
 
 void remember_range(
-    const std::string& key, std::span<const std::uint8_t> bytes)
+    const std::string& key, const std::string& path, std::uint64_t offset,
+    std::span<const std::uint8_t> bytes)
 {
     if (bytes.size() > range_cache_entry_limit) {
         return;  // Movie-sized reads are streamed, not cached.
@@ -552,7 +753,8 @@ void remember_range(
         entries.splice(entries.begin(), entries, found->second);
         return;
     }
-    entries.push_front(RangeEntry{key, {bytes.begin(), bytes.end()}});
+    entries.push_front(
+        RangeEntry{key, path, offset, {bytes.begin(), bytes.end()}});
     index[key] = entries.begin();
     range_cache_bytes() += bytes.size();
     while (range_cache_bytes() > range_cache_budget && !entries.empty()) {
@@ -585,6 +787,47 @@ std::uint64_t data_size(const std::filesystem::path& path)
     return result;
 }
 
+// Fills `destination` from whatever the cache already holds, from as many
+// entries as it takes.  Ranges are asked for in whatever shape the caller
+// wants them - a whole archive entry, the first 64KB of one, the remainder
+// after that - so the bytes for a read are often here under some other
+// range's name.  Matching only the exact extent meant refetching bytes that
+// were already in hand a few entries away.
+//
+// Entries that contribute are moved to the front, because they were used.
+bool serve_from_cache(
+    const std::string& path, std::uint64_t offset,
+    std::span<std::uint8_t> destination)
+{
+    auto& entries = range_cache();
+    std::size_t filled = 0;
+    // Repeated passes: each one takes whatever continues the run, so a read
+    // split across several entries is put back together in whatever order
+    // they happen to sit in the list.
+    bool progressed = true;
+    while (filled < destination.size() && progressed) {
+        progressed = false;
+        for (auto at = entries.begin(); at != entries.end(); ++at) {
+            const auto grown =
+                take_from(*at, path, offset, destination, filled);
+            if (grown == filled) {
+                continue;
+            }
+            filled = grown;
+            entries.splice(entries.begin(), entries, at);
+            progressed = true;
+            break;
+        }
+    }
+    return filled == destination.size();
+}
+
+DataCacheStats& data_cache_stats()
+{
+    static DataCacheStats stats;
+    return stats;
+}
+
 bool data_read(
     const std::filesystem::path& path, std::uint64_t offset,
     std::span<std::uint8_t> destination)
@@ -592,6 +835,8 @@ bool data_read(
     if (destination.empty()) {
         return true;
     }
+    auto& stats = data_cache_stats();
+    ++stats.reads;
     const std::string key = path.string();
 
     if (const auto pinned = pinned_files().find(key);
@@ -602,6 +847,7 @@ bool data_read(
         }
         std::memcpy(
             destination.data(), contents.data() + offset, destination.size());
+        ++stats.pinned_hits;
         return true;
     }
 
@@ -620,6 +866,7 @@ bool data_read(
         }
         std::memcpy(
             destination.data(), stored.data() + offset, destination.size());
+        ++stats.pinned_hits;
         return true;
     }
 
@@ -631,6 +878,13 @@ bool data_read(
         std::memcpy(
             destination.data(), found->second->bytes.data(),
             destination.size());
+        ++stats.lru_exact;
+        return true;
+    }
+    // No entry of exactly this shape, but the bytes may still be here under
+    // one or several others.
+    if (serve_from_cache(key, offset, destination)) {
+        ++stats.lru_assembled;
         return true;
     }
 
@@ -640,17 +894,21 @@ bool data_read(
         key.c_str(), static_cast<double>(offset),
         static_cast<double>(destination.size()), destination.data());
     if (prefetched == 1) {
-        remember_range(cache_key, destination);
+        ++stats.store_hits;
+        remember_range(cache_key, key, offset, destination);
         return true;
     }
 
+    // Nothing had it: the read blocks on the network, and the frame with it.
+    ++stats.blocking;
+    stats.blocking_bytes += destination.size();
     if (fetch_range(
             key.c_str(), static_cast<double>(offset),
             static_cast<double>(destination.size()), destination.data())
         == 0) {
         return false;
     }
-    remember_range(cache_key, destination);
+    remember_range(cache_key, key, offset, destination);
     return true;
 }
 
@@ -741,6 +999,14 @@ std::uint64_t data_size(const std::filesystem::path& path)
     return error ? 0 : size;
 }
 
+DataCacheStats& data_cache_stats()
+{
+    // Native reads come off the disk and never wait on anything, so the
+    // counters exist only to keep the interface the same on both builds.
+    static DataCacheStats stats;
+    return stats;
+}
+
 bool data_read(
     const std::filesystem::path& path, std::uint64_t offset,
     std::span<std::uint8_t> destination)
@@ -748,6 +1014,7 @@ bool data_read(
     if (destination.empty()) {
         return true;
     }
+    ++data_cache_stats().reads;
     std::ifstream input(path, std::ios::binary);
     input.seekg(static_cast<std::streamoff>(offset));
     input.read(

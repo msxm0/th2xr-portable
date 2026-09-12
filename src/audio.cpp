@@ -276,24 +276,40 @@ struct AudioDecoder::State {
 };
 
 AudioDecoder::AudioDecoder(std::vector<std::uint8_t> bytes)
+    : AudioDecoder(std::move(bytes), 0)
+{
+}
+
+AudioDecoder::AudioDecoder(std::vector<std::uint8_t> bytes, std::size_t ready)
     : state_(std::make_unique<State>())
 {
     auto& state = *state_;
     state.bytes = std::move(bytes);
     // State is heap allocated and never moved, so the span stays valid.
     state.input.bytes = state.bytes;
+    ready_ = (ready == 0 || ready > state.bytes.size())
+        ? state.bytes.size() : ready;
+    head_only_ = ready_ < state.bytes.size();
+    // ffmpeg reads the buffer directly and would run off the end of what has
+    // arrived, so a partial start is the browser's alone.  Without it there
+    // is nothing to gain anyway: on a native build the read never blocked.
+#ifndef __EMSCRIPTEN__
+    head_only_ = false;
+    ready_ = state.bytes.size();
+#endif
 
 #ifdef __EMSCRIPTEN__
     // Hand Ogg to the browser, which decodes it off this thread.  Anything
     // else - the WAV effects, or a file it will not take - goes to ffmpeg
     // below, so this is an optimisation rather than a dependency.
-    if (looks_like_ogg(state.bytes)) {
+    if (looks_like_ogg(std::span(state.bytes).first(ready_))) {
         th2_audio_init();
         const int rate = th2_audio_rate();
-        const int channels = ogg_channels(state.bytes);
+        const int channels =
+            ogg_channels(std::span(state.bytes).first(ready_));
         if (rate > 0 && channels > 0) {
             const int handle = th2_audio_start(
-                state.bytes.data(), static_cast<int>(state.bytes.size()));
+                state.bytes.data(), static_cast<int>(ready_));
             if (handle != 0) {
                 state.browser_handle = handle;
                 // The context resamples everything to its own rate on the way
@@ -306,6 +322,64 @@ AudioDecoder::AudioDecoder(std::vector<std::uint8_t> bytes)
     }
 #endif
 
+    if (head_only_) {
+        // The browser would not take it and ffmpeg cannot be given a
+        // truncated file, so there is nothing to start from yet.  The clip
+        // stays empty and supply_rest() opens it properly once the whole
+        // file is here.
+        return;
+    }
+    open_stream();
+}
+
+bool AudioDecoder::awaiting_rest() const
+{
+    return head_only_;
+}
+
+std::span<std::uint8_t> AudioDecoder::rest_buffer()
+{
+    auto& state = *state_;
+    return std::span(state.bytes).subspan(
+        std::min(ready_, state.bytes.size()));
+}
+
+void AudioDecoder::supply_rest()
+{
+    if (!head_only_) {
+        return;
+    }
+    auto& state = *state_;
+    const std::size_t head_samples = clip_.samples.size();
+    ready_ = state.bytes.size();
+    head_only_ = false;
+    state.input.bytes = state.bytes;
+#ifdef __EMSCRIPTEN__
+    if (state.browser_handle != 0) {
+        th2_audio_release(state.browser_handle);
+        state.browser_handle = 0;
+    }
+    if (looks_like_ogg(state.bytes)) {
+        const int handle = th2_audio_start(
+            state.bytes.data(), static_cast<int>(state.bytes.size()));
+        if (handle != 0) {
+            state.browser_handle = handle;
+            // Start the copy where the head stopped rather than at zero.
+            // The two decodes agree sample for sample over the bytes they
+            // share, so what has already been handed to the device stays
+            // correct and none of it is copied twice.
+            const int copied = clip_.channels > 0
+                ? static_cast<int>(head_samples / clip_.channels) : 0;
+            state.browser_frames = 0;
+            state.browser_copied = copied;
+            done_ = false;
+            return;
+        }
+    }
+#endif
+    // No browser decode: ffmpeg over the complete buffer, from the start.
+    clip_.samples.clear();
+    done_ = false;
     open_stream();
 }
 
@@ -446,7 +520,10 @@ bool AudioDecoder::decode_browser(std::chrono::nanoseconds budget,
     }
     th2_audio_release(state.browser_handle);
     state.browser_handle = 0;
-    done_ = true;
+    // A head that has been copied out in full is not a finished track: the
+    // rest of the file is still coming.  Saying otherwise would let the
+    // channel treat two and a half seconds as the whole thing and loop.
+    done_ = !head_only_;
     return true;
 }
 #endif

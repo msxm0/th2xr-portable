@@ -427,12 +427,22 @@ void Game::update_predecode_queues()
         scan_assets_, {}, &ScanAsset::key).begin();
     scan_assets_.erase(last, scan_assets_.end());
 
+    // Forget what has not been named for a while, or this grows for the
+    // length of a playthrough.
+    if (scan_generation_ % 64 == 0) {
+        std::erase_if(named_recently_, [this](const auto& item) {
+            return scan_generation_ - item.second
+                > named_recently_generations * 8;
+        });
+    }
+
     image_decode_queue_.clear();
     audio_decode_queue_.clear();
     std::size_t images = 0;
     std::size_t audio = 0;
 
     for (const ScanAsset& asset : scan_assets_) {
+        named_recently_[asset.key] = scan_generation_;
         if (asset.audio) {
             // Whatever is held is still wanted, so it keeps its place; what
             // is not held is work, up to the nearest twenty.

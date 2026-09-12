@@ -5,6 +5,7 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <algorithm>
 #include <cctype>
@@ -281,6 +282,70 @@ Archive::Range Archive::range_of(const ArchiveEntry& entry) const
 bool Archive::resident(const ArchiveEntry& entry) const
 {
     return data_is_resident(path_, entry.offset, entry.stored_size);
+}
+
+Archive::SplitRead Archive::read_head(
+    const ArchiveEntry& entry, std::size_t head) const
+{
+    SplitRead read;
+    read.bytes.resize(entry.stored_size);
+    // Splitting is for a cold miss and nothing else.  The caches are keyed by
+    // exact range, so asking for a 64KB head of a track the prefetcher has
+    // already fetched whole would miss both of them and fetch it a second
+    // time - turning the hits into misses for exactly the tracks that were
+    // handled well.  When the whole entry is already here, take it.
+    //
+    // A compressed entry cannot be started from a prefix either, and an entry
+    // only a little larger than the head would pay two round trips to save
+    // one.
+    if (entry.compressed || entry.stored_size <= head * 2
+        || data_is_resident(path_, entry.offset, entry.stored_size)) {
+        if (!data_read(path_, entry.offset, read.bytes)) {
+            throw std::runtime_error(
+                path_.string() + ": cannot read " + entry.name);
+        }
+        read.ready = entry.stored_size;
+        return read;
+    }
+    // The rest goes out first so it is already on the wire while this call
+    // is blocked on the head; both halves are ordinary ranges, so each is
+    // cached on its own the way any other read is.
+    data_prefetch_pin(path_, entry.offset + head, entry.stored_size - head,
+                      false);
+    if (!data_read(path_, entry.offset,
+                   std::span(read.bytes).first(head))) {
+        throw std::runtime_error(
+            path_.string() + ": cannot read head of " + entry.name);
+    }
+    read.ready = head;
+    return read;
+}
+
+void Archive::read_rest_into(
+    const ArchiveEntry& entry, std::size_t ready,
+    std::span<std::uint8_t> destination) const
+{
+    if (ready >= entry.stored_size) {
+        return;
+    }
+    const auto remaining = entry.stored_size - ready;
+    if (destination.size() < remaining) {
+        throw std::runtime_error(
+            path_.string() + ": short buffer for rest of " + entry.name);
+    }
+    if (!data_read(path_, entry.offset + ready,
+                   destination.first(remaining))) {
+        throw std::runtime_error(
+            path_.string() + ": cannot read rest of " + entry.name);
+    }
+}
+
+bool Archive::resident_rest(
+    const ArchiveEntry& entry, std::size_t ready) const
+{
+    return ready >= entry.stored_size
+        || data_is_resident(path_, entry.offset + ready,
+                            entry.stored_size - ready);
 }
 
 std::vector<std::uint8_t> Archive::read_prefix(

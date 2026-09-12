@@ -27,6 +27,18 @@ AudioClip decode_audio(std::span<const std::uint8_t> bytes);
 class AudioDecoder {
 public:
     explicit AudioDecoder(std::vector<std::uint8_t> bytes);
+    // Started from the first `ready` bytes of a file whose remainder is
+    // still arriving.  A truncated Ogg decodes to whole pages and stops, so
+    // 64KB of a track is about two and a half seconds - far more than the
+    // playback window needs to start, and it arrives in one round trip
+    // instead of waiting for a couple of megabytes.
+    //
+    // When the rest lands, supply_rest() decodes the complete file and
+    // resumes copying where the head left off.  That is sound because the
+    // two decodes agree exactly: the same decoder over the same leading
+    // bytes produces the same samples, verified bit-for-bit over a whole
+    // track, so nothing has to be re-copied or cross-faded.
+    AudioDecoder(std::vector<std::uint8_t> bytes, std::size_t ready);
     ~AudioDecoder();
 
     AudioDecoder(const AudioDecoder&) = delete;
@@ -67,6 +79,13 @@ public:
     const AudioClip& clip() const { return clip_; }
     AudioClip take();
 
+    // True once the head has been decoded as far as it goes and the rest of
+    // the file is needed to continue.  The caller fills rest_buffer() and
+    // calls supply_rest().
+    bool awaiting_rest() const;
+    std::span<std::uint8_t> rest_buffer();
+    void supply_rest();
+
 private:
     void open_stream();
 #ifdef __EMSCRIPTEN__
@@ -79,6 +98,10 @@ private:
     std::unique_ptr<State> state_;
     AudioClip clip_{};
     bool done_ = false;
+    // Bytes of the file in hand.  Equal to the whole input except between a
+    // head-only start and supply_rest().
+    std::size_t ready_ = 0;
+    bool head_only_ = false;
 };
 
 class AudioChannel {

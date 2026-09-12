@@ -564,15 +564,16 @@ private:
     // reasoned about.
     struct PrefetchTrace {
         int audio_created = 0;
-        int audio_evicted = 0;
-        int audio_evicted_undecoded = 0;
         int audio_recreated = 0;
         int image_queued = 0;
         int image_decoded = 0;
         int image_used = 0;
         int image_evicted_unused = 0;
-        std::size_t audio_cache_bytes = 0;
-        std::size_t largest_clip_bytes = 0;
+        // An asset the engine asked for that no recent scan had named.
+        // This is the explorer's coverage, which is the thing to look at if
+        // the prefetcher keeps missing: fetch counts say how much it
+        // fetched, this says how much of what was wanted it saw coming.
+        int unpredicted_uses = 0;
     };
     PrefetchTrace trace_{};
 
@@ -1089,8 +1090,38 @@ private:
     th2::PredecodeCache<std::shared_ptr<th2::AudioDecoder>> audio_decoders_;
     std::uint64_t audio_decode_order_ = 0;
 
+    // A track started from its first 64KB, waiting for the rest of its
+    // bytes.  Held weakly: if the decoder is dropped before the tail lands -
+    // evicted, or the scene moved on - there is nothing left to finish.
+    struct PendingAudioRest {
+        const th2::Archive* archive = nullptr;
+        const th2::ArchiveEntry* entry = nullptr;
+        std::weak_ptr<th2::AudioDecoder> decoder;
+        std::size_t ready = 0;
+    };
+    std::vector<PendingAudioRest> pending_audio_rest_;
+    // Key to the generation of the last scan that named it.  The plan itself
+    // is rebuilt every scan and an asset in use is usually behind the
+    // interpreter by then, so asking the plan whether something was
+    // predicted always answers no.  This remembers.
+    std::unordered_map<std::string, int> named_recently_;
+    // Scans run up to twenty times a second, so this is about ten seconds
+    // of exploration - long enough that an asset named a moment before it is
+    // used still counts as predicted, which is the question being asked.
+    static constexpr int named_recently_generations = 200;
+    // True when no recent scan saw this coming; counts and logs it once.
+    bool note_asset_use(const std::string& key);
+    void collect_audio_rests();
+    // Two and a half seconds of Vorbis, and one round trip.  Larger buys
+    // nothing - the playback window only needs one second in front of the
+    // device - and smaller risks a track whose first page is unusually big.
+    static constexpr std::size_t audio_head_bytes = 64 * 1024;
+
+    // `keep` says whether this is read-ahead, and so whether the decoder
+    // belongs in the explorer-governed cache at all.
     std::shared_ptr<th2::AudioDecoder> audio_decoder(
-        const th2::Archive& archive, std::string_view name, int rank);
+        const th2::Archive& archive, std::string_view name, int rank,
+        bool keep);
     std::shared_ptr<th2::AudioDecoder> ready_audio_decoder(
         const th2::Archive& archive, std::string_view name);
     void update_audio_decode();
