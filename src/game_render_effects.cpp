@@ -630,14 +630,23 @@ void Game::draw_geometric_transition(float progress)
 
     switch (transition.type) {
     case 11: {
-        int zoom = 256 - rate * rate / 256;
+        // BAK_CFZOOM1.  Two different rates, which is easy to miss:
+        //     rate = 256-rate*rate/256;      DRW_BLD(128-rate/2)
+        //     rate = 256-256*cnt/back_max;   rate = rate*rate/256;
+        //     DSP_SetGraphZoom2( GRP_BACK, ..., rate )
+        // The first is the incoming picture's alpha, the second its zoom.
+        // Using the alpha's rate for both left the zoom wrong everywhere
+        // except the two endpoints, where they happen to agree.
+        const int faded = 256 - rate * rate / 256;
+        const int inverse = 256 - rate;
+        const int zoom = inverse * inverse / 256;
         const float scale = (zoom + 256.0f) / 256.0f;
         SDL_FRect rectangle{
             400.0f - 400.0f * scale, 300.0f - 300.0f * scale,
             800.0f * scale, 600.0f * scale};
-        SDL_RenderTexture(renderer_, transition.previous.get(), nullptr, nullptr);
+        draw_old(full);
         SDL_SetTextureAlphaModFloat(
-            transition.composite.get(), (128.0f - zoom / 2.0f) / 128.0f);
+            transition.composite.get(), (128.0f - faded / 2.0f) / 128.0f);
         SDL_RenderTexture(
             renderer_, transition.composite.get(), nullptr, &rectangle);
         break;
@@ -673,8 +682,10 @@ void Game::draw_geometric_transition(float progress)
         SDL_FRect rectangle{
             400.0f - 400.0f * scale, 300.0f - 300.0f * scale,
             800.0f * scale, 600.0f * scale};
-        SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
-        SDL_RenderClear(renderer_);
+        // GRP_BACK+1 is still on at LAY_BACK and nothing clears, so the
+        // old screen stays behind the shrinking new one.  Clearing to
+        // black instead threw it away.
+        draw_old(full);
         SDL_SetTextureAlphaModFloat(
             transition.composite.get(), (32.0f - inverse / 8.0f) / 32.0f);
         SDL_RenderTexture(
@@ -693,17 +704,42 @@ void Game::draw_geometric_transition(float progress)
     case 17:
     case 18:
     case 19: {
+        // BAK_SLIDE_*.  Both pictures move, in opposite directions:
+        //     DSP_SetGraphMove( GRP_BACK+0, 0, y-DISP_Y )   incoming
+        //     DSP_SetGraphMove( GRP_BACK+1, 0, y )          snapshot
+        // and both take DRW_BLD(rate).  Only the snapshot was moving here,
+        // so the new picture appeared in place rather than sliding in
+        // behind the old one leaving.
         const int inverse = 256 - rate;
         const float x = 800.0f
             - 800.0f * inverse * inverse / (256.0f * 256.0f);
         const float y = 600.0f
             - 600.0f * inverse * inverse / (256.0f * 256.0f);
-        SDL_FRect rectangle = full;
-        if (transition.type == 16) rectangle.y = y;
-        if (transition.type == 17) rectangle.y = -y;
-        if (transition.type == 18) rectangle.x = -x;
-        if (transition.type == 19) rectangle.x = x;
-        draw_old(rectangle, 1.0f - rate / 256.0f);
+        SDL_FRect leaving = full;
+        SDL_FRect arriving = full;
+        switch (transition.type) {
+        case 16:  // up
+            arriving.y = y - 600.0f;
+            leaving.y = y;
+            break;
+        case 17:  // down
+            arriving.y = 600.0f - y;
+            leaving.y = -y;
+            break;
+        case 18:  // right
+            arriving.x = 800.0f - x;
+            leaving.x = -x;
+            break;
+        default:  // 19, left
+            arriving.x = x - 800.0f;
+            leaving.x = x;
+            break;
+        }
+        const float alpha = rate / 256.0f;
+        draw_old(leaving, alpha);
+        SDL_SetTextureAlphaModFloat(transition.composite.get(), alpha);
+        SDL_RenderTexture(
+            renderer_, transition.composite.get(), nullptr, &arriving);
         break;
     }
     case 20: {

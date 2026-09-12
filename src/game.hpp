@@ -384,6 +384,11 @@ private:
     // AVG_SetBackPos and the cases of AVG_ControlShake that transform
     // GRP_BACK, applied to the background graph and the darkened copy that
     // has to travel with it.
+    // BAK_SLIDE_* moves GRP_BACK off its rest position, so the background
+    // must not also be drawn where it normally sits - the transition puts
+    // both pictures on screen itself.  Every other type leaves GRP_BACK
+    // alone and composites over it.
+    bool transition_moves_background() const;
     void setup_background_graphs(
         const ShakeSample& shake, bool shake_background,
         bool shake_characters);

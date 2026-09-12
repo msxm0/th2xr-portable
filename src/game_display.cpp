@@ -39,6 +39,12 @@ void Game::publish_background_bitmaps()
     publish(th2::bmp_backhalf, half_tone_background_.get());
 }
 
+bool Game::transition_moves_background() const
+{
+    return transition_ && transition_->frames > 0
+        && transition_->type >= 16 && transition_->type <= 19;
+}
+
 void Game::setup_background_graphs(
     const ShakeSample& shake, bool shake_background, bool shake_characters)
 {
@@ -64,8 +70,8 @@ void Game::setup_background_graphs(
     // finished the engine turns GRP_BACK off and shows the darkened copy in
     // its place, rather than tinting anything.
     display().set_graph(
-        th2::grp_back, back_bmp, th2::lay_back, !copy_shown,
-        th2::check_none);
+        th2::grp_back, back_bmp, th2::lay_back,
+        !copy_shown && !transition_moves_background(), th2::check_none);
     display().set_graph(
         th2::grp_back + 1, half_bmp, th2::lay_back + 2, copy_shown,
         th2::check_none);
