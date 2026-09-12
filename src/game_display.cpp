@@ -45,6 +45,18 @@ bool Game::transition_moves_background() const
         && transition_->type >= 16 && transition_->type <= 19;
 }
 
+float Game::transition_progress() const
+{
+    if (!transition_ || transition_->frames <= 0) {
+        return 0.0f;
+    }
+    const auto elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - transition_->started);
+    return std::clamp(
+        static_cast<float>(elapsed.count() * 60.0 / transition_->frames),
+        0.0f, 1.0f);
+}
+
 void Game::setup_background_graphs(
     const ShakeSample& shake, bool shake_background, bool shake_characters)
 {
@@ -70,8 +82,8 @@ void Game::setup_background_graphs(
     // finished the engine turns GRP_BACK off and shows the darkened copy in
     // its place, rather than tinting anything.
     display().set_graph(
-        th2::grp_back, back_bmp, th2::lay_back,
-        !copy_shown && !transition_moves_background(), th2::check_none);
+        th2::grp_back, back_bmp, th2::lay_back, !copy_shown,
+        th2::check_none);
     display().set_graph(
         th2::grp_back + 1, half_bmp, th2::lay_back + 2, copy_shown,
         th2::check_none);
@@ -125,6 +137,36 @@ void Game::setup_background_graphs(
                     static_cast<int>(view.y - shake.y));
             }
         }
+    }
+
+    // BAK_SLIDE_*: the engine moves GRP_BACK itself rather than drawing a
+    // copy of the incoming picture -
+    //     DSP_SetGraphParam( GRP_BACK+0, DRW_BLD(rate) );
+    //     DSP_SetGraphMove ( GRP_BACK+0, 0, y-DISP_Y );
+    // - and the transition only has the outgoing snapshot to draw.  Doing
+    // it the other way round meant the incoming picture had to be captured
+    // off the art target, which cannot work while the background it is a
+    // capture of is switched off.
+    if (transition_moves_background()) {
+        const int rate = std::clamp(
+            static_cast<int>(transition_progress() * 256.0f), 0, 256);
+        const int inverse = 256 - rate;
+        const int x = th2::display_width
+            - th2::display_width * inverse * inverse / (256 * 256);
+        const int y = th2::display_height
+            - th2::display_height * inverse * inverse / (256 * 256);
+        int dx = 0;
+        int dy = 0;
+        switch (transition_->type) {
+        case 16: dy = y - th2::display_height; break;
+        case 17: dy = th2::display_height - y; break;
+        case 18: dx = th2::display_width - x; break;
+        default: dx = x - th2::display_width; break;  // 19
+        }
+        display().set_graph_move(th2::grp_back, dx, dy);
+        display().set_graph_param(
+            th2::grp_back,
+            th2::drw_bld | (static_cast<std::uint32_t>(rate) << 16));
     }
 
     // AVG_ControlBackFade: DSP_SetGraphBright( GRP_BACK, rr, gg, bb ), with

@@ -891,7 +891,15 @@ void Game::draw_frame()
     display().draw(
         shake_art ? shake_target_.get() : art_target,
         [this](int layer) {
-            if (layer == th2::lay_back) {
+            // The snapshot goes in at LAY_BACK, under the incoming
+            // background at LAY_BACK+1.  A slide is the one family where
+            // that order is visible, because both pictures are half
+            // transparent at once and neither covers the other - so for
+            // those the wipe draws before the background rather than over
+            // it.  Every other type composites over a background that is
+            // still in its rest position.
+            const int at = transition_moves_background() ? 0 : th2::lay_back;
+            if (layer == at) {
                 draw_active_transition();
             }
         });

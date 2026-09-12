@@ -389,6 +389,8 @@ private:
     // both pictures on screen itself.  Every other type leaves GRP_BACK
     // alone and composites over it.
     bool transition_moves_background() const;
+    // How far through the running wipe we are, 0..1.  Zero when none is.
+    float transition_progress() const;
     void setup_background_graphs(
         const ShakeSample& shake, bool shake_background,
         bool shake_characters);

@@ -716,30 +716,15 @@ void Game::draw_geometric_transition(float progress)
         const float y = 600.0f
             - 600.0f * inverse * inverse / (256.0f * 256.0f);
         SDL_FRect leaving = full;
-        SDL_FRect arriving = full;
         switch (transition.type) {
-        case 16:  // up
-            arriving.y = y - 600.0f;
-            leaving.y = y;
-            break;
-        case 17:  // down
-            arriving.y = 600.0f - y;
-            leaving.y = -y;
-            break;
-        case 18:  // right
-            arriving.x = 800.0f - x;
-            leaving.x = -x;
-            break;
-        default:  // 19, left
-            arriving.x = x - 800.0f;
-            leaving.x = x;
-            break;
+        case 16: leaving.y = y; break;         // up
+        case 17: leaving.y = -y; break;        // down
+        case 18: leaving.x = -x; break;        // right
+        default: leaving.x = x; break;         // 19, left
         }
-        const float alpha = rate / 256.0f;
-        draw_old(leaving, alpha);
-        SDL_SetTextureAlphaModFloat(transition.composite.get(), alpha);
-        SDL_RenderTexture(
-            renderer_, transition.composite.get(), nullptr, &arriving);
+        // GRP_BACK carries its own move and DRW_BLD(rate); see
+        // setup_background_graphs().  Only the snapshot is left to draw.
+        draw_old(leaving, rate / 256.0f);
         break;
     }
     case 20: {
