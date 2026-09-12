@@ -245,20 +245,6 @@ void Game::set_character(const th2::Event& event)
             ? previous->locate : 1;
     }
     const bool wait_form = event.instruction.name == "CW";
-    // AVG_SetChar():
-    //     if(in_type!=CHAR_TYPE_WAIT){
-    //         AVG_ResetHalfTone();
-    //         AVG_SetNovelMessageDisp(OFF);
-    //     }
-    // Before the equality check below, so it happens even when the call
-    // changes nothing.  This is what guarantees BMP_BACKHALF is never a copy
-    // of a plate that has since been re-baked: a character cannot change
-    // without the wash being torn down first, and the next message rebuilds
-    // it from the plate as it is by then.
-    if (!wait_form) {
-        reset_half_tone();
-        hide_message_for_animation();
-    }
     const std::size_t layer_index = wait_form ? 3 : 4;
     const std::size_t brightness_index = wait_form ? 4 : 5;
     const std::size_t alpha_index = wait_form ? 5 : 6;
@@ -277,7 +263,19 @@ void Game::set_character(const th2::Event& event)
     const int animation_type = wait_form ? 3
         : number(event, 3) == -2 ? -1
         : number(event, 3) < 0 ? 0 : number(event, 3);
+    // AVG_SetChar():
+    //     index = GetCharIndex(char_no);
+    //     if( index!=MAX_CHAR ){ if(...all equal...) return; }
+    //     if(in_type!=CHAR_TYPE_WAIT){
+    //         AVG_ResetHalfTone();
+    //         AVG_SetNovelMessageDisp(OFF);
+    //     }
+    // After the equality check, not before it: a call that changes nothing
+    // returns without touching either.  CHAR_TYPE_WAIT is 3, which is the
+    // CW form and a C that asks for it by number, so both are spelt the
+    // same way here.
     if (animation_type != 3) {
+        reset_half_tone();
         hide_message_for_animation();
     }
     CharacterAnimation animation;
