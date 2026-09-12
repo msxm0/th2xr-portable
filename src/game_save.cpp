@@ -338,15 +338,20 @@ void Game::save_body(std::ostream& out) const
     }
 
     // Overlays
+    // SpriteBmp[i], with the slot it lives in - a loaded overlay is one
+    // whose bitmap slot is filled.
+    const auto overlay_live = [this](std::size_t i) {
+        return display().bmp_flag(th2::bmp_script + static_cast<int>(i));
+    };
     std::uint32_t overlay_count = 0;
-    for (const auto& ov : overlays_) {
-        if (ov) {
+    for (std::size_t i = 0; i < overlay_states_.size(); ++i) {
+        if (overlay_live(i)) {
             ++overlay_count;
         }
     }
     write_u32(out, overlay_count);
-    for (std::size_t i = 0; i < overlays_.size(); ++i) {
-        if (!overlays_[i]) {
+    for (std::size_t i = 0; i < overlay_states_.size(); ++i) {
+        if (!overlay_live(i)) {
             continue;
         }
         const auto& state = overlay_states_[i];
@@ -602,11 +607,7 @@ bool Game::load_body(std::istream& in)
     background_baked_dirty_ = true;
 
     // Overlays
-    for (std::size_t i = 0; i < overlays_.size(); ++i) {
-        overlays_[i].reset();
-        overlay_pixels_[i].reset();
-        overlay_states_[i] = {};
-    }
+    reset_overlays();
     const auto overlay_count = read_u32(in);
     for (std::uint32_t i = 0; i < overlay_count; ++i) {
         const auto slot = static_cast<std::size_t>(read_u32(in));
@@ -635,10 +636,8 @@ bool Game::load_body(std::istream& in)
         state.zoom_center_x = read_i32(in);
         state.zoom_center_y = read_i32(in);
         state.zoom = read_i32(in);
-        if (slot < overlays_.size()) {
-            load_overlay(slot, name, archive, state.tone_type);
-            overlay_states_[slot] = std::move(state);
-            apply_overlay_brightness(slot);
+        if (slot < overlay_states_.size()) {
+            restore_overlay(slot, state);
         }
     }
 

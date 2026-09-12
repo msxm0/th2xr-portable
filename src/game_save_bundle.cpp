@@ -108,11 +108,7 @@ void Game::reset_play_state()
     tone_back_ = -1;
     tone_char_ = -1;
     weather_ = 0;
-    for (std::size_t i = 0; i < overlays_.size(); ++i) {
-        overlays_[i].reset();
-        overlay_pixels_[i].reset();
-        overlay_states_[i] = {};
-    }
+    reset_overlays();
     clear_characters();
     sakura_.reset();
 

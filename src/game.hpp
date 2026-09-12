@@ -143,6 +143,7 @@ private:
         int parameter = 0;
         int parameter_value = 0;
         int reverse = 0;
+        int nuki = -1;
         int red = 128;
         int green = 128;
         int blue = 128;
@@ -364,8 +365,6 @@ private:
     BackgroundKind background_kind_ = BackgroundKind::background;
     BackgroundView background_view_;
     std::optional<BackgroundScroll> background_scroll_;
-    std::array<Texture, 32> overlays_{};
-    std::array<Surface, 32> overlay_pixels_{};
     std::array<OverlayState, 32> overlay_states_{};
     // The original's display layer and character machine.  display_ owns
     // the graph table; avg_char_ is CharStruct[MAX_CHAR] and AVG_ControlChar.
@@ -373,6 +372,7 @@ private:
     std::optional<th2::Display> display_;
     std::optional<th2::AvgChar> avg_char_;
     th2::Display& display() { return *display_; }
+    const th2::Display& display() const { return *display_; }
     th2::AvgChar& chars() { return *avg_char_; }
     const th2::AvgChar& chars() const { return *avg_char_; }
     void build_display();
@@ -1007,10 +1007,11 @@ private:
         const th2::Event& event, BackgroundKind kind, char prefix);
     void restore_background();
     std::optional<std::size_t> overlay_index(int requested) const;
+    void reset_overlays();
+    void restore_overlay(std::size_t slot, const OverlayState& held);
     void load_overlay(
         std::size_t slot, std::string name, std::string archive,
-        int tone_type = 0);
-    void apply_overlay_brightness(std::size_t slot);
+        int tone_type, int layer, int nuki);
     bool handle(const th2::Event& event);
     std::filesystem::path dump_engine_error(
         const th2::ScriptStep& step, std::string_view error);
@@ -1325,7 +1326,6 @@ private:
     void clear_sidebar();
     void clear_authentic_text();
     void begin_authentic_text();
-    void draw_overlay(std::size_t slot);
     float imgui_display_scale() const;
     void present_frame();
     void reset_render_state();

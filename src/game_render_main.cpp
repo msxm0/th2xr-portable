@@ -480,61 +480,6 @@ void Game::finish_background_fade(
     SDL_SetTextureColorMod(texture, 255, 255, 255);
 }
 
-void Game::draw_overlay(std::size_t slot)
-{
-    if (!overlays_[slot] || !overlay_states_[slot].visible) {
-        return;
-    }
-    const auto& state = overlay_states_[slot];
-    auto* texture = overlays_[slot].get();
-    const int alpha = state.parameter == 11
-        ? std::clamp(state.parameter_value, 0, 256) * 255 / 256
-        : 255;
-    SDL_SetTextureAlphaMod(texture, static_cast<Uint8>(alpha));
-    if (state.parameter == 1) {
-        SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_ADD);
-    } else if (state.parameter == 5) {
-        SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_MOD);
-    } else {
-        SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
-    }
-
-    const auto scale_x = [](int value) {
-        return value * 800.0f / 640.0f;
-    };
-    const auto scale_y = [](int value) {
-        return value * 600.0f / 448.0f;
-    };
-    SDL_FRect source{
-        scale_x(state.source_x), scale_y(state.source_y),
-        scale_x(state.source_width), scale_y(state.source_height)};
-    SDL_FRect destination{
-        scale_x(state.destination_x), scale_y(state.destination_y),
-        scale_x(state.destination_width),
-        scale_y(state.destination_height)};
-    if (state.zoom != 0) {
-        const float scale = (256.0f + state.zoom) / 256.0f;
-        const float center_x = scale_x(state.zoom_center_x);
-        const float center_y = scale_y(state.zoom_center_y);
-        destination.x = center_x + (destination.x - center_x) * scale;
-        destination.y = center_y + (destination.y - center_y) * scale;
-        destination.w *= scale;
-        destination.h *= scale;
-    }
-    SDL_FlipMode flip = SDL_FLIP_NONE;
-    if ((state.reverse & 0x10) != 0) {
-        flip = static_cast<SDL_FlipMode>(flip | SDL_FLIP_HORIZONTAL);
-    }
-    if ((state.reverse & 0x20) != 0) {
-        flip = static_cast<SDL_FlipMode>(flip | SDL_FLIP_VERTICAL);
-    }
-    const Uint8 brighten = apply_background_fade(texture);
-    SDL_RenderTextureRotated(
-        renderer_, texture, &source, &destination, 0.0, nullptr, flip);
-    finish_background_fade(
-        texture, brighten, &source, &destination, 0.0, flip);
-}
-
 float Game::imgui_display_scale() const
 {
     // Cap the scale so ImGui doesn't become enormous on high-DPI phones.
@@ -925,72 +870,31 @@ void Game::draw_frame()
     } else {
         display().reset_graph(th2::grp_work);
     }
-    display().draw_layer(0);
-    for (std::size_t i = 0; i < overlays_.size(); ++i) {
-        if (overlay_states_[i].layer < 1) {
-            draw_overlay(i);
-        }
-    }
-    // GRP_BACK at LAY_BACK, with the shake's transform on it.  The
-    // background is a graph now, so the slide, the zoom and the roll are
-    // DSP_SetGraphSMove, DSP_SetGraphZoom2 and DSP_SetGraphRoll rather than
-    // a rect worked out here, and the darkened copy gets the same transform
-    // because it is the graph next door.
+    // GRP_BACK at LAY_BACK, with the shake's transform on it, and the
+    // darkened copy next door at LAY_BACK+2 with the same transform.
     setup_background_graphs(shake, shake_background, shake_characters);
-    if (background_) {
-        display().draw_layer(th2::lay_back);
-    } else if (bg_scene_ == 0) {
+    if (!background_ && bg_scene_ == 0) {
         SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
         const SDL_FRect game_area{0.0f, 0.0f, 800.0f, 600.0f};
         SDL_RenderFillRect(renderer_, &game_area);
     }
-    // A wipe happens down here, not over the finished frame.  AVG_SetBack
-    // parks a snapshot of the screen in GRP_BACK+1 at LAY_BACK and lifts the
-    // incoming background to LAY_BACK+1 above it, so both sit at the bottom
-    // of the scene: the characters and overlays of the *new* moment draw on
-    // top and are not part of the dissolve.  Compositing it last instead put
-    // the old screen - which the snapshot still contains - over the new
-    // characters, so they faded in with the background rather than being
-    // there from the first frame.
-    draw_active_transition();
-    // The half tone sits at LAY_BACK+2, so layers 1 and 2 are beneath it and
-    // layers 3 and 4 above.  With the copy opaque that is the difference
-    // between an overlay being hidden and being visible, so the band the
-    // engine happens to group as "background-ish" has to be split there.
-    for (std::size_t i = 0; i < overlays_.size(); ++i) {
-        if (overlay_states_[i].layer >= 1 && overlay_states_[i].layer < 3) {
-            draw_overlay(i);
-        }
-    }
-    // GRP_BACK+1, at LAY_BACK+2: the darkened copy, opaque, covering
-    // everything drawn below it.
-    // GRP_BACK+1, the darkened copy, at LAY_BACK+2 - above overlays at
-    // layers 1 and 2 and below those at 3 and 4, which is the difference
-    // between an overlay being hidden by it and being visible.
-    display().draw_layer(th2::lay_back + 2);
-    for (std::size_t i = 0; i < overlays_.size(); ++i) {
-        if (overlay_states_[i].layer >= 3 && overlay_states_[i].layer < 5) {
-            draw_overlay(i);
-        }
-    }
-    for (std::size_t i = 0; i < overlays_.size(); ++i) {
-        if (overlay_states_[i].layer >= 5
-            && overlay_states_[i].layer < 18) {
-            draw_overlay(i);
-        }
-    }
-    // The character graphs, at LAY_CHAR + CharStruct[i].layer.  A settled
-    // character is baked into BMP_BACK and AVG_ControlChar has switched its
-    // graph off, so only the live ones draw here - which is what makes the
-    // ones in the plate move with a background transform instead.
-    for (int layer = 0; layer < 5; ++layer) {
-        display().draw_layer(th2::lay_char + layer);
-    }
-    for (std::size_t i = 0; i < overlays_.size(); ++i) {
-        if (overlay_states_[i].layer >= 18) {
-            draw_overlay(i);
-        }
-    }
+    // DSP_DrawGraph: layers 0 to LAYER_MAX, every visible graph on each.
+    // Everything in the art pass is a graph now - GRP_WORK at 0, GRP_BACK at
+    // LAY_BACK, the script's overlays wherever SetBmpEx put them, GRP_BACK+1
+    // at LAY_BACK+2 and the live characters at LAY_CHAR - so the ordering is
+    // the layer numbers rather than a sequence of bands written out here.
+    //
+    // A wipe is the one thing that is not a graph yet.  It goes in at
+    // LAY_BACK, where AVG_SetBack parks the outgoing snapshot: the
+    // characters and overlays of the new moment draw over it rather than
+    // fading in with it.
+    display().draw(
+        shake_art ? shake_target_.get() : art_target,
+        [this](int layer) {
+            if (layer == th2::lay_back) {
+                draw_active_transition();
+            }
+        });
     if (ui_mode_ == UiMode::system_menu) {
         draw_system_menu();
     } else if (ui_mode_ == UiMode::save || ui_mode_ == UiMode::load) {

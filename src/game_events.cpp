@@ -198,22 +198,58 @@ bool Game::handle(const th2::Event& event)
         if (const auto slot = overlay_index(number(event, 0))) {
             load_overlay(
                 *slot, text(event, 2), text(event, 6),
-                number(event, 5) < 0 ? 1 : number(event, 5));
-            overlay_states_[*slot].layer = number(event, 3);
+                number(event, 5) < 0 ? 1 : number(event, 5),
+                number(event, 3), number(event, 4));
         }
     } else if (name == "ResetBmp") {
         if (const auto slot = overlay_index(number(event, 0))) {
-            overlays_[*slot].reset();
-            overlay_pixels_[*slot].reset();
+            display().reset_graph(
+                th2::grp_script + static_cast<int>(*slot));
+            display().release_bmp(
+                th2::bmp_script + static_cast<int>(*slot));
             overlay_states_[*slot] = {};
         }
-    } else if (name == "SetBmpParam") {
+    } else if (name == "SetBmpDisp") {
+        // AVG_SetBmpDisp: DSP_SetGraphDisp( GRP_SCRIPT+s_bno, disp )
         if (const auto slot = overlay_index(number(event, 0))) {
-            overlay_states_[*slot].parameter = number(event, 1);
-            overlay_states_[*slot].parameter_value =
+            const bool on = number(event, 1) != 0;
+            display().set_graph_disp(
+                th2::grp_script + static_cast<int>(*slot), on);
+            overlay_states_[*slot].visible = on;
+        }
+    } else if (name == "SetBmpLayer") {
+        // AVG_SetBmpLayer: DSP_SetGraphLayer( GRP_SCRIPT+s_bno, layer )
+        if (const auto slot = overlay_index(number(event, 0))) {
+            display().set_graph_layer(
+                th2::grp_script + static_cast<int>(*slot), number(event, 1));
+            overlay_states_[*slot].layer = number(event, 1);
+        }
+    } else if (name == "SetBmpParam") {
+        // AVG_SetBmpParam: DSP_SetGraphParam( GRP_SCRIPT+s_bno, param ).
+        // The script gives the mode and its parameter separately, where the
+        // engine has them packed into one DWORD.
+        if (const auto slot = overlay_index(number(event, 0))) {
+            auto& state = overlay_states_[*slot];
+            state.parameter = number(event, 1);
+            state.parameter_value =
                 number(event, 2) < 0 ? 0 : number(event, 2);
+            display().set_graph_param(
+                th2::grp_script + static_cast<int>(*slot),
+                static_cast<std::uint32_t>(state.parameter)
+                    | (static_cast<std::uint32_t>(state.parameter_value)
+                       << 16));
+        }
+    } else if (name == "SetBmpRevParam") {
+        if (const auto slot = overlay_index(number(event, 0))) {
+            overlay_states_[*slot].reverse = number(event, 1);
+            display().set_graph_rev_param(
+                th2::grp_script + static_cast<int>(*slot),
+                static_cast<std::uint32_t>(number(event, 1)));
         }
     } else if (name == "SetBmpBright") {
+        // AVG_SetBmpBright: DSP_SetGraphBright( GRP_SCRIPT+s_bno, r, g, b ).
+        // A graph field, not a walk over the picture - and the brightening
+        // half above 128 is the additive pass the display layer does.
         if (const auto slot = overlay_index(number(event, 0))) {
             auto& state = overlay_states_[*slot];
             state.red = std::clamp(number(event, 1), 0, 255);
@@ -221,21 +257,68 @@ bool Game::handle(const th2::Event& event)
                 ? state.red : std::clamp(number(event, 2), 0, 255);
             state.blue = number(event, 3) < 0
                 ? state.red : std::clamp(number(event, 3), 0, 255);
-            apply_overlay_brightness(*slot);
+            display().set_graph_bright(
+                th2::grp_script + static_cast<int>(*slot),
+                state.red, state.green, state.blue);
         }
     } else if (name == "SetBmpMove") {
+        // AVG_SetBmpMove: DSP_SetGraphMove( g, x*800/640, y*600/448 )
         if (const auto slot = overlay_index(number(event, 0))) {
-            overlay_states_[*slot].destination_x = number(event, 1);
-            overlay_states_[*slot].destination_y = number(event, 2);
+            auto& state = overlay_states_[*slot];
+            state.destination_x = number(event, 1);
+            state.destination_y = number(event, 2);
+            display().set_graph_move(
+                th2::grp_script + static_cast<int>(*slot),
+                state.destination_x * 800 / 640,
+                state.destination_y * 600 / 448);
+        }
+    } else if (name == "SetBmpPos") {
+        // AVG_SetBmpPos: DSP_SetGraphPos with every coordinate scaled.
+        if (const auto slot = overlay_index(number(event, 0))) {
+            auto& state = overlay_states_[*slot];
+            state.destination_x = number(event, 1);
+            state.destination_y = number(event, 2);
+            state.source_x = number(event, 3);
+            state.source_y = number(event, 4);
+            state.destination_width = state.source_width = number(event, 5);
+            state.destination_height = state.source_height = number(event, 6);
+            display().set_graph_pos(
+                th2::grp_script + static_cast<int>(*slot),
+                state.destination_x * 800 / 640,
+                state.destination_y * 600 / 448,
+                state.source_x * 800 / 640, state.source_y * 600 / 448,
+                state.destination_width * 800 / 640,
+                state.destination_height * 600 / 448);
         }
     } else if (name == "SetBmpZoom") {
+        // AVG_SetBmpZoom: DSP_SetGraphZoom( g, dx, dy, dw, dh ), which puts
+        // the source back to the whole bitmap - it is a scale of the picture,
+        // not a window onto it.
         if (const auto slot = overlay_index(number(event, 0))) {
             auto& state = overlay_states_[*slot];
             state.destination_x = number(event, 1);
             state.destination_y = number(event, 2);
             state.destination_width = number(event, 3);
             state.destination_height = number(event, 4);
-            state.zoom = 0;
+            display().set_graph_zoom(
+                th2::grp_script + static_cast<int>(*slot),
+                state.destination_x * 800 / 640,
+                state.destination_y * 600 / 448,
+                state.destination_width * 800 / 640,
+                state.destination_height * 600 / 448);
+        }
+    } else if (name == "SetBmpZoom2") {
+        // AVG_SetBmpZoom2: DSP_SetGraphZoom2( g, cx, cy, zoom ) - a scale
+        // about a point, which leaves the rectangle alone.
+        if (const auto slot = overlay_index(number(event, 0))) {
+            auto& state = overlay_states_[*slot];
+            state.zoom_center_x = number(event, 1);
+            state.zoom_center_y = number(event, 2);
+            state.zoom = number(event, 3);
+            display().set_graph_zoom2(
+                th2::grp_script + static_cast<int>(*slot),
+                state.zoom_center_x * 800 / 640,
+                state.zoom_center_y * 600 / 448, state.zoom);
         }
     } else if (name == "C") {
         // ESC_EOprC: the defaults the opcode fills in before AVG_SetChar
@@ -457,11 +540,7 @@ bool Game::handle(const th2::Event& event)
             number(event, 0), number(event, 1), number(event, 2),
             text(event, 3)});
     } else if (name == "LoadScript") {
-        for (std::size_t i = 0; i < overlays_.size(); ++i) {
-            overlays_[i].reset();
-            overlay_pixels_[i].reset();
-            overlay_states_[i] = {};
-        }
+        reset_overlays();
         choices_.clear();
         choosing_ = false;
         choice_highlight_ = 0;

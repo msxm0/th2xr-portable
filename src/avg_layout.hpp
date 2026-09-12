@@ -28,7 +28,18 @@ inline constexpr int bmp_backhalf = bmp_back2 + 1;
 inline constexpr int bmp_spback = bmp_backhalf + 1;
 inline constexpr int bmp_spbackhalf = bmp_spback + 1;
 inline constexpr int bmp_chip = bmp_spbackhalf + 1;
-inline constexpr int bmp_char = bmp_chip + 8;
+inline constexpr int bmp_char = bmp_chip + 8;             // 20
+inline constexpr int bmp_charhalf = bmp_char + max_char * 2;  // 36
+inline constexpr int bmp_system = bmp_charhalf + max_char * 2;  // 52
+inline constexpr int bmp_select = bmp_system + 10;       // 62
+inline constexpr int bmp_save = bmp_select + 4;          // 66
+inline constexpr int bmp_weather = bmp_save + 10;        // 76
+inline constexpr int bmp_work = bmp_weather + 10;        // 86
+inline constexpr int bmp_script = bmp_work + 20;         // 106
+
+// MAX_SCRIPT_OBJ: the script's own overlay objects, BMP_SCRIPT+i drawn by
+// GRP_SCRIPT+i.
+inline constexpr int max_script_obj = 32;
 
 inline constexpr int lay_back = 1;
 inline constexpr int lay_spback = lay_back + 4;

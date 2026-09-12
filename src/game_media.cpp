@@ -706,10 +706,10 @@ void Game::restore_background()
 std::optional<std::size_t> Game::overlay_index(int requested) const
 {
     if (requested == -1) {
-        return overlays_.size() - 1;
+        return overlay_states_.size() - 1;
     }
     if (requested < 0
-        || static_cast<std::size_t>(requested) >= overlays_.size()) {
+        || static_cast<std::size_t>(requested) >= overlay_states_.size()) {
         return std::nullopt;
     }
     return static_cast<std::size_t>(requested);
@@ -896,64 +896,101 @@ Surface Game::take_predecoded_image(bool background, std::string_view name)
     return decoded_images_.take(key);
 }
 
+void Game::restore_overlay(std::size_t slot, const OverlayState& held)
+{
+    // AVG_LoadBmpSetting: reload the picture, then replay every setter in
+    // the order the engine does, so the graph ends up as it was.
+    const int graph = th2::grp_script + static_cast<int>(slot);
+    if (held.name.empty()) {
+        display().reset_graph(graph);
+        display().release_bmp(th2::bmp_script + static_cast<int>(slot));
+        overlay_states_[slot] = {};
+        return;
+    }
+    load_overlay(
+        slot, held.name, held.archive, held.tone_type, held.layer,
+        held.nuki);
+    overlay_states_[slot] = held;
+    display().set_graph_disp(graph, held.visible);
+    display().set_graph_param(
+        graph,
+        static_cast<std::uint32_t>(held.parameter)
+            | (static_cast<std::uint32_t>(held.parameter_value) << 16));
+    display().set_graph_rev_param(
+        graph, static_cast<std::uint32_t>(held.reverse));
+    display().set_graph_bright(graph, held.red, held.green, held.blue);
+    display().set_graph_pos(
+        graph, held.destination_x * 800 / 640, held.destination_y * 600 / 448,
+        held.source_x * 800 / 640, held.source_y * 600 / 448,
+        held.destination_width * 800 / 640,
+        held.destination_height * 600 / 448);
+    if (held.zoom) {
+        display().set_graph_zoom2(
+            graph, held.zoom_center_x * 800 / 640,
+            held.zoom_center_y * 600 / 448, held.zoom);
+    } else if (held.destination_width != held.source_width
+               || held.destination_height != held.source_height) {
+        display().set_graph_zoom(
+            graph, held.destination_x * 800 / 640,
+            held.destination_y * 600 / 448,
+            held.destination_width * 800 / 640,
+            held.destination_height * 600 / 448);
+    }
+}
+
+void Game::reset_overlays()
+{
+    // ResetBmp for every slot: the graph goes, the bitmap goes, and
+    // SpriteBmp[i] goes with them.
+    for (std::size_t i = 0; i < overlay_states_.size(); ++i) {
+        display().reset_graph(th2::grp_script + static_cast<int>(i));
+        display().release_bmp(th2::bmp_script + static_cast<int>(i));
+        overlay_states_[i] = {};
+    }
+}
+
 void Game::load_overlay(
     std::size_t slot, std::string name, std::string archive,
-    int tone_type)
+    int tone_type, int layer, int nuki)
 {
+    // The default branch of AVG_SetBmp: decode into BMP_SCRIPT+i, then
+    //     DSP_SetGraph( GRP_SCRIPT+s_bno, BMP_SCRIPT+s_bno, layer, ON, nuki )
+    // and record the same thing in SpriteBmp[i] for the savegame.
     const auto& source = archive == "bak" ? backgrounds_ : graphics_;
-    overlays_[slot] = load_toned_texture(
+    Texture texture = load_toned_texture(
         renderer_, source, name, graphics_,
         tone_type == 1
             ? character_tone_curves()
             : background_tone_curves(),
-        &overlay_pixels_[slot],
+        nullptr,
         take_predecoded_image(archive == "bak", name));
     auto& state = overlay_states_[slot];
     state = {};
     state.name = std::move(name);
     state.archive = std::move(archive);
     state.tone_type = tone_type;
+    state.layer = layer;
+    state.nuki = nuki;
+    const int bmp = th2::bmp_script + static_cast<int>(slot);
+    const int graph = th2::grp_script + static_cast<int>(slot);
+    if (!texture) {
+        display().release_bmp(bmp);
+        display().reset_graph(graph);
+        return;
+    }
     float width = 0.0f;
     float height = 0.0f;
-    SDL_GetTextureSize(overlays_[slot].get(), &width, &height);
+    SDL_GetTextureSize(texture.get(), &width, &height);
+    display().set_bmp(
+        bmp, std::move(texture), static_cast<int>(width),
+        static_cast<int>(height));
+    display().set_graph(graph, bmp, layer, true, nuki);
+    // SpriteBmp's own rectangle is in the script's 640x448, which is what
+    // the setters below take and scale on the way in.
     state.destination_width = static_cast<int>(width * 640.0f / 800.0f);
     state.destination_height = static_cast<int>(height * 448.0f / 600.0f);
     state.source_width = state.destination_width;
     state.source_height = state.destination_height;
 }
-
-void Game::apply_overlay_brightness(std::size_t slot)
-{
-    const auto& source = overlay_pixels_[slot];
-    if (!source) {
-        return;
-    }
-    Surface adjusted(
-        SDL_ConvertSurface(source.get(), SDL_PIXELFORMAT_RGBA32));
-    if (!adjusted) {
-        throw std::runtime_error(SDL_GetError());
-    }
-    const auto& state = overlay_states_[slot];
-    const std::array brightness{
-        state.red, state.green, state.blue};
-    auto* pixels = static_cast<std::uint8_t*>(adjusted->pixels);
-    for (int y = 0; y < adjusted->h; ++y) {
-        auto* row = pixels + static_cast<std::size_t>(y) * adjusted->pitch;
-        for (int x = 0; x < adjusted->w; ++x) {
-            auto* pixel = row + static_cast<std::size_t>(x) * 4;
-            for (int channel = 0; channel < 3; ++channel) {
-                const int value = pixel[channel];
-                const int light = brightness[channel];
-                pixel[channel] = static_cast<std::uint8_t>(
-                    light < 128
-                        ? value * light / 128
-                        : value
-                            + (255 - value) * (light - 128) / 128);
-            }
-        }
-    }
-    overlays_[slot] = texture_from_surface(adjusted.get());
-}
-
 
 }  // namespace th2app
