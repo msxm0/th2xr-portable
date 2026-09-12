@@ -384,11 +384,15 @@ private:
     // AVG_SetBackPos and the cases of AVG_ControlShake that transform
     // GRP_BACK, applied to the background graph and the darkened copy that
     // has to travel with it.
-    // BAK_SLIDE_* moves GRP_BACK off its rest position, so the background
-    // must not also be drawn where it normally sits - the transition puts
-    // both pictures on screen itself.  Every other type leaves GRP_BACK
-    // alone and composites over it.
-    bool transition_moves_background() const;
+    // True while a wipe that the display layer can express as graph
+    // parameters is running.  AVG_ControlBackChange parks the outgoing
+    // snapshot in GRP_BACK+1 at LAY_BACK, lifts GRP_BACK to LAY_BACK+1 and
+    // then only ever calls DSP_SetGraphParam, DSP_SetGraphZoom2 or
+    // DSP_SetGraphMove on the two of them - no blending of its own.  The
+    // pattern wipes are the exception: they need their mask.
+    bool transition_drives_graphs() const;
+    // AVG_ControlBackChange's per-frame half, for the types above.
+    void control_back_change();
     // How far through the running wipe we are, 0..1.  Zero when none is.
     float transition_progress() const;
     void setup_background_graphs(

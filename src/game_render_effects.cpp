@@ -629,102 +629,16 @@ void Game::draw_geometric_transition(float progress)
     const SDL_FRect full{0.0f, 0.0f, 800.0f, 600.0f};
 
     switch (transition.type) {
-    case 11: {
-        // BAK_CFZOOM1.  Two different rates, which is easy to miss:
-        //     rate = 256-rate*rate/256;      DRW_BLD(128-rate/2)
-        //     rate = 256-256*cnt/back_max;   rate = rate*rate/256;
-        //     DSP_SetGraphZoom2( GRP_BACK, ..., rate )
-        // The first is the incoming picture's alpha, the second its zoom.
-        // Using the alpha's rate for both left the zoom wrong everywhere
-        // except the two endpoints, where they happen to agree.
-        const int faded = 256 - rate * rate / 256;
-        const int inverse = 256 - rate;
-        const int zoom = inverse * inverse / 256;
-        const float scale = (zoom + 256.0f) / 256.0f;
-        SDL_FRect rectangle{
-            400.0f - 400.0f * scale, 300.0f - 300.0f * scale,
-            800.0f * scale, 600.0f * scale};
-        draw_old(full);
-        SDL_SetTextureAlphaModFloat(
-            transition.composite.get(), (128.0f - faded / 2.0f) / 128.0f);
-        SDL_RenderTexture(
-            renderer_, transition.composite.get(), nullptr, &rectangle);
-        break;
-    }
-    case 12: {
-        const int inverse = 256 - rate;
-        const int eased = 256 - inverse * inverse / 256;
-        const float scale = (eased * 2.0f + 256.0f) / 256.0f;
-        SDL_FRect rectangle{
-            400.0f - 400.0f * scale, 300.0f - 300.0f * scale,
-            800.0f * scale, 600.0f * scale};
-        draw_old(rectangle);
-        SDL_SetTextureAlphaModFloat(
-            transition.composite.get(), eased / 256.0f);
-        SDL_RenderTexture(
-            renderer_, transition.composite.get(), nullptr, nullptr);
-        break;
-    }
-    case 13: {
-        const int inverse = 256 - rate;
-        const int eased = inverse * inverse / 256;
-        const float scale = 0.5f + eased / 512.0f;
-        SDL_FRect rectangle{
-            400.0f - 400.0f * scale, 300.0f - 300.0f * scale,
-            800.0f * scale, 600.0f * scale};
-        draw_old(rectangle, eased / 256.0f);
-        break;
-    }
-    case 14: {
-        const int inverse = 256 - rate;
-        const int zoom = -(inverse * inverse / 256) / 2;
-        const float scale = (zoom + 256.0f) / 256.0f;
-        SDL_FRect rectangle{
-            400.0f - 400.0f * scale, 300.0f - 300.0f * scale,
-            800.0f * scale, 600.0f * scale};
-        // GRP_BACK+1 is still on at LAY_BACK and nothing clears, so the
-        // old screen stays behind the shrinking new one.  Clearing to
-        // black instead threw it away.
-        draw_old(full);
-        SDL_SetTextureAlphaModFloat(
-            transition.composite.get(), (32.0f - inverse / 8.0f) / 32.0f);
-        SDL_RenderTexture(
-            renderer_, transition.composite.get(), nullptr, &rectangle);
-        break;
-    }
-    case 15: {
+    // BAK_CFZOOM1..4 and BAK_SLIDE_UP..LE are graph parameters now; see
+    // control_back_change().  What is left here are the types no script
+    // uses, kept because they cost nothing and the numbering would be
+    // confusing without them.
+    case 15: {  // BAK_KAMI - simplified; the engine uses four graphs
         const float x = 800.0f * rate / 256.0f;
         SDL_FRect left{-x, 0.0f, 800.0f, 600.0f};
         SDL_FRect right{x, 0.0f, 800.0f, 600.0f};
         draw_old(left, 0.5f);
         draw_old(right, 0.5f);
-        break;
-    }
-    case 16:
-    case 17:
-    case 18:
-    case 19: {
-        // BAK_SLIDE_*.  Both pictures move, in opposite directions:
-        //     DSP_SetGraphMove( GRP_BACK+0, 0, y-DISP_Y )   incoming
-        //     DSP_SetGraphMove( GRP_BACK+1, 0, y )          snapshot
-        // and both take DRW_BLD(rate).  Only the snapshot was moving here,
-        // so the new picture appeared in place rather than sliding in
-        // behind the old one leaving.
-        const int inverse = 256 - rate;
-        const float x = 800.0f
-            - 800.0f * inverse * inverse / (256.0f * 256.0f);
-        const float y = 600.0f
-            - 600.0f * inverse * inverse / (256.0f * 256.0f);
-        SDL_FRect leaving = full;
-        switch (transition.type) {
-        case 16: leaving.y = y; break;         // up
-        case 17: leaving.y = -y; break;        // down
-        case 18: leaving.x = -x; break;        // right
-        default: leaving.x = x; break;         // 19, left
-        }
-        // GRP_BACK carries its own move and DRW_BLD(rate); see
-        // setup_background_graphs().  Only the snapshot is left to draw.
-        draw_old(leaving, rate / 256.0f);
         break;
     }
     case 20: {
