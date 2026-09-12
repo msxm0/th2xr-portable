@@ -105,12 +105,20 @@ public:
     // The calls AVG_ControlChar makes into the rest of the engine.  Named
     // after what they are so a transcribed line still reads as itself.
     struct Hooks {
-        // AVG_LoadChar( index, cno, pose, BackStruct.tone_no, in_type )
-        std::function<void(int index, int cno, int pose, int in_type)>
-            load_char;
+        // The decode half of AVG_LoadChar: put character `cno` pose `pose`
+        // into bitmap slot `bmp_slot`.  The graph setup that follows it in
+        // the original stays in avg_load_char below, so the sequence is the
+        // same whoever calls it.
+        std::function<void(int bmp_slot, int cno, int pose, int in_type)>
+            load_char_bitmap;
         std::function<void()> reset_half_tone;          // AVG_ResetHalfTone
         std::function<void(bool)> novel_message_disp;   // AVG_SetNovelMessageDisp
         std::function<void()> copy_back;                // AVG_CopyBack(OFF)
+        // Called whenever a character has just been composited into
+        // BMP_BACK.  Nothing in the original needs this - it is the data
+        // dependency BMP_BACKHALF has on the plate, which the engine gets
+        // from its call order and we have to state.
+        std::function<void()> plate_baked;
         std::function<void()> create_back_cscope;       // AVG_CreateBackCScope
         std::function<bool()> window_cond;              // AVG_GetWindowCond
         std::function<void()> close_window;             // AVG_CloseWindow(OFF)
@@ -160,18 +168,36 @@ public:
     // layer and then by slot.
     void set_back_char(int x, int y, int char_disp);
 
+    // AVG_CheckCharLocate: where this character is standing, or -1 if it is
+    // not on screen.  The C and CW opcodes default their locate from it.
+    int check_char_locate(int char_no) const;
+
     // AVG_WaitChar: true while the script must stay on this instruction.
     bool wait_char(int char_no) const;
+    // True while any character is mid-animation, which is what holds the
+    // script as a whole rather than one instruction.
+    bool any_animating() const;
 
     // AVG_ControlChar, run once a frame between the script and the draw.
     void control_char();
 
     void init_char();                                      // AVG_InitChar
 
+    // Re-decodes every live character's bitmap, which is what a tone change
+    // needs: AVG_LoadChar picks the tone curve from BackStruct.
+    void reload_all();
+    // Runs every animation out to its end in one go, for the fast-forward.
+    void finish_animations();
+    // Registers a character directly, for a savegame load - the equivalent
+    // of the CHAR_TYPE_DIRECT path with the slot chosen explicitly.
+    void restore(int index, int cno, int pose, int locate, int layer,
+                 int bright, int alph, bool waiting, bool pending_release);
+
     const CharState& state(int index) const { return chars_.at(index); }
     CharState& state(int index) { return chars_.at(index); }
 
 private:
+    void avg_load_char(int index, int cno, int pose, int in_type);
     void set_char_pos(int index, int x);                   // SetCharPos
     int locate_offset(int index) const;                    // CharPosTable fold
 

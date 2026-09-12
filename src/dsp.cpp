@@ -190,16 +190,17 @@ void Display::create_bmp(int bno, int width, int height)
         && bitmap.width == width && bitmap.height == height) {
         return;
     }
-    bitmap.texture.reset(SDL_CreateTexture(
+    bitmap.owned.reset(SDL_CreateTexture(
         renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET,
         width, height));
+    bitmap.view = bitmap.owned.get();
     bitmap.width = width;
     bitmap.height = height;
     bitmap.pos_x = 0;
     bitmap.pos_y = 0;
-    bitmap.renderable = bitmap.texture != nullptr;
-    if (bitmap.texture) {
-        SDL_SetTextureBlendMode(bitmap.texture.get(), SDL_BLENDMODE_BLEND);
+    bitmap.renderable = bitmap.view != nullptr;
+    if (bitmap.view) {
+        SDL_SetTextureBlendMode(bitmap.view, SDL_BLENDMODE_BLEND);
     }
 }
 
@@ -224,12 +225,29 @@ void Display::set_bmp(int bno, Texture texture, int width, int height)
         return;
     }
     auto& bitmap = bitmaps_[bno];
-    bitmap.texture = std::move(texture);
+    bitmap.owned = std::move(texture);
+    bitmap.view = bitmap.owned.get();
     bitmap.width = width;
     bitmap.height = height;
     bitmap.pos_x = 0;
     bitmap.pos_y = 0;
     bitmap.renderable = false;
+}
+
+void Display::borrow_bmp(
+    int bno, SDL_Texture* texture, int width, int height, bool renderable)
+{
+    if (bno < 0 || bno >= bitmap_max) {
+        return;
+    }
+    auto& bitmap = bitmaps_[bno];
+    bitmap.owned.reset();
+    bitmap.view = texture;
+    bitmap.width = width;
+    bitmap.height = height;
+    bitmap.pos_x = 0;
+    bitmap.pos_y = 0;
+    bitmap.renderable = renderable && texture != nullptr;
 }
 
 bool Display::ensure_renderable(int bno)
@@ -244,6 +262,11 @@ bool Display::ensure_renderable(int bno)
     if (bitmap.width <= 0 || bitmap.height <= 0) {
         return false;
     }
+    if (bitmap.view && !bitmap.owned) {
+        // Borrowed and not a target: promoting would swap in a texture the
+        // owner never sees, so refuse rather than silently diverge.
+        return false;
+    }
     // Promote in place: a bitmap loaded as a plain texture becomes a target
     // the first time something renders into it, keeping whatever it held.
     Texture promoted{SDL_CreateTexture(
@@ -253,7 +276,7 @@ bool Display::ensure_renderable(int bno)
         return false;
     }
     SDL_SetTextureBlendMode(promoted.get(), SDL_BLENDMODE_BLEND);
-    if (bitmap.texture) {
+    if (bitmap.view) {
         SDL_Texture* const held = SDL_GetRenderTarget(renderer_);
         float scale_x = 1.0f;
         float scale_y = 1.0f;
@@ -263,13 +286,14 @@ bool Display::ensure_renderable(int bno)
         SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
         SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 0);
         SDL_RenderClear(renderer_);
-        SDL_SetTextureBlendMode(bitmap.texture.get(), SDL_BLENDMODE_NONE);
-        SDL_RenderTexture(renderer_, bitmap.texture.get(), nullptr, nullptr);
-        SDL_SetTextureBlendMode(bitmap.texture.get(), SDL_BLENDMODE_BLEND);
+        SDL_SetTextureBlendMode(bitmap.view, SDL_BLENDMODE_NONE);
+        SDL_RenderTexture(renderer_, bitmap.view, nullptr, nullptr);
+        SDL_SetTextureBlendMode(bitmap.view, SDL_BLENDMODE_BLEND);
         SDL_SetRenderScale(renderer_, scale_x, scale_y);
         SDL_SetRenderTarget(renderer_, held);
     }
-    bitmap.texture = std::move(promoted);
+    bitmap.owned = std::move(promoted);
+    bitmap.view = bitmap.owned.get();
     bitmap.renderable = true;
     return true;
 }
@@ -302,18 +326,18 @@ void Display::copy_bmp2(int db_no, int sb_no, int r, int g, int b)
     float scale_x = 1.0f;
     float scale_y = 1.0f;
     SDL_GetRenderScale(renderer_, &scale_x, &scale_y);
-    SDL_SetRenderTarget(renderer_, destination.texture.get());
+    SDL_SetRenderTarget(renderer_, destination.view);
     SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
     const auto shade = [](int value) {
         return static_cast<Uint8>(
             std::clamp(value * 255 / bright_neutral, 0, 255));
     };
     SDL_SetTextureColorMod(
-        source.texture.get(), shade(r), shade(g), shade(b));
-    SDL_SetTextureBlendMode(source.texture.get(), SDL_BLENDMODE_NONE);
-    SDL_RenderTexture(renderer_, source.texture.get(), nullptr, nullptr);
-    SDL_SetTextureColorMod(source.texture.get(), 255, 255, 255);
-    SDL_SetTextureBlendMode(source.texture.get(), SDL_BLENDMODE_BLEND);
+        source.view, shade(r), shade(g), shade(b));
+    SDL_SetTextureBlendMode(source.view, SDL_BLENDMODE_NONE);
+    SDL_RenderTexture(renderer_, source.view, nullptr, nullptr);
+    SDL_SetTextureColorMod(source.view, 255, 255, 255);
+    SDL_SetTextureBlendMode(source.view, SDL_BLENDMODE_BLEND);
     SDL_SetRenderScale(renderer_, scale_x, scale_y);
     SDL_SetRenderTarget(renderer_, held);
 }
@@ -339,7 +363,7 @@ SDL_Texture* Display::bmp_texture(int bno) const
     if (bno < 0 || bno >= bitmap_max) {
         return nullptr;
     }
-    return bitmaps_[bno].texture.get();
+    return bitmaps_[bno].view;
 }
 
 void Display::get_disp_bmp(int bno)
@@ -481,11 +505,11 @@ void Display::set_graph_target(int gno, int target)
     float scale_x = 1.0f;
     float scale_y = 1.0f;
     SDL_GetRenderScale(renderer_, &scale_x, &scale_y);
-    SDL_SetRenderTarget(renderer_, bitmaps_[target].texture.get());
+    SDL_SetRenderTarget(renderer_, bitmaps_[target].view);
     SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
     // DrawGraphBmp( dest_bmp, 0, 0, ... ) - into the bitmap with no global
     // offset, whatever the screen's happens to be.
-    draw_one(graph, bitmaps_[target].texture.get(), 0, 0);
+    draw_one(graph, bitmaps_[target].view, 0, 0);
     SDL_SetRenderScale(renderer_, scale_x, scale_y);
     SDL_SetRenderTarget(renderer_, held);
 
@@ -846,7 +870,7 @@ void Display::draw_graph_bmp(
         graph, global_x, global_y, bitmap.pos_x, bitmap.pos_y,
         bright_r_, bright_g_, bright_b_);
 
-    SDL_Texture* const texture = bitmap.texture.get();
+    SDL_Texture* const texture = bitmap.view;
     SDL_SetTextureColorMod(
         texture, geometry.red, geometry.green, geometry.blue);
     const int alpha = draw_alpha_of(graph.param);
@@ -949,45 +973,40 @@ void Display::draw_one(
     }
 }
 
-void Display::draw(SDL_Texture* dest, const LayerHook& on_layer)
+void Display::begin_frame(SDL_Texture* dest)
 {
-    const int x = global_x_;
-    const int y = global_y_;
-
-    SDL_SetRenderTarget(renderer_, dest);
-    SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
-
     // GetGraph( dest, draw_mode ) - armed by DSP_GetDispBmp, taken once.
     // Note that `dest` is never cleared, here or anywhere: what a transform
     // fails to cover keeps last frame's picture, which is the behaviour the
     // shakes depend on.
-    if (capture_ && capture_bno_ >= 0 && capture_bno_ < bitmap_max) {
-        capture_ = false;
-        Bitmap& into = bitmaps_[capture_bno_];
-        if (into.valid() && into.renderable) {
-            SDL_SetRenderTarget(renderer_, into.texture.get());
-            SDL_SetTextureBlendMode(dest, SDL_BLENDMODE_NONE);
-            SDL_RenderTexture(renderer_, dest, nullptr, nullptr);
-            SDL_SetTextureBlendMode(dest, SDL_BLENDMODE_BLEND);
-            SDL_SetRenderTarget(renderer_, dest);
-        }
+    if (!capture_ || capture_bno_ < 0 || capture_bno_ >= bitmap_max) {
+        return;
     }
-
-    for (int lno = 0; lno < layer_max; ++lno) {
-        for (const auto& graph : graphs_) {
-            if (!graph.flag || !graph.disp || graph.layer != lno) {
-                continue;
-            }
-            draw_one(graph, dest, x, y);
-        }
-        // Where DrawGraphText would run.  The glyphs are drawn by the
-        // overlay pass at monitor resolution instead, so this only reports
-        // that the layer has come round.
-        if (on_layer) {
-            on_layer(lno);
-        }
+    capture_ = false;
+    Bitmap& into = bitmaps_[capture_bno_];
+    if (!into.valid() || !into.renderable) {
+        return;
     }
+    SDL_Texture* const held = SDL_GetRenderTarget(renderer_);
+    SDL_SetRenderTarget(renderer_, into.view);
+    SDL_SetTextureBlendMode(dest, SDL_BLENDMODE_NONE);
+    SDL_RenderTexture(renderer_, dest, nullptr, nullptr);
+    SDL_SetTextureBlendMode(dest, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderTarget(renderer_, held);
+}
 
+void Display::draw_layer(int layer)
+{
+    for (const auto& graph : graphs_) {
+        if (!graph.flag || !graph.disp || graph.layer != layer) {
+            continue;
+        }
+        draw_one(graph, nullptr, global_x_, global_y_);
+    }
+}
+
+void Display::end_frame()
+{
     // A graph that was rendered into a bitmap this frame comes back on for
     // the next one.  AVG_ControlChar relies on it: it bakes with
     // DSP_SetGraphTarget and then switches the graph off itself, by
@@ -1002,25 +1021,45 @@ void Display::draw(SDL_Texture* dest, const LayerHook& on_layer)
     // The four bands DSP_SetGraphGlobalPos pulls away from, with signed
     // widths so the same four cover an offset in any direction and two
     // collapse to nothing each time.
-    if (x != 0 || y != 0) {
-        const SDL_FRect bands[4] = {
-            {0.0f, 0.0f, static_cast<float>(x),
-             static_cast<float>(display_height)},
-            {static_cast<float>(x), 0.0f,
-             static_cast<float>(display_width - x), static_cast<float>(y)},
-            {static_cast<float>(display_width + x), static_cast<float>(y),
-             static_cast<float>(-x), static_cast<float>(display_height - y)},
-            {static_cast<float>(x), static_cast<float>(display_height + y),
-             static_cast<float>(display_width - x), static_cast<float>(-y)},
-        };
-        SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
-        SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
-        for (const auto& band : bands) {
-            if (band.w > 0.0f && band.h > 0.0f) {
-                SDL_RenderFillRect(renderer_, &band);
-            }
+    const int x = global_x_;
+    const int y = global_y_;
+    if (x == 0 && y == 0) {
+        return;
+    }
+    const SDL_FRect bands[4] = {
+        {0.0f, 0.0f, static_cast<float>(x),
+         static_cast<float>(display_height)},
+        {static_cast<float>(x), 0.0f,
+         static_cast<float>(display_width - x), static_cast<float>(y)},
+        {static_cast<float>(display_width + x), static_cast<float>(y),
+         static_cast<float>(-x), static_cast<float>(display_height - y)},
+        {static_cast<float>(x), static_cast<float>(display_height + y),
+         static_cast<float>(display_width - x), static_cast<float>(-y)},
+    };
+    SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
+    for (const auto& band : bands) {
+        if (band.w > 0.0f && band.h > 0.0f) {
+            SDL_RenderFillRect(renderer_, &band);
         }
     }
+}
+
+void Display::draw(SDL_Texture* dest, const LayerHook& on_layer)
+{
+    SDL_SetRenderTarget(renderer_, dest);
+    SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
+    begin_frame(dest);
+    for (int lno = 0; lno < layer_max; ++lno) {
+        draw_layer(lno);
+        // Where DrawGraphText would run.  The glyphs are drawn by the
+        // overlay pass at monitor resolution instead, so this only reports
+        // that the layer has come round.
+        if (on_layer) {
+            on_layer(lno);
+        }
+    }
+    end_frame();
 }
 
 }  // namespace th2

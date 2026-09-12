@@ -8,6 +8,8 @@
 #include "frame_budget.hpp"
 #include "image.hpp"
 #include "texture.hpp"
+#include "dsp.hpp"
+#include "avg_char.hpp"
 #include "gl_transition.hpp"
 #include "gamepad_input.hpp"
 #include "imgui_layer.hpp"
@@ -131,29 +133,6 @@ private:
     struct CharacterTexture {
         int pose = -1;
         Texture texture;
-    };
-    enum class CharacterAnimationKind {
-        none,
-        enter,
-        leave,
-        pose,
-        locate,
-        brightness,
-        alpha,
-    };
-    struct CharacterAnimation {
-        CharacterAnimationKind kind = CharacterAnimationKind::none;
-        int type = 0;
-        int frames = 1;
-        int from_locate = 1;
-        int to_locate = 1;
-        int from_brightness = 128;
-        int to_brightness = 128;
-        int from_alpha = 256;
-        int to_alpha = 256;
-        bool blocking = false;
-        Texture previous;
-        std::chrono::steady_clock::time_point started;
     };
     struct OverlayState {
         std::string name;
@@ -382,37 +361,31 @@ private:
     std::array<Texture, 32> overlays_{};
     std::array<Surface, 32> overlay_pixels_{};
     std::array<OverlayState, 32> overlay_states_{};
-    th2::Characters characters_;
+    // The original's display layer and character machine.  display_ owns
+    // the graph table; avg_char_ is CharStruct[MAX_CHAR] and AVG_ControlChar.
+    // Both need the renderer, so they are built in the constructor body.
+    std::optional<th2::Display> display_;
+    std::optional<th2::AvgChar> avg_char_;
+    th2::Display& display() { return *display_; }
+    th2::AvgChar& chars() { return *avg_char_; }
+    const th2::AvgChar& chars() const { return *avg_char_; }
+    void build_display();
+    // AVG_ControlChar's view of BackStruct, and the calls it makes outward.
+    th2::AvgChar::Hooks character_hooks();
+    // Points BMP_BACK / BMP_BACK2 at the plates the game still owns, so a
+    // character can bake into them before the background is a graph itself.
+    void publish_background_bitmaps();
+
     std::array<CharacterTexture, 32> character_textures_{};
-    std::array<CharacterAnimation, 32> character_animations_{};
-    std::array<bool, 32> character_staged_{};
-    // CharStruct[i].cut_mode, driven by AVG_ControlChar.  A settled
-    // character is normally *baked into the background bitmap* rather than
-    // drawn as a layer: mode 0 means "bake me next frame", 1 means "I am in
-    // the bitmap, do not draw me", 2 means "draw me live".  Only a shake
-    // sets 2, which is why a character stops being part of the background
-    // for the duration of one.
-    //
-    // Modelling this rather than always drawing characters as a layer is
-    // what makes the derived bitmaps come out right without special cases:
-    // the half tone is a copy of the background *after* baking, so it
-    // contains the characters, and a background transform moves them because
-    // they are the background.
-    enum class CutMode { bake = 0, baked = 1, live = 2 };
-    std::array<CutMode, 32> character_cut_mode_{};
     // BMP_BACK: the background with the baked characters in it.  background_
     // is BMP_BACK2, the clean copy taken before any of them were added, and
     // is what this is rebuilt from.
     Texture background_baked_;
     bool background_baked_dirty_ = true;
     void rebuild_baked_background();
-    // Draws one character, either onto the scene or into the baked bitmap.
-    // False when there was nothing to draw - the texture has not loaded yet -
-    // so a bake can tell the difference between "in the bitmap" and "never
-    // made it in", which is otherwise a character that disappears for good.
-    bool draw_character(const th2::CharacterState& character,
-                        const ShakeSample& shake, bool shake_characters);
-    std::array<bool, 32> character_pending_removal_{};
+    // AVG_CopyBack(OFF): BMP_BACK <- BMP_BACK2, creating the plate if it is
+    // not there yet.  Returns false when there is no background to copy.
+    bool copy_back_plate();
     th2::AudioChannel bgm_;
     int bgm_track_ = -1;
     bool bgm_loop_ = false;
@@ -688,7 +661,6 @@ private:
     Texture shake_target_;
     Texture pose_blend_target_;
     // Set while a character animation has the message window hidden.
-    bool message_restore_after_animation_ = false;
     float half_tone_count_ = 0.0f;
     // AVG_SetHalfTone() is called when a message is set, not every frame the
     // message happens to be up - so the wash is armed by a line arriving and
@@ -815,6 +787,11 @@ private:
     bool sidebar_mouse_near_ = false;
     bool suppress_sidebar_mouse_up_ = false;
     bool message_visible_ = true;
+    // Message.wstep: whether the message *window* is up, which is a
+    // different thing from whether the text is shown.  AVG_GetWindowCond
+    // reads this, and AVG_ControlChar uses it to know the window was open
+    // before an animation started so it can put it back afterwards.
+    bool message_window_open_ = true;
     int save_page_ = 0;
     int save_hover_ = -1;
     int save_confirm_slot_ = -1;
@@ -995,10 +972,17 @@ private:
     std::vector<ToneCurveSpec> character_tone_curves() const;
     int character_effect_frames(int frames) const;
     bool character_animation_active() const;
-    void start_character_animation(
-        int character_number, CharacterAnimation animation);
+    // AVG_ControlChar counts in frames and the engine runs at sixty of them
+    // a second; we run at the display's rate, which is often twice that.
+    // This is the leftover time between sixtieths, so the state machine is
+    // stepped the number of times the original would have stepped it.
+    // Set when a character has been composited into BMP_BACK, so the
+    // darkened copy taken from it can be refreshed once at the end of the
+    // pass rather than per character.
+    bool half_tone_copy_stale_ = false;
+    double character_control_debt_ = 0.0;
+    std::chrono::steady_clock::time_point character_control_time_{};
     void update_character_animations();
-    void set_character(const th2::Event& event);
     void play_se(int channel, int sound, bool loop, int volume, int fade = 0,
                  bool wait_for_completion = false);
     void sync_game_flags();
@@ -1335,7 +1319,6 @@ private:
     void reset_render_state();
     // Hides the message window for a character animation, remembering to
     // put it back when the animation ends.
-    void hide_message_for_animation();
     // AVG_ControlBackFade() is DSP_SetGraphBright() on the background and on
     // every script bitmap - a property of each object, not a wash over the
     // screen.  Applied per texture it follows whatever transform that object

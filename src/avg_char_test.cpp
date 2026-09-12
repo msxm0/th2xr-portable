@@ -32,14 +32,9 @@ struct Rig {
     th2::AvgChar::Hooks hooks()
     {
         th2::AvgChar::Hooks h;
-        h.load_char = [this](int index, int, int, int) {
+        h.load_char_bitmap = [this](int bmp_slot, int, int, int) {
             ++loaded;
-            calls.push_back("load " + std::to_string(index));
-            // AVG_LoadChar ends by giving the slot a graph, which the rest
-            // of the machine then drives.
-            display.set_graph(
-                th2::grp_char + index, th2::bmp_char + index * 2,
-                th2::lay_char, true);
+            calls.push_back("load " + std::to_string(bmp_slot));
         };
         h.reset_half_tone = [this] { calls.push_back("reset_half_tone"); };
         h.novel_message_disp = [this](bool on) {

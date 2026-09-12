@@ -310,18 +310,31 @@ void Game::save_body(std::ostream& out) const
     }
 
     // Characters
-    const auto ordered = characters_.ordered();
-    write_u32(out, static_cast<std::uint32_t>(ordered.size()));
-    for (const auto& ch : ordered) {
-        write_i32(out, ch.number);
+    // CharStruct[MAX_CHAR], slot order - which is the order AVG_SetBackChar
+    // bakes in, so it has to survive a round trip.  The two flags are
+    // CHAR_COND_WAIT (registered but not shown yet) and CHAR_TYPE_WAIT2
+    // (released at the next AVG_SetBackReleaseChar), which is what the CW
+    // and CRW forms leave behind.
+    std::uint32_t live = 0;
+    for (int i = 0; i < th2::max_char; ++i) {
+        if (chars().state(i).flag) {
+            ++live;
+        }
+    }
+    write_u32(out, live);
+    for (int i = 0; i < th2::max_char; ++i) {
+        const auto& ch = chars().state(i);
+        if (!ch.flag) {
+            continue;
+        }
+        write_i32(out, ch.cno);
         write_i32(out, ch.pose);
-        write_i32(out, ch.locate);
+        write_i32(out, ch.loc1);
         write_i32(out, ch.layer);
-        write_i32(out, ch.brightness);
-        write_i32(out, ch.alpha);
-        write_i32(out, character_staged_.at(ch.number) ? 1 : 0);
-        write_i32(
-            out, character_pending_removal_.at(ch.number) ? 1 : 0);
+        write_i32(out, ch.fade1);
+        write_i32(out, ch.alph1);
+        write_i32(out, ch.cond == th2::char_cond_wait ? 1 : 0);
+        write_i32(out, ch.type == th2::char_type_wait2 ? 1 : 0);
     }
 
     // Overlays
@@ -570,11 +583,7 @@ bool Game::load_body(std::istream& in)
     restore_background();
 
     // Characters
-    characters_ = {};
-    character_textures_ = {};
-    character_animations_ = {};
-    character_staged_ = {};
-    character_pending_removal_ = {};
+    chars().init_char();
     const auto char_count = read_u32(in);
     for (std::uint32_t i = 0; i < char_count; ++i) {
         const auto number = read_i32(in);
@@ -585,12 +594,12 @@ bool Game::load_body(std::istream& in)
         const auto alpha = read_i32(in);
         const bool staged = read_i32(in) != 0;
         const bool pending_removal = read_i32(in) != 0;
-        auto& ch = characters_.set(
-            number, pose, locate, layer, brightness, alpha);
-        character_staged_.at(number) = staged;
-        character_pending_removal_.at(number) = pending_removal;
-        load_character_texture(ch);
+        // Back into the slot it came out of, so the bake order is the same.
+        chars().restore(
+            static_cast<int>(i), number, pose, locate, layer, brightness,
+            alpha, staged, pending_removal);
     }
+    background_baked_dirty_ = true;
 
     // Overlays
     for (std::size_t i = 0; i < overlays_.size(); ++i) {

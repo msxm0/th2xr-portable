@@ -383,12 +383,7 @@ void Game::skip(bool force_unread)
     }
     if (character_animation_active()) {
         if (force_unread) {
-            for (auto& animation : character_animations_) {
-                if (animation.kind != CharacterAnimationKind::none) {
-                    animation.started -= std::chrono::milliseconds(
-                        animation.frames * 1000 / 60);
-                }
-            }
+            chars().finish_animations();
         }
         return;
     }

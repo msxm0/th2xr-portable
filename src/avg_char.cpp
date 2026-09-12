@@ -81,6 +81,20 @@ int AvgChar::locate_offset(int index) const
     return 0;
 }
 
+void AvgChar::avg_load_char(int index, int cno, int pose, int in_type)
+{
+    // AVG_LoadChar: decode into BMP_CHAR+index*2+grp, then give the slot a
+    // graph at LAY_CHAR+layer and put it where the character stands.
+    CharState& character = chars_[index];
+    const int slot = bmp_char + index * 2 + character.grp;
+    if (hooks_.load_char_bitmap) {
+        hooks_.load_char_bitmap(slot, cno, pose, in_type);
+    }
+    display_.set_graph(
+        grp_char + index, slot, lay_char + character.layer, true, -2);
+    set_char_pos(index, char_locate(character.loc1));
+}
+
 void AvgChar::set_char_pos(int index, int x)
 {
     x += locate_offset(index);
@@ -156,9 +170,7 @@ void AvgChar::set_char(
                 character.cut_mode = 0;
             } else {
                 character.cond = char_cond_nomal;
-                if (hooks_.load_char) {
-                    hooks_.load_char(index, char_no, pose, in_type);
-                }
+                avg_load_char(index, char_no, pose, in_type);
                 display_.set_graph_param(
                     grp_char + index, drw_bld_of(alph));
                 character.cut_mode = 0;
@@ -196,9 +208,7 @@ void AvgChar::set_char(
         } else {
             character.cut_mode = 0;
             character.cond = char_cond_nomal;
-            if (hooks_.load_char) {
-                hooks_.load_char(index, char_no, pose, in_type);
-            }
+                avg_load_char(index, char_no, pose, in_type);
             display_.set_graph_param(grp_char + index, drw_bld_of(alph));
         }
         character.type = in_type;
@@ -227,9 +237,7 @@ void AvgChar::set_char(
         // Registered as already baked, which AVG_ControlChar's first loop
         // notices next frame and turns into a full plate rebuild.
         character.cut_mode = 1;
-        if (hooks_.load_char) {
-            hooks_.load_char(index, char_no, pose, in_type);
-        }
+                avg_load_char(index, char_no, pose, in_type);
     }
 }
 
@@ -295,9 +303,7 @@ void AvgChar::set_char_pose(int char_no, int pose, int in_type, int frame)
     if (hooks_.novel_message_disp) {
         hooks_.novel_message_disp(false);
     }
-    if (hooks_.load_char) {
-        hooks_.load_char(index, char_no, pose, char_type_cfade);
-    }
+    avg_load_char(index, char_no, pose, char_type_cfade);
     display_.set_graph_bset(
         grp_char + index, bmp_char + index * 2 + !character.grp, 0);
 }
@@ -441,10 +447,8 @@ void AvgChar::set_back_char(int x, int y, int char_disp)
                 continue;
             }
             character.cond = char_cond_nomal;
-            if (hooks_.load_char) {
-                hooks_.load_char(i, character.cno, character.pose,
-                                 char_type_direct);
-            }
+            avg_load_char(i, character.cno, character.pose,
+                          char_type_direct);
             character.cut_mode = char_disp == 1 ? 1 : 0;
             display_.set_graph_param(
                 grp_char + i, drw_bld_of(character.alph1));
@@ -460,8 +464,28 @@ void AvgChar::set_back_char(int x, int y, int char_disp)
             display_.set_graph_clip(grp_char + i, 0, 0, sx, sy);
             display_.set_graph_target(grp_char + i, bmp_back);
             display_.set_graph_move(grp_char + i, mx, my);
+            if (hooks_.plate_baked) {
+                hooks_.plate_baked();
+            }
         }
     }
+}
+
+int AvgChar::check_char_locate(int char_no) const
+{
+    const int index = char_index(char_no);
+    return index == max_char ? -1 : chars_[index].loc1;
+}
+
+bool AvgChar::any_animating() const
+{
+    for (const auto& character : chars_) {
+        if (character.flag && character.cond != char_cond_nomal
+            && character.cond != char_cond_wait) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool AvgChar::wait_char(int char_no) const
@@ -476,10 +500,54 @@ bool AvgChar::wait_char(int char_no) const
 
 void AvgChar::init_char()
 {
-    for (auto& character : chars_) {
-        character = CharState{};
+    for (int i = 0; i < max_char; ++i) {
+        release_char(i);
     }
     win_flag_ = 0;
+}
+
+void AvgChar::reload_all()
+{
+    for (int i = 0; i < max_char; ++i) {
+        if (chars_[i].flag) {
+            avg_load_char(i, chars_[i].cno, chars_[i].pose, char_type_direct);
+        }
+    }
+}
+
+void AvgChar::finish_animations()
+{
+    for (auto& character : chars_) {
+        if (character.flag && character.cond != char_cond_nomal
+            && character.cond != char_cond_wait) {
+            character.cnt = character.max;
+        }
+    }
+}
+
+void AvgChar::restore(
+    int index, int cno, int pose, int locate, int layer, int bright,
+    int alph, bool waiting, bool pending_release)
+{
+    if (index < 0 || index >= max_char) {
+        return;
+    }
+    CharState& character = chars_[index];
+    character = CharState{};
+    character.flag = 1;
+    character.cond = waiting ? char_cond_wait : char_cond_nomal;
+    character.type = pending_release ? char_type_wait2 : char_type_direct;
+    character.cno = cno;
+    character.pose = pose;
+    character.loc1 = locate;
+    character.loc2 = locate;
+    character.layer = layer;
+    character.fade1 = character.fade2 = bright;
+    character.alph1 = character.alph2 = alph;
+    character.cut_mode = 0;
+    avg_load_char(index, cno, pose, char_type_direct);
+    display_.set_graph_param(grp_char + index, drw_bld_of(alph));
+    display_.set_graph_fade(grp_char + index, bright);
 }
 
 void AvgChar::control_char()
@@ -563,6 +631,9 @@ void AvgChar::control_char()
                             grp_char + i, sx + back_x, sy + back_y);
                         display_.set_graph_target(grp_char + i, bmp_back);
                         display_.set_graph_move(grp_char + i, sx, sy);
+                        if (hooks_.plate_baked) {
+                            hooks_.plate_baked();
+                        }
                         character.cut_mode = 1;
                         break;
                     }
@@ -734,6 +805,9 @@ void AvgChar::control_char()
         if (character.type == char_type_wave
             && character.cond != char_cond_nomal) {
             display_.set_graph_target(grp_char + i, bmp_back);
+            if (hooks_.plate_baked) {
+                hooks_.plate_baked();
+            }
         }
 
         if (character.cond != char_cond_nomal

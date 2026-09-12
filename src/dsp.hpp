@@ -126,17 +126,22 @@ struct Graph {
 // an origin; here they are textures, with `pos` kept because DrawGraphBmp
 // subtracts it from every source coordinate.
 struct Bitmap {
-    Texture texture;
+    // A slot either owns its texture or borrows one the game still holds.
+    // Borrowing is a bridge while the background is not yet a graph: the
+    // characters have to bake into BMP_BACK, and BMP_BACK is for now the
+    // game's own plate.
+    Texture owned;
+    SDL_Texture* view = nullptr;
     int width = 0;
     int height = 0;
     int pos_x = 0;
     int pos_y = 0;
-    // Whether the texture was created with target access.  A bitmap only
-    // needs it once something renders into it (DSP_CopyBmp, SetGraphTarget,
-    // GetDispBmp), so it is promoted on demand rather than up front.
+    // Whether the texture can be rendered into.  A slot only needs it once
+    // something draws into it (DSP_CopyBmp, SetGraphTarget, GetDispBmp), so
+    // an owned one is promoted on demand rather than up front.
     bool renderable = false;
 
-    bool valid() const { return texture != nullptr; }
+    bool valid() const { return view != nullptr; }
 };
 
 // What DrawGraphBmp works out before handing the blit to the rasteriser:
@@ -250,6 +255,11 @@ public:
     // DSP_LoadBmp, which decodes from the archive.  Loading stays where it
     // is; only the residency is modelled here.
     void set_bmp(int bno, Texture texture, int width, int height);
+    // Points a slot at a texture the caller keeps owning.  `renderable`
+    // says whether it was created with target access, since a borrowed slot
+    // cannot be promoted - the owner would not see the replacement.
+    void borrow_bmp(int bno, SDL_Texture* texture, int width, int height,
+                    bool renderable);
     void copy_bmp(int db_no, int sb_no);                   // DSP_CopyBmp
     // DSP_CopyBmp2: the same copy with a brightness applied, 128 neutral.
     void copy_bmp2(int db_no, int sb_no, int r, int g, int b);
@@ -337,6 +347,15 @@ public:
     // from.  `dest` is never cleared - that is the whole reason a shake
     // leaves last frame's picture in the corners it does not cover.
     void draw(SDL_Texture* dest, const LayerHook& on_layer = {});
+
+    // The pieces of draw(), exposed so the game can still sequence its own
+    // art pass while the background and overlays are not yet graphs.
+    // begin_frame takes the armed screen capture, draw_layer draws one
+    // layer's graphs into the current target, end_frame puts back the graphs
+    // that were rendered into a bitmap this frame and paints the bands.
+    void begin_frame(SDL_Texture* dest);
+    void draw_layer(int layer);
+    void end_frame();
 
 private:
     Graph& at(int gno) { return graphs_.at(gno); }

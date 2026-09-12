@@ -158,6 +158,7 @@ Game::Game(
         SDL_SetWindowIcon(window_, icon.get());
     }
     SDL_Log("SDL window and renderer created");
+    build_display();
 #ifdef __EMSCRIPTEN__
     // Fullscreen in a browser needs a user gesture, so it cannot be restored
     // at startup; the page starts windowed and the option starts off with it.

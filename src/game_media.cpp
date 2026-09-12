@@ -44,53 +44,28 @@ void Game::begin_background_scroll(
     };
 }
 
-void Game::load_character_texture(const th2::CharacterState& character)
-{
-    // A new pose is a new bake: AVG_LoadChar is followed by a restore from
-    // BMP_BACK2 and a fresh AVG_SetBackChar, because what is already in the
-    // bitmap cannot be taken back out.
-    background_baked_dirty_ = true;
-    auto& loaded = character_texture(character.number);
-    if (loaded.pose != character.pose || !loaded.texture) {
-        const auto asset =
-            th2::character_asset_name(character.number, character.pose);
-        loaded.texture = load_toned_texture(
-            renderer_, graphics_, asset, graphics_, character_tone_curves(),
-            nullptr, take_predecoded_image(false, asset));
-        loaded.pose = character.pose;
-    }
-}
-
 void Game::reload_character_textures()
 {
-    character_textures_ = {};
-    for (const auto& character : characters_.ordered()) {
-        load_character_texture(character);
-    }
+    // AVG_LoadChar picks its tone curve out of BackStruct, so a tone change
+    // means decoding every character again.
+    chars().reload_all();
+    background_baked_dirty_ = true;
 }
 
 void Game::apply_staged_characters()
 {
-    for (std::size_t index = 0; index < character_pending_removal_.size();
-         ++index) {
-        if (character_pending_removal_[index]) {
-            characters_.remove(static_cast<int>(index));
-            character_textures_[index] = {};
-            character_animations_[index] = {};
-        }
-        character_pending_removal_[index] = false;
-        character_staged_[index] = false;
-        background_baked_dirty_ = true;
-    }
+    // AVG_SetBackReleaseChar(): the CW/CRW forms register a change without
+    // showing it, and this is where it lands - the ones marked
+    // CHAR_TYPE_WAIT2 are released, and AVG_SetBackChar turns the waiting
+    // ones into CHAR_COND_NOMAL as it bakes them.
+    chars().set_back_release_char();
+    background_baked_dirty_ = true;
 }
 
 void Game::clear_characters()
 {
-    characters_.clear();
-    character_textures_ = {};
-    character_animations_ = {};
-    character_staged_ = {};
-    character_pending_removal_ = {};
+    chars().init_char();
+    background_baked_dirty_ = true;
 }
 
 std::size_t Game::character_index(int character_number) const
@@ -164,151 +139,48 @@ int Game::character_effect_frames(int frames) const
 
 bool Game::character_animation_active() const
 {
-    return std::ranges::any_of(
-        character_animations_, [](const CharacterAnimation& animation) {
-            return animation.kind != CharacterAnimationKind::none;
-        });
-}
-
-void Game::start_character_animation(
-    int character_number, CharacterAnimation animation)
-{
-    const auto index = character_index(character_number);
-    animation.frames = character_effect_frames(animation.frames);
-    animation.started = std::chrono::steady_clock::now();
-    if (animation.frames == 0) {
-        if (animation.kind == CharacterAnimationKind::leave) {
-            characters_.remove(character_number);
-            character_textures_[index] = {};
-            character_staged_[index] = false;
-            background_baked_dirty_ = true;
-            character_pending_removal_[index] = false;
-        }
-        return;
-    }
-    character_animations_[index] = std::move(animation);
-}
-
-void Game::hide_message_for_animation()
-{
-    // GM_AvgChar.cpp closes the message window for the duration of a
-    // character animation and reopens it when the animation ends, through a
-    // flag that remembers whether it was up (the win_flag around
-    // AVG_CloseWindow / AVG_OpenWindow).  Without the reopening the text
-    // stays gone until the script happens to print the next line, which
-    // leaves the screen bare if it waits for input first.
-    message_restore_after_animation_ |= message_visible_;
-    message_visible_ = false;
+    return avg_char_ && chars().any_animating();
 }
 
 void Game::update_character_animations()
 {
-    bool resume = false;
+    // AVG_ControlChar, run between the script and the draw.  It advances
+    // every character's counters, bakes the settled ones into BMP_BACK, and
+    // closes and reopens the message window around an animation.
+    //
+    // The original calls it once a frame at sixty frames a second and counts
+    // in whole frames, so on a faster display it has to be stepped by
+    // elapsed time instead - otherwise every character animation runs at the
+    // refresh rate rather than at the speed the script asked for.
     const auto now = std::chrono::steady_clock::now();
-    for (std::size_t index = 0; index < character_animations_.size(); ++index) {
-        auto& animation = character_animations_[index];
-        if (animation.kind == CharacterAnimationKind::none) {
-            continue;
-        }
-        const auto elapsed = std::chrono::duration<double>(
-            now - animation.started).count() * 60.0;
-        if (elapsed < animation.frames) {
-            continue;
-        }
-        if (animation.kind == CharacterAnimationKind::leave) {
-            characters_.remove(static_cast<int>(index));
-            character_textures_[index] = {};
-            character_staged_[index] = false;
-            background_baked_dirty_ = true;
-            character_pending_removal_[index] = false;
-        }
-        resume |= animation.blocking;
-        animation = {};
+    if (character_control_time_ == std::chrono::steady_clock::time_point{}) {
+        character_control_time_ = now;
     }
-    if (message_restore_after_animation_ && !character_animation_active()) {
-        message_restore_after_animation_ = false;
-        message_visible_ = true;
-    }
-    if (resume) {
-        advance();
-    }
-}
-
-void Game::set_character(const th2::Event& event)
-{
-    const int character_number = number(event, 0);
-    const auto index = character_index(character_number);
-    const auto* previous = characters_.find(character_number);
-    int locate = number(event, 2);
-    if (locate < 0) {
-        locate = event.instruction.name != "SetChar" && previous
-            ? previous->locate : 1;
-    }
-    const bool wait_form = event.instruction.name == "CW";
-    const std::size_t layer_index = wait_form ? 3 : 4;
-    const std::size_t brightness_index = wait_form ? 4 : 5;
-    const std::size_t alpha_index = wait_form ? 5 : 6;
-    const int layer = number(event, layer_index) < 0
-        ? 0 : number(event, layer_index);
-    const int brightness = number(event, brightness_index) < 0
-        ? 128 : number(event, brightness_index);
-    const int alpha = number(event, alpha_index) < 0
-        ? 256 : number(event, alpha_index);
-    if (previous && previous->pose == number(event, 1)
-        && previous->locate == locate && previous->layer == layer
-        && previous->brightness == brightness
-        && previous->alpha == alpha) {
+    character_control_debt_ += std::chrono::duration<double>(
+        now - character_control_time_).count() * 60.0;
+    character_control_time_ = now;
+    // A long stall must not be made up all at once, or an animation jumps.
+    character_control_debt_ = std::min(character_control_debt_, 8.0);
+    const int steps = static_cast<int>(character_control_debt_);
+    if (steps <= 0) {
         return;
     }
-    const int animation_type = wait_form ? 3
-        : number(event, 3) == -2 ? -1
-        : number(event, 3) < 0 ? 0 : number(event, 3);
-    // AVG_SetChar():
-    //     index = GetCharIndex(char_no);
-    //     if( index!=MAX_CHAR ){ if(...all equal...) return; }
-    //     if(in_type!=CHAR_TYPE_WAIT){
-    //         AVG_ResetHalfTone();
-    //         AVG_SetNovelMessageDisp(OFF);
-    //     }
-    // After the equality check, not before it: a call that changes nothing
-    // returns without touching either.  CHAR_TYPE_WAIT is 3, which is the
-    // CW form and a C that asks for it by number, so both are spelt the
-    // same way here.
-    if (animation_type != 3) {
-        reset_half_tone();
-        hide_message_for_animation();
+    character_control_debt_ -= steps;
+    const bool was_animating = character_animation_active();
+    for (int i = 0; i < steps; ++i) {
+        chars().control_char();
     }
-    CharacterAnimation animation;
-    animation.from_locate = previous ? previous->locate : locate;
-    animation.to_locate = locate;
-    animation.from_brightness = previous ? previous->brightness : brightness;
-    animation.to_brightness = brightness;
-    animation.from_alpha = previous ? previous->alpha : alpha;
-    animation.to_alpha = alpha;
-    animation.blocking = event.instruction.name == "C";
-    bool stage = wait_form;
-    if (event.instruction.name == "C") {
-        animation.type = animation_type;
-        stage = animation.type == 3;
-        animation.frames = animation.type == -1 ? 0 : number(event, 7);
-        animation.kind = previous && previous->pose != number(event, 1)
-            ? CharacterAnimationKind::pose
-            : CharacterAnimationKind::enter;
+    if (half_tone_copy_stale_) {
+        half_tone_copy_stale_ = false;
+        if (half_tone_armed_ && half_tone_background_) {
+            build_half_tone_background();
+        }
     }
-    if (animation.kind == CharacterAnimationKind::pose && previous) {
-        auto& loaded = character_textures_[index];
-        animation.previous = std::move(loaded.texture);
-        loaded.pose = -1;
-    }
-    auto& character = characters_.set(
-        character_number, number(event, 1), locate, layer,
-        brightness, alpha);
-    load_character_texture(character);
-    character_pending_removal_[index] = false;
-    character_staged_[index] = stage;
-    background_baked_dirty_ = true;
-    if (!stage && event.instruction.name != "SetChar") {
-        start_character_animation(character_number, std::move(animation));
+    if (was_animating && !character_animation_active()) {
+        // The script is held while anything is animating, so it resumes on
+        // the frame the last one settles - which is after the bake, not
+        // before it.
+        advance();
     }
 }
 

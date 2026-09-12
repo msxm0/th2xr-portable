@@ -237,72 +237,65 @@ bool Game::handle(const th2::Event& event)
             state.destination_height = number(event, 4);
             state.zoom = 0;
         }
-    } else if (name == "C" || name == "CW") {
-        set_character(event);
-    } else if (name == "CR" || name == "CRW") {
-        const int character_number = number(event, 0);
-        const auto index = character_index(character_number);
-        const int type = name == "CRW" ? 3
-            : number(event, 1) < 0 ? 0 : number(event, 1);
-        if (type == 3) {
-            character_pending_removal_[index] = true;
-        } else {
-            CharacterAnimation animation;
-            animation.kind = CharacterAnimationKind::leave;
-            animation.type = type;
-            animation.frames = number(event, 2);
-            animation.blocking = true;
-            if (const auto* character = characters_.find(character_number)) {
-                animation.from_locate = animation.to_locate =
-                    character->locate;
-                animation.from_alpha = animation.to_alpha =
-                    character->alpha;
-                hide_message_for_animation();
-                start_character_animation(
-                    character_number, std::move(animation));
-            }
+    } else if (name == "C") {
+        // ESC_EOprC: the defaults the opcode fills in before AVG_SetChar
+        // ever sees them, then
+        //   AVG_SetChar( P0, P1, P2, P4, P3, P5, P6, P7 )
+        // - note layer and in_type arrive swapped round.
+        int locate = number(event, 2);
+        if (locate == -1) {
+            const int held = chars().check_char_locate(number(event, 0));
+            locate = held == -1 ? 1 : held;
         }
+        int in_type = number(event, 3);
+        if (in_type == -1) {
+            in_type = th2::char_type_cfade;
+        } else if (in_type == -2) {
+            in_type = th2::char_type_direct;
+        }
+        const int layer = number(event, 4) == -1 ? 0 : number(event, 4);
+        const int bright = number(event, 5) == -1
+            ? th2::bright_neutral : number(event, 5);
+        const int alph = number(event, 6) == -1 ? 256 : number(event, 6);
+        const int frame = number(event, 7);
+        chars().set_char(
+            number(event, 0), number(event, 1), locate, layer, in_type,
+            bright, alph, frame);
+    } else if (name == "CW") {
+        // ESC_EOprCW: the wait form, which does not hold the script and
+        // passes CHAR_TYPE_WAIT with no frame count.
+        int locate = number(event, 2);
+        if (locate == -1) {
+            const int held = chars().check_char_locate(number(event, 0));
+            locate = held == -1 ? 1 : held;
+        }
+        const int layer = number(event, 3) == -1 ? 0 : number(event, 3);
+        const int bright = number(event, 4) == -1
+            ? th2::bright_neutral : number(event, 4);
+        const int alph = number(event, 5) == -1 ? 256 : number(event, 5);
+        chars().set_char(
+            number(event, 0), number(event, 1), locate, layer,
+            th2::char_type_wait, bright, alph, -1);
+    } else if (name == "CR") {
+        const int out_type = number(event, 1) == -1 ? 0 : number(event, 1);
+        chars().reset_char(number(event, 0), out_type, number(event, 2));
+    } else if (name == "CRW") {
+        chars().reset_char(number(event, 0), th2::char_type_wait, -1);
     } else if (name == "CP") {
-        const int character_number = number(event, 0);
-        if (auto* character = characters_.find(character_number)) {
-            if (character->pose == number(event, 1)) {
-                return true;
-            }
-            if (number(event, 2) == 3) {
-                character->pose = number(event, 1);
-                load_character_texture(*character);
-                character_staged_[character_index(character_number)] = true;
-                background_baked_dirty_ = true;
-                return true;
-            }
-            hide_message_for_animation();
-            CharacterAnimation animation;
-            animation.kind = CharacterAnimationKind::pose;
-            animation.type = number(event, 2) < 0 ? 0 : number(event, 2);
-            animation.frames = -1;
-            animation.from_alpha = animation.to_alpha = character->alpha;
-            animation.blocking = name == "CP";
-            auto& loaded = character_texture(character_number);
-            animation.previous = std::move(loaded.texture);
-            loaded.pose = -1;
-            character->pose = number(event, 1);
-            load_character_texture(*character);
-            start_character_animation(
-                character_number, std::move(animation));
-        }
+        const int in_type = number(event, 2) == -1 ? 0 : number(event, 2);
+        chars().set_char_pose(
+            number(event, 0), number(event, 1), in_type, -1);
     } else if (name == "CL") {
-        if (auto* character = characters_.find(number(event, 0))) {
-            hide_message_for_animation();
-            CharacterAnimation animation;
-            animation.kind = CharacterAnimationKind::locate;
-            animation.frames = name == "CL" ? number(event, 2) : -1;
-            animation.from_locate = character->locate;
-            animation.to_locate = number(event, 1);
-            animation.blocking = name == "CL";
-            character->locate = number(event, 1);
-            start_character_animation(
-                character->number, std::move(animation));
-        }
+        chars().set_char_locate(
+            number(event, 0), number(event, 1), number(event, 2));
+    } else if (name == "CY") {
+        chars().set_char_layer(number(event, 0), number(event, 1));
+    } else if (name == "CB") {
+        chars().set_char_bright(
+            number(event, 0), number(event, 1), number(event, 2));
+    } else if (name == "CA") {
+        chars().set_char_alph(
+            number(event, 0), number(event, 1), number(event, 2));
     } else if (name == "SetMessage2") {
         push_backlog();
         message_scroll_follow_ = true;
@@ -317,6 +310,7 @@ bool Game::handle(const th2::Event& event)
             pending_backlog_voice_.reset();
         }
         message_visible_ = true;
+        message_window_open_ = true;
         raise_half_tone();
         current_line_key_ = runtime_.script_name() + ':'
             + std::to_string(runtime_.vm_pc());
@@ -336,6 +330,7 @@ bool Game::handle(const th2::Event& event)
             pending_backlog_voice_.reset();
         }
         message_visible_ = true;
+        message_window_open_ = true;
         raise_half_tone();
         current_line_key_ = runtime_.script_name() + ':'
             + std::to_string(runtime_.vm_pc());

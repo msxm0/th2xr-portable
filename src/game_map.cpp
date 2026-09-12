@@ -300,8 +300,7 @@ void Game::begin_calendar(int month, int day)
     }
     background_.reset();
     background_baked_dirty_ = true;
-    characters_.clear();
-    character_textures_ = {};
+    clear_characters();
     calendar_state_ = CalendarState{
         month, day, weekday(month, day), calendar_holiday(month, day),
         false, std::chrono::steady_clock::now(),

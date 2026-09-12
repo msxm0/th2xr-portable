@@ -719,23 +719,23 @@ void Game::ensure_shake_target()
     SDL_SetTextureBlendMode(shake_target_.get(), SDL_BLENDMODE_NONE);
 }
 
-void Game::rebuild_baked_background()
+bool Game::copy_back_plate()
 {
-    // DSP_CopyBmp( BMP_BACK, BMP_BACK2 ): back to the clean plate, then the
-    // settled characters go in again.  The engine does this whenever a
-    // character changes, because a bake cannot be undone in place.
+    // DSP_CopyBmp( BMP_BACK, BMP_BACK2 ): the clean plate back over the
+    // baked one.  A bake cannot be undone in place, so this is how a
+    // character comes out of the background again.
     if (!background_) {
         background_baked_.reset();
-        background_baked_dirty_ = false;
-        return;
+        publish_background_bitmaps();
+        return false;
     }
     float width = 0.0f;
     float height = 0.0f;
     SDL_GetTextureSize(background_.get(), &width, &height);
     if (width <= 0.0f || height <= 0.0f) {
         background_baked_.reset();
-        background_baked_dirty_ = false;
-        return;
+        publish_background_bitmaps();
+        return false;
     }
     float held_width = 0.0f;
     float held_height = 0.0f;
@@ -747,8 +747,8 @@ void Game::rebuild_baked_background()
             renderer_, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET,
             static_cast<int>(width), static_cast<int>(height)));
         if (!background_baked_) {
-            background_baked_dirty_ = false;
-            return;
+            publish_background_bitmaps();
+            return false;
         }
         SDL_SetTextureBlendMode(background_baked_.get(), SDL_BLENDMODE_NONE);
     }
@@ -761,50 +761,22 @@ void Game::rebuild_baked_background()
     SDL_SetTextureBlendMode(background_.get(), SDL_BLENDMODE_NONE);
     SDL_RenderTexture(renderer_, background_.get(), nullptr, nullptr);
     SDL_SetTextureBlendMode(background_.get(), SDL_BLENDMODE_BLEND);
-
-    // Every settled character that is due to be baked goes in now, in the
-    // order AVG_SetBackChar walks them - by layer, then by slot.
-    bool animating_below = false;
-    const ShakeSample still;
-    for (const auto& character : characters_.ordered()) {
-        if (character_staged_.at(character.number)) {
-            continue;
-        }
-        auto& mode = character_cut_mode_.at(character.number);
-        if (mode == CutMode::live) {
-            continue;
-        }
-        const auto& animation = character_animations_.at(character.number);
-        if (animation.kind != CharacterAnimationKind::none) {
-            // Mid-animation: AVG_SetBackChar bakes only CHAR_COND_NOMAL and
-            // CHAR_COND_WAIT, and AVG_ControlChar leaves everything else
-            // drawn live.  Say so, or it is left marked as baked while not
-            // being in the plate - in neither place, and so invisible for
-            // the length of the animation.
-            mode = CutMode::bake;
-            // And everything ordered above it stays a layer too, or the
-            // plate would draw over the one that is animating:
-            //     if( CharStruct[j].layer*MAX_CHAR+j > ...+i )
-            //         CharStruct[j].disp = 1;
-            animating_below = true;
-            continue;
-        }
-        if (animating_below) {
-            mode = CutMode::bake;
-            continue;
-        }
-        // Baked without the shake offset: the transform belongs to the
-        // background it is now part of.
-        // Only once it is really in the bitmap.  A texture that has not
-        // loaded yet leaves it to be tried again, rather than marking it
-        // baked and never drawing it anywhere.
-        if (draw_character(character, still, false)) {
-            mode = CutMode::baked;
-        }
-    }
     SDL_SetRenderScale(renderer_, scale_x, scale_y);
     SDL_SetRenderTarget(renderer_, previous_target);
+    // The slots have to point at the plate before anything bakes into it.
+    publish_background_bitmaps();
+    return true;
+}
+
+void Game::rebuild_baked_background()
+{
+    // AVG_CopyBack(OFF) followed by AVG_SetBackChar: the clean plate, then
+    // the settled characters composited back into it by layer and by slot.
     background_baked_dirty_ = false;
+    if (!copy_back_plate()) {
+        return;
+    }
+    chars().set_back_char(0, 0, 1);
     // AVG_SetBackChar() bakes, AVG_SetHalfTone() copies, in that order - so
     // BMP_BACKHALF is always of a plate that already has its characters.
     //
@@ -817,121 +789,6 @@ void Game::rebuild_baked_background()
     if (half_tone_armed_ && half_tone_background_) {
         build_half_tone_background();
     }
-}
-
-bool Game::draw_character(
-    const th2::CharacterState& character, const ShakeSample& shake,
-    bool shake_characters)
-{
-        auto& loaded = character_texture(character.number);
-        if (!loaded.texture) {
-            return false;
-        }
-        auto& animation = character_animations_.at(character.number);
-        float progress = 1.0f;
-        if (animation.kind != CharacterAnimationKind::none) {
-            progress = std::clamp(
-                static_cast<float>(std::chrono::duration<double>(
-                    std::chrono::steady_clock::now()
-                    - animation.started).count() * 60.0
-                    / animation.frames),
-                0.0f, 1.0f);
-        }
-        const float eased = 1.0f
-            - (1.0f - progress) * (1.0f - progress) * (1.0f - progress);
-        float x = static_cast<float>(
-            th2::character_offset(character.locate));
-        int brightness_value = character.brightness;
-        int alpha_value = character.alpha;
-        if (animation.kind == CharacterAnimationKind::enter) {
-            if (animation.type == 1 || animation.type == 2) {
-                const float start = animation.type == 1 ? -600.0f : 600.0f;
-                x = start + (x - start) * eased;
-            } else {
-                alpha_value = static_cast<int>(
-                    animation.to_alpha * progress);
-            }
-        } else if (animation.kind == CharacterAnimationKind::leave) {
-            if (animation.type == 1 || animation.type == 2) {
-                const float destination =
-                    animation.type == 1 ? -600.0f : 600.0f;
-                // CHAR_COND_OUT cubes the remaining count, not the elapsed
-                // one: the walk off screen starts fast and eases into the
-                // wings, the mirror of the entrance.  Cubing progress
-                // instead left the character standing still for most of the
-                // animation and then snapping away.
-                const float remaining = 1.0f - eased;  // (1 - progress)^3
-                x = destination + (x - destination) * remaining;
-            } else {
-                alpha_value = static_cast<int>(
-                    animation.from_alpha * (1.0f - progress));
-            }
-        } else if (animation.kind == CharacterAnimationKind::locate) {
-            const float from = static_cast<float>(
-                th2::character_offset(animation.from_locate));
-            const float to = static_cast<float>(
-                th2::character_offset(animation.to_locate));
-            x = from + (to - from) * eased;
-        } else if (animation.kind
-                   == CharacterAnimationKind::brightness) {
-            brightness_value = static_cast<int>(
-                animation.from_brightness
-                + (animation.to_brightness
-                   - animation.from_brightness) * progress);
-        } else if (animation.kind == CharacterAnimationKind::alpha) {
-            alpha_value = static_cast<int>(
-                animation.from_alpha
-                + (animation.to_alpha - animation.from_alpha) * progress);
-        } else if (animation.kind == CharacterAnimationKind::pose) {
-            alpha_value = static_cast<int>(
-                animation.to_alpha * progress);
-        }
-        // No half tone here.  A baked character is darkened by being inside
-        // the copy; a live one is a graph at LAY_CHAR, which the half tone -
-        // a background layer - never touches.
-        const auto brightness = static_cast<Uint8>(
-            std::clamp(brightness_value * 2, 0, 255));
-        SDL_SetTextureColorMod(
-            loaded.texture.get(), brightness, brightness, brightness);
-        SDL_SetTextureAlphaMod(
-            loaded.texture.get(),
-            static_cast<Uint8>(
-                std::clamp(alpha_value, 0, 256) * 255 / 256));
-        SDL_FRect destination{
-            x + (shake_characters ? shake.x : 0.0f),
-            shake_characters ? shake.y : 0.0f,
-            800.0f, 600.0f};
-        if (animation.kind == CharacterAnimationKind::pose
-            && animation.previous) {
-            // GM_AvgChar.cpp hangs the old pose off the same graphic as the
-            // new one (DSP_SetGraphBSet) and slides a single blend factor
-            // across the pair, so the character dissolves from one pose to
-            // the other without ever becoming see-through.  Blending the two
-            // in a scratch target reproduces that; drawing them one over the
-            // other straight onto the scene would let the background show
-            // through in the middle, which reads as the old pose leaving
-            // before the new one arrives.
-            if (draw_pose_dissolve(
-                    loaded.texture.get(), animation.previous.get(), progress,
-                    brightness,
-                    std::clamp(animation.to_alpha, 0, 256) * 255 / 256,
-                    destination)) {
-                return true;
-            }
-            SDL_SetTextureColorMod(
-                animation.previous.get(),
-                brightness, brightness, brightness);
-            SDL_SetTextureAlphaMod(
-                animation.previous.get(),
-                static_cast<Uint8>(
-                    std::clamp(static_cast<int>(
-                        animation.from_alpha * (1.0f - progress)),
-                        0, 256) * 255 / 256));
-            SDL_RenderTexture(
-                renderer_, animation.previous.get(), nullptr, &destination);
-        }
-        SDL_RenderTexture(renderer_, loaded.texture.get(), nullptr, &destination);
-        return true;
 }
 
 void Game::draw_frame()
@@ -950,56 +807,16 @@ void Game::draw_frame()
             || shake_->type == 2 || shake_->type == 9
             || shake_->type == 12 || shake_->type == 13
             || shake_->type == 14);
-    // Characters are normally baked into BMP_BACK by DSP_SetGraphTarget,
-    // which draws them into the bitmap once and switches their graph off, so
-    // they travel with the background's source offset for free.  A sine
-    // shake is the exception: it swaps the background to BMP_BACK2, the copy
-    // taken before the bake, and SetCharPosShake sets cut_mode 2 to bring the
-    // character graphs back live and move them itself.  Either way they
-    // follow, which is what this reproduces - we never bake, so they always
-    // have to be moved by hand.
-    // SetCharPosShake(x, y, ON) - only the SIN cases call it - sets cut_mode
-    // 2, taking the characters out of the bitmap and moving them itself,
-    // while GRP_BACK swaps to BMP_BACK2, the plate without them.  Every
-    // other shake leaves them baked, so they travel with the background.
+    // SetCharPosShake(x, y, ON) - only the SIN cases call it - sets
+    // cut_mode 2, taking the characters out of the bitmap and moving them
+    // itself, while GRP_BACK swaps to BMP_BACK2, the plate without them.
+    // Every other shake leaves them baked, so they travel with the
+    // background's source offset for free and nothing needs saying.
     const bool shake_characters = shake_
         && (shake_->type == 0 || shake_->type == 15);
-    for (std::size_t i = 0; i < character_cut_mode_.size(); ++i) {
-        auto& mode = character_cut_mode_[i];
-        if (shake_characters) {
-            if (mode != CutMode::live) {
-                mode = CutMode::live;
-                background_baked_dirty_ = true;
-            }
-        } else if (mode == CutMode::live) {
-            mode = CutMode::bake;
-            background_baked_dirty_ = true;
-        }
-    }
-    // AVG_ControlChar:
-    //     if( cond!=CHAR_COND_NOMAL && cut_mode ){ disp = 1; break; }
-    //     if(disp){ AVG_CopyBack(OFF); for(i..) cut_mode = 0; }
-    //
-    // A character that starts animating while it is still in the plate takes
-    // the whole plate back to the clean copy and resets every cut_mode: they
-    // all come out, and the settled ones go back in next pass.  Without it a
-    // character fading out is still in the bitmap at full strength and the
-    // fade has nothing to show - which is why a cross-fade looked right (a
-    // pose change reloads a texture, and that invalidated the plate by luck)
-    // while a fade-out did not.
-    for (const auto& character : characters_.ordered()) {
-        if (character_staged_.at(character.number)) {
-            continue;
-        }
-        if (character_animations_.at(character.number).kind
-                != CharacterAnimationKind::none
-            && character_cut_mode_.at(character.number) != CutMode::bake) {
-            for (auto& mode : character_cut_mode_) {
-                mode = CutMode::bake;
-            }
-            background_baked_dirty_ = true;
-            break;
-        }
+    if (shake_characters) {
+        chars().set_char_pos_shake(
+            static_cast<int>(shake.x), static_cast<int>(shake.y), 1);
     }
     if (background_baked_dirty_) {
         rebuild_baked_background();
@@ -1232,26 +1049,12 @@ void Game::draw_frame()
             draw_overlay(i);
         }
     }
-    // AVG_ControlChar: a settled character is baked into the background
-    // bitmap and its graph switched off, so only the live ones are drawn
-    // here.  Anything mid-animation is live by definition - AVG_SetBackChar
-    // only bakes CHAR_COND_NOMAL and CHAR_COND_WAIT.
-    for (const auto& character : characters_.ordered()) {
-        if (character_staged_.at(character.number)) {
-            continue;
-        }
-        auto& mode = character_cut_mode_.at(character.number);
-        if (mode == CutMode::baked) {
-            continue;
-        }
-        const auto& animation = character_animations_.at(character.number);
-        if (mode == CutMode::bake
-            && animation.kind == CharacterAnimationKind::none) {
-            // Settled since the plate was built - it belongs in the bitmap
-            // now, so rebuild rather than draw it twice.
-            background_baked_dirty_ = true;
-        }
-        draw_character(character, shake, shake_characters);
+    // The character graphs, at LAY_CHAR + CharStruct[i].layer.  A settled
+    // character is baked into BMP_BACK and AVG_ControlChar has switched its
+    // graph off, so only the live ones draw here - which is what makes the
+    // ones in the plate move with a background transform instead.
+    for (int layer = 0; layer < 5; ++layer) {
+        display().draw_layer(th2::lay_char + layer);
     }
     for (std::size_t i = 0; i < overlays_.size(); ++i) {
         if (overlay_states_[i].layer >= 18) {

@@ -962,6 +962,9 @@ void Game::update_shake()
     const auto elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - shake_->started).count();
     if (elapsed * 60.0 >= shake_->frames) {
+        // AVG_StopShake: SetCharPosShake(0, 0, OFF) puts the characters
+        // back in the plate, which is the only thing that undoes cut_mode 2.
+        chars().set_char_pos_shake(0, 0, 0);
         shake_.reset();
         advance();
     }

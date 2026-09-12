@@ -347,6 +347,7 @@ if(ANDROID)
         src/texture.cpp
         src/dsp.cpp
         src/avg_char.cpp
+        src/game_display.cpp
         src/game_title_draw.cpp
         src/icon.cpp
         src/image.cpp
@@ -382,6 +383,7 @@ else()
         src/texture.cpp
         src/dsp.cpp
         src/avg_char.cpp
+        src/game_display.cpp
         src/game_title_draw.cpp
         src/icon.cpp
         src/image.cpp
