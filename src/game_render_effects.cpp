@@ -1065,7 +1065,8 @@ Game::ShakeSample Game::shake_sample()
             : 0.0f;
         const float step = limit_loop(swept, root);
         // DSP_SetGraphZoom2's zoom is 256ths: sw*(zoom+256)/256.
-        result.scale = 1.0f + step * step / 256.0f;
+        result.zoom_256 = static_cast<int>(step * step);
+        result.scale = 1.0f + static_cast<float>(result.zoom_256) / 256.0f;
         result.half_blend = true;
         break;
     }
@@ -1084,6 +1085,7 @@ Game::ShakeSample Game::shake_sample()
         if ((shake_->direction % 2) == 0) {
             rate = 256.0f - rate;
         }
+        result.roll_rate = static_cast<int>(rate);
         result.angle = degrees(rate);
         break;
     }
@@ -1091,6 +1093,9 @@ Game::ShakeSample Game::shake_sample()
         const float rate =
             -wave(count * shake_->swing / 8) * static_cast<float>(pitch)
             * taper;
+        // (256+y)%256 - the rate wraps into a turn rather than going
+        // negative, which is what DSP_SetGraphRoll indexes the table with.
+        result.roll_rate = (static_cast<int>(rate) % 256 + 256) % 256;
         result.angle = degrees(rate);
         break;
     }
@@ -1100,8 +1105,9 @@ Game::ShakeSample Game::shake_sample()
         // land exactly - smoothing this into a curve would let the
         // uncovered region accumulate.
         static constexpr std::array<int, 4> steps{-1, 0, 1, 0};
-        result.angle = degrees(static_cast<float>(
-            steps[static_cast<std::size_t>(count % 4)] * pitch));
+        const int turn = steps[static_cast<std::size_t>(count % 4)] * pitch;
+        result.roll_rate = (turn % 256 + 256) % 256;
+        result.angle = degrees(static_cast<float>(turn));
         break;
     }
     default:

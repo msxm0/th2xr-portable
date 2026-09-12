@@ -39,6 +39,101 @@ void Game::publish_background_bitmaps()
     publish(th2::bmp_backhalf, half_tone_background_.get());
 }
 
+void Game::setup_background_graphs(
+    const ShakeSample& shake, bool shake_background, bool shake_characters)
+{
+    if (!background_) {
+        display().reset_graph(th2::grp_back);
+        display().reset_graph(th2::grp_back + 1);
+        return;
+    }
+    publish_background_bitmaps();
+
+    // DSP_SetGraphBmp( GRP_BACK, BMP_BACK2 ) - a sine shake points both the
+    // background and the half tone at the clean plate, which is why the
+    // characters come out of it and move on their own for the duration.
+    const bool have_plate = display().bmp_flag(th2::bmp_back);
+    const int back_bmp = (shake_characters || !have_plate)
+        ? th2::bmp_back2 : th2::bmp_back;
+    const bool copy_shown = !shake_characters && half_tone_settled()
+        && display().bmp_flag(th2::bmp_backhalf);
+    const int half_bmp = shake_characters
+        ? th2::bmp_back2 : th2::bmp_backhalf;
+
+    // GRP_BACK at LAY_BACK and GRP_BACK+1 at LAY_BACK+2.  Once the ramp has
+    // finished the engine turns GRP_BACK off and shows the darkened copy in
+    // its place, rather than tinting anything.
+    display().set_graph(
+        th2::grp_back, back_bmp, th2::lay_back, !copy_shown,
+        th2::check_none);
+    display().set_graph(
+        th2::grp_back + 1, half_bmp, th2::lay_back + 2, copy_shown,
+        th2::check_none);
+
+    const auto view = current_background_view();
+    for (const int graph : {th2::grp_back, th2::grp_back + 1}) {
+        // AVG_SetBackPos:      DSP_SetGraphPos( g, 0,0, x,y, DISP_X,DISP_Y )
+        // AVG_SetBackPosZoom:  DSP_SetGraphPosZoom( g, 0,0,DISP_X,DISP_Y,
+        //                                           x,y,w,h )
+        if (view.width != static_cast<float>(th2::display_width)
+            || view.height != static_cast<float>(th2::display_height)) {
+            display().set_graph_pos_zoom(
+                graph, 0, 0, th2::display_width, th2::display_height,
+                static_cast<int>(view.x), static_cast<int>(view.y),
+                static_cast<int>(view.width), static_cast<int>(view.height));
+        } else {
+            display().set_graph_pos(
+                graph, 0, 0, static_cast<int>(view.x),
+                static_cast<int>(view.y), th2::display_width,
+                th2::display_height);
+        }
+    }
+
+    if (shake_background) {
+        for (const int graph : {th2::grp_back, th2::grp_back + 1}) {
+            if (shake.roll_rate >= 0) {
+                // DSP_GetGraphBmpSize then
+                // DSP_SetGraphRoll( g, DISP_X/2, DISP_Y/2, 0, cnt, 0,0,w,h )
+                int width = 0;
+                int height = 0;
+                display().get_graph_bmp_size(graph, &width, &height);
+                display().set_graph_roll(
+                    graph, th2::display_width / 2, th2::display_height / 2,
+                    0, shake.roll_rate, 0, 0, width, height);
+            } else if (shake.half_blend) {
+                // SHAKE_ZOOM:
+                //     DSP_SetGraphZoom2( g, DISP_X/2, DISP_Y/2, cnt2 );
+                //     DSP_SetGraphParam( g, DRW_BLD(128) );
+                display().set_graph_zoom2(
+                    graph, th2::display_width / 2, th2::display_height / 2,
+                    shake.zoom_256);
+                display().set_graph_param(
+                    graph, th2::drw_bld | (128u << 16));
+            } else {
+                // DSP_SetGraphSMove( g, BackStruct.x-x, BackStruct.y-y ).
+                // The source moves, not the destination: lowering the offset
+                // starts the sample earlier and slides the picture the same
+                // way the characters go.
+                display().set_graph_smove(
+                    graph, static_cast<int>(view.x - shake.x),
+                    static_cast<int>(view.y - shake.y));
+            }
+        }
+    }
+
+    // AVG_ControlBackFade: DSP_SetGraphBright( GRP_BACK, rr, gg, bb ), with
+    // the half tone's own ramp multiplied in while it is still running.
+    // GRP_BACK+1 keeps a neutral brightness, as it does in the original -
+    // the darkness is already in the bitmap, and AVG_SetBackFade tears the
+    // wash down before it starts anyway.
+    const float shade = half_tone_factor();
+    display().set_graph_bright(
+        th2::grp_back,
+        static_cast<int>(background_brightness_[0] * shade),
+        static_cast<int>(background_brightness_[1] * shade),
+        static_cast<int>(background_brightness_[2] * shade));
+}
+
 th2::AvgChar::Hooks Game::character_hooks()
 {
     th2::AvgChar::Hooks hooks;

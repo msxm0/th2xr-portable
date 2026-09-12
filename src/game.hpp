@@ -228,6 +228,12 @@ private:
         // SHAKE_ZOOM alone sets DRW_BLD(128) on the background while it
         // runs, so the zoomed picture is composited at half strength.
         bool half_blend = false;
+        // The engine's own units, for the graph setters.  DSP_SetGraphZoom2
+        // takes 256ths above one-to-one and DSP_SetGraphRoll takes a turn in
+        // 256 steps, so carrying degrees and a scale factor alongside them
+        // would mean converting back and losing the integer arithmetic.
+        int zoom_256 = 0;
+        int roll_rate = -1;   // -1 when this shake does not roll
     };
     struct BackgroundView {
         float x = 0.0f;
@@ -375,6 +381,12 @@ private:
     // Points BMP_BACK / BMP_BACK2 at the plates the game still owns, so a
     // character can bake into them before the background is a graph itself.
     void publish_background_bitmaps();
+    // AVG_SetBackPos and the cases of AVG_ControlShake that transform
+    // GRP_BACK, applied to the background graph and the darkened copy that
+    // has to travel with it.
+    void setup_background_graphs(
+        const ShakeSample& shake, bool shake_background,
+        bool shake_characters);
 
     std::array<CharacterTexture, 32> character_textures_{};
     // BMP_BACK: the background with the baked characters in it.  background_

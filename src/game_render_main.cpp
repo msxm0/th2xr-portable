@@ -931,113 +931,14 @@ void Game::draw_frame()
             draw_overlay(i);
         }
     }
-    std::function<void(SDL_Texture*, float)> draw_background_layer;
+    // GRP_BACK at LAY_BACK, with the shake's transform on it.  The
+    // background is a graph now, so the slide, the zoom and the roll are
+    // DSP_SetGraphSMove, DSP_SetGraphZoom2 and DSP_SetGraphRoll rather than
+    // a rect worked out here, and the darkened copy gets the same transform
+    // because it is the graph next door.
+    setup_background_graphs(shake, shake_background, shake_characters);
     if (background_) {
-        const auto view = current_background_view();
-        SDL_FRect source{
-            view.x, view.y, view.width, view.height};
-        SDL_FRect destination{0.0f, 0.0f, 800.0f, 600.0f};
-        double angle = 0.0;
-        if (shake_background) {
-            // A slide is DSP_SetGraphSMove, which moves the *source* - the
-            // window onto the bitmap - and leaves the destination at the
-            // full screen.  The picture does not travel; the view does.
-            // Moving the destination instead swept the picture off the edge
-            // and left a gap the engine never has.
-            //
-            // The background is exactly screen-sized, so the source runs off
-            // the bitmap, and ClipRect handles that by narrowing the blit
-            // and pushing the destination in by the same amount - it does
-            // not clamp or wrap.  The strip that leaves uncovered keeps the
-            // previous frame, which is restored above.
-            // BackStruct.x - x, not + x.  Lowering the source offset
-            // starts the sample that much earlier and so slides the picture
-            // the *same* way the characters go, which move by
-            // DSP_SetGraphMove(GRP_CHAR+i, ... +shx, ...).  Adding it moved
-            // the two in opposite directions.
-            source.x -= shake.x;
-            source.y -= shake.y;
-            if (source.x < 0.0f) {
-                destination.x -= source.x;
-                destination.w += source.x;
-                source.w += source.x;
-                source.x = 0.0f;
-            }
-            if (source.y < 0.0f) {
-                destination.y -= source.y;
-                destination.h += source.y;
-                source.h += source.y;
-                source.y = 0.0f;
-            }
-            float width = 0.0f;
-            float height = 0.0f;
-            SDL_GetTextureSize(background_.get(), &width, &height);
-            if (source.x + source.w > width) {
-                const float over = source.x + source.w - width;
-                source.w -= over;
-                destination.w -= over;
-            }
-            if (source.y + source.h > height) {
-                const float over = source.y + source.h - height;
-                source.h -= over;
-                destination.h -= over;
-            }
-            // A zoom or a roll is a destination transform, unlike a slide.
-            if (shake.scale != 1.0f) {
-                destination.x += 400.0f * (1.0f - shake.scale);
-                destination.y += 300.0f * (1.0f - shake.scale);
-                destination.w *= shake.scale;
-                destination.h *= shake.scale;
-            }
-            angle = shake.angle;
-        }
-        if (source.w <= 0.0f || source.h <= 0.0f) {
-            source = {0.0f, 0.0f, 0.0f, 0.0f};
-        }
-        // Once the ramp has finished, the engine turns GRP_BACK off and
-        // shows GRP_BACK+1 - the darkened copy - in its place.  Before then
-        // it dims GRP_BACK live, so the ordinary texture is used with the
-        // factor folded into its modulation.
-        draw_background_layer = [this, source, destination, angle, shake](
-                                    SDL_Texture* surface, float shade) mutable {
-        if (surface && source.w > 0.0f && source.h > 0.0f
-            && clip_texture_source(
-                surface, source, destination)) {
-            if (shake.half_blend) {
-                // SHAKE_ZOOM sets DRW_BLD(128) on the background for the
-                // duration, so the zoomed picture is half strength over
-                // whatever it is covering.
-                SDL_SetTextureAlphaMod(surface, 128);
-            } else {
-                // Opaque: GRP_BACK and GRP_BACK+1 are both plain bitmap
-                // layers, so the darkened copy hides what is beneath it
-                // rather than tinting it.
-                SDL_SetTextureBlendMode(surface, SDL_BLENDMODE_NONE);
-            }
-            const Uint8 brighten = apply_background_fade(surface, shade);
-            SDL_RenderTextureRotated(
-                renderer_, surface, &source, &destination,
-                angle, nullptr, SDL_FLIP_NONE);
-            finish_background_fade(
-                surface, brighten, &source, &destination, angle,
-                SDL_FLIP_NONE);
-            SDL_SetTextureAlphaMod(surface, 255);
-            SDL_SetTextureBlendMode(surface, SDL_BLENDMODE_BLEND);
-        }
-        };
-        // GRP_BACK, at LAY_BACK.  Switched off once the ramp finishes and
-        // the darkened copy takes over below.
-        // GRP_BACK: BMP_BACK normally - the plate with the characters baked
-        // into it - but BMP_BACK2, the clean one, while a sine shake has
-        // them out as their own layer.
-        SDL_Texture* const plate =
-            (shake_characters || !background_baked_)
-                ? background_.get() : background_baked_.get();
-        // Without a copy - the wash armed before a background existed -
-        // there is nothing to switch to, so the live dimming stands in.
-        if (!half_tone_settled() || !half_tone_background()) {
-            draw_background_layer(plate, half_tone_factor());
-        }
+        display().draw_layer(th2::lay_back);
     } else if (bg_scene_ == 0) {
         SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
         const SDL_FRect game_area{0.0f, 0.0f, 800.0f, 600.0f};
@@ -1063,14 +964,10 @@ void Game::draw_frame()
     }
     // GRP_BACK+1, at LAY_BACK+2: the darkened copy, opaque, covering
     // everything drawn below it.
-    // DSP_SetGraphBmp( GRP_BACK+1, BMP_BACK2 ) - a sine shake points the
-    // half tone's graph at the clean plate along with GRP_BACK, so the
-    // darkening is simply not on screen while one runs.  AVG_StopShake puts
-    // BMP_BACKHALF back.
-    if (background_ && !shake_characters && half_tone_settled()
-        && half_tone_background() && draw_background_layer) {
-        draw_background_layer(half_tone_background(), 1.0f);
-    }
+    // GRP_BACK+1, the darkened copy, at LAY_BACK+2 - above overlays at
+    // layers 1 and 2 and below those at 3 and 4, which is the difference
+    // between an overlay being hidden by it and being visible.
+    display().draw_layer(th2::lay_back + 2);
     for (std::size_t i = 0; i < overlays_.size(); ++i) {
         if (overlay_states_[i].layer >= 3 && overlay_states_[i].layer < 5) {
             draw_overlay(i);

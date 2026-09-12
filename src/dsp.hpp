@@ -157,6 +157,11 @@ struct GraphGeometry {
     SDL_Rect clip{};
     bool clipped = false;
     Uint8 red = 255, green = 255, blue = 255;
+    // Brightness above 128 cannot be a modulation, which can only take
+    // light away.  The rasteriser lerps the pixel towards white; here the
+    // same picture is added over itself by this much, which keeps the
+    // object's own shape where a white rectangle would not.
+    Uint8 brighten = 0;
     bool flip_x = false;
     bool flip_y = false;
 };

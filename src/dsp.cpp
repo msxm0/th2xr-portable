@@ -40,21 +40,54 @@ int engine_sin(int rate)
     return engine_cos(rate + 64);
 }
 
-// DrawGraphBmp's brightness fold.  128 is neutral; below it the graph's own
-// value is scaled down, above it the original lerps towards white, which a
-// colour modulation cannot express - so that half saturates instead.
-Uint8 fold_bright(int own, int global, bool brt_flag)
+// DrawGraphBmp's brightness fold.  128 is neutral, and the global
+// brightness multiplies into the graph's own unless brt_flag is set:
+//     if( BrightR<=BRT_NML ) r =       gs->r * BrightR          / BRT_NML;
+//     else                   r = (0xff-gs->r)*(BrightR-BRT_NML) / BRT_NML + gs->r;
+int fold_bright(int own, int global, bool brt_flag)
 {
-    const int value = brt_flag
+    return brt_flag
         ? own
         : (global <= bright_neutral
                ? own * global / bright_neutral
                : (0xff - own) * (global - bright_neutral) / bright_neutral
                      + own);
-    // The rasteriser treats 128 as "unchanged", so a modulation of 255 is
-    // what stands for it here.
+}
+
+// Everything up to neutral is a colour modulation; the rasteriser treats
+// 128 as unchanged, so that is a modulation of 255 here.
+Uint8 modulation_of(int value)
+{
     return static_cast<Uint8>(
-        std::clamp(value * 255 / bright_neutral, 0, 255));
+        std::clamp(std::min(value, bright_neutral) * 255 / bright_neutral,
+                   0, 255));
+}
+
+// The rasteriser's ClipRect: narrow the blit to what the bitmap actually
+// holds and shift the destination by the same proportion.  False when
+// nothing of the source is left.
+bool clip_source(const Bitmap& bitmap, SDL_FRect& source, SDL_FRect& destination)
+{
+    const auto width = static_cast<float>(bitmap.width);
+    const auto height = static_cast<float>(bitmap.height);
+    if (source.w <= 0.0f || source.h <= 0.0f || width <= 0.0f
+        || height <= 0.0f) {
+        return false;
+    }
+    const SDL_FRect original = source;
+    const float left = std::clamp(source.x, 0.0f, width);
+    const float top = std::clamp(source.y, 0.0f, height);
+    const float right = std::clamp(source.x + source.w, 0.0f, width);
+    const float bottom = std::clamp(source.y + source.h, 0.0f, height);
+    if (right <= left || bottom <= top) {
+        return false;
+    }
+    destination.x += (left - original.x) / original.w * destination.w;
+    destination.y += (top - original.y) / original.h * destination.h;
+    destination.w *= (right - left) / original.w;
+    destination.h *= (bottom - top) / original.h;
+    source = {left, top, right - left, bottom - top};
+    return true;
 }
 
 }  // namespace
@@ -167,9 +200,19 @@ GraphGeometry resolve_geometry(
         out.clip = SDL_Rect{0, 0, display_width, display_height};
     }
 
-    out.red = fold_bright(graph.r, global_r, graph.brt_flag);
-    out.green = fold_bright(graph.g, global_g, graph.brt_flag);
-    out.blue = fold_bright(graph.b, global_b, graph.brt_flag);
+    const int red = fold_bright(graph.r, global_r, graph.brt_flag);
+    const int green = fold_bright(graph.g, global_g, graph.brt_flag);
+    const int blue = fold_bright(graph.b, global_b, graph.brt_flag);
+    out.red = modulation_of(red);
+    out.green = modulation_of(green);
+    out.blue = modulation_of(blue);
+    // AVG_ControlBackFade drives GRP_BACK's brightness all the way to 255
+    // for a flash to white, which is past what a modulation can reach.
+    const int highest = std::max({red, green, blue});
+    out.brighten = highest > bright_neutral
+        ? static_cast<Uint8>(std::clamp(
+              (highest - bright_neutral) * 255 / bright_neutral, 0, 255))
+        : 0;
 
     // REV_W 0x10 / REV_H 0x20, which the rasteriser turns into a negative
     // step through the source.
@@ -911,16 +954,41 @@ void Display::draw_graph_bmp(
             SDL_RenderGeometry(renderer_, texture, vertices, 4, indices, 6);
         }
     } else {
+        // DSP_SetGraphSMove can push the source window off the edge of the
+        // bitmap - the background is exactly screen-sized, so any slide
+        // does.  The rasteriser's ClipRect narrows the blit and pushes the
+        // destination in by the same amount rather than clamping or
+        // wrapping, which is what leaves the strip for GRP_WORK to fill.
+        SDL_FRect source = geometry.source;
+        SDL_FRect destination = geometry.destination;
+        if (!clip_source(bitmap, source, destination)) {
+            SDL_SetTextureColorMod(texture, 255, 255, 255);
+            SDL_SetTextureAlphaMod(texture, 255);
+            if (clipping) {
+                SDL_SetRenderClipRect(renderer_, nullptr);
+            }
+            return;
+        }
         const SDL_FlipMode flip = static_cast<SDL_FlipMode>(
             (geometry.flip_x ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE)
             | (geometry.flip_y ? SDL_FLIP_VERTICAL : SDL_FLIP_NONE));
         if (flip == SDL_FLIP_NONE) {
-            SDL_RenderTexture(
-                renderer_, texture, &geometry.source, &geometry.destination);
+            SDL_RenderTexture(renderer_, texture, &source, &destination);
         } else {
             SDL_RenderTextureRotated(
-                renderer_, texture, &geometry.source, &geometry.destination,
+                renderer_, texture, &source, &destination,
                 0.0, nullptr, flip);
+        }
+        if (geometry.brighten > 0) {
+            // The same picture again, added on.  A white rectangle over the
+            // destination would light up everything transparent in it too.
+            SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_ADD);
+            SDL_SetTextureColorMod(
+                texture, geometry.brighten, geometry.brighten,
+                geometry.brighten);
+            SDL_RenderTextureRotated(
+                renderer_, texture, &source, &destination, 0.0, nullptr,
+                flip);
         }
     }
     if (clipping) {
