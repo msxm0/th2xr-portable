@@ -11,42 +11,13 @@
 // and then by slot, and a slot is whatever GetSpaceIndex found free, which
 // is not the order a vector would keep.
 
+#include "avg_layout.hpp"
 #include "dsp.hpp"
 
 #include <array>
 #include <functional>
 
 namespace th2 {
-
-inline constexpr int max_char = 8;  // MAX_CHAR
-
-// GRP_/BMP_/LAY_ from GM_avg.h, worked through rather than guessed:
-//   GRP_BACK2 0, GRP_BACK 1, GRP_SPBACK 51, GRP_SPBACKHALF 60,
-//   GRP_CHIP 68, GRP_CHAR 76
-inline constexpr int grp_back2 = 0;
-inline constexpr int grp_back = grp_back2 + 1;
-inline constexpr int grp_back_chip = 50;
-inline constexpr int grp_char_chip = 8;
-inline constexpr int grp_spback = grp_back + grp_back_chip;
-inline constexpr int grp_spbackhalf = grp_spback + 1 + max_char;
-inline constexpr int grp_chip = grp_spbackhalf + max_char;
-inline constexpr int grp_char = grp_chip + grp_char_chip;
-
-inline constexpr int bmp_back = 0;
-inline constexpr int bmp_back2 = bmp_back + 8;
-inline constexpr int bmp_backhalf = bmp_back2 + 1;
-inline constexpr int bmp_spback = bmp_backhalf + 1;
-inline constexpr int bmp_spbackhalf = bmp_spback + 1;
-inline constexpr int bmp_chip = bmp_spbackhalf + 1;
-inline constexpr int bmp_char = bmp_chip + 8;
-
-inline constexpr int lay_back = 1;
-inline constexpr int lay_spback = lay_back + 4;
-inline constexpr int lay_chip = lay_spback + 4;
-inline constexpr int lay_fore = lay_chip + 5;
-inline constexpr int lay_char = lay_fore + 4;    // 18
-inline constexpr int lay_weather = lay_char + 4;
-inline constexpr int lay_window = lay_weather + 4;
 
 // CHAR_COND_*
 enum CharCond {

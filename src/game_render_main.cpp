@@ -802,11 +802,25 @@ void Game::draw_frame()
     SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
     SDL_Texture* art_target = upscaler_->art_target();
     const auto shake = shake_sample();
+    // The types whose case in AVG_ControlShake transforms GRP_BACK itself,
+    // rather than moving the text or the whole composited screen.
+    // SHAKE_SIN_SET shares its case with SHAKE_SIN and so belongs here too -
+    // it was in the character list but not this one, which left it moving
+    // the characters while the background stood still.
     const bool shake_background = shake_
         && (shake_->type == 0 || shake_->type == 1
             || shake_->type == 2 || shake_->type == 9
             || shake_->type == 12 || shake_->type == 13
-            || shake_->type == 14);
+            || shake_->type == 14 || shake_->type == 15);
+    // GRP_WORK: the cases that slide or roll the background park a black
+    // PRM_FLAT rectangle at layer 0, below LAY_BACK, so the strip the
+    // transform uncovers comes out black instead of showing the frame
+    // before it.  SHAKE_ZOOM, SHAKE_ROLL_SIN and SHAKE_ROLL_2TI do not -
+    // those three genuinely keep the previous frame in the corners.
+    const bool shake_work_rect = shake_
+        && (shake_->type == 0 || shake_->type == 1
+            || shake_->type == 9 || shake_->type == 12
+            || shake_->type == 15);
     // SetCharPosShake(x, y, ON) - only the SIN cases call it - sets
     // cut_mode 2, taking the characters out of the bitmap and moving them
     // itself, while GRP_BACK swaps to BMP_BACK2, the plate without them.
@@ -897,6 +911,21 @@ void Game::draw_frame()
         present_frame();
         return;
     }
+    // GRP_WORK, at layer 0:
+    //     DSP_SetGraphPrim( GRP_WORK, PRM_FLAT, POL_RECT, 0, ON );
+    //     DSP_SetGraphPosRect( GRP_WORK, 0, 0, DISP_X, DISP_Y );
+    //     DSP_SetGraphFade( GRP_WORK, 0 );
+    // A black rectangle under the background, for the shakes that move it.
+    if (shake_work_rect) {
+        display().set_graph_prim(
+            th2::grp_work, th2::GraphType::flat, th2::Poly::rect, 0, true);
+        display().set_graph_pos_rect(
+            th2::grp_work, 0, 0, th2::display_width, th2::display_height);
+        display().set_graph_fade(th2::grp_work, 0);
+    } else {
+        display().reset_graph(th2::grp_work);
+    }
+    display().draw_layer(0);
     for (std::size_t i = 0; i < overlays_.size(); ++i) {
         if (overlay_states_[i].layer < 1) {
             draw_overlay(i);
@@ -1034,8 +1063,12 @@ void Game::draw_frame()
     }
     // GRP_BACK+1, at LAY_BACK+2: the darkened copy, opaque, covering
     // everything drawn below it.
-    if (background_ && half_tone_settled() && half_tone_background()
-        && draw_background_layer) {
+    // DSP_SetGraphBmp( GRP_BACK+1, BMP_BACK2 ) - a sine shake points the
+    // half tone's graph at the clean plate along with GRP_BACK, so the
+    // darkening is simply not on screen while one runs.  AVG_StopShake puts
+    // BMP_BACKHALF back.
+    if (background_ && !shake_characters && half_tone_settled()
+        && half_tone_background() && draw_background_layer) {
         draw_background_layer(half_tone_background(), 1.0f);
     }
     for (std::size_t i = 0; i < overlays_.size(); ++i) {

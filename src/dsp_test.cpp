@@ -233,6 +233,28 @@ void test_clip_clears_on_negative()
     check(!display.graph(0).clip.has_value(), "a negative x clears the clip");
 }
 
+// GRP_WORK, as AVG_ControlShake sets it up: a solid rectangle at layer 0,
+// under the background, so a shake that slides or rolls the picture shows
+// black where it pulls away from rather than the previous frame.
+void test_flat_primitive()
+{
+    th2::Display display(nullptr);
+    display.set_graph_prim(
+        0, th2::GraphType::flat, th2::Poly::rect, 0, true);
+    display.set_graph_pos_rect(0, 0, 0, 800, 600);
+    display.set_graph_fade(0, 0);
+    const th2::Graph& work = display.graph(0);
+    check(work.flag && work.disp, "the work rect is on");
+    check(work.layer == 0, "at layer 0, below LAY_BACK");
+    check(work.type == th2::GraphType::flat, "and is a flat primitive");
+    check(work.dw == 800 && work.dh == 600, "covering the screen");
+    check(work.r == 0 && work.g == 0 && work.b == 0,
+          "DSP_SetGraphFade(0) makes it black");
+    const auto geometry = resolve_geometry(work, 0, 0, 0, 0);
+    check(geometry.red == 0 && geometry.green == 0 && geometry.blue == 0,
+          "and it resolves to black rather than a neutral modulation");
+}
+
 }  // namespace
 
 int main()
@@ -248,6 +270,7 @@ int main()
     test_roll_corners();
     test_zoom_setters_degrade();
     test_clip_clears_on_negative();
+    test_flat_primitive();
     if (failures) {
         std::printf("%d check(s) failed\n", failures);
         return 1;
