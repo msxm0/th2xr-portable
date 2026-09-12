@@ -308,6 +308,7 @@ void Game::start_text_reveal(std::size_t start)
     text_reveal_start_ = start;
     text_reveal_started_ = std::chrono::steady_clock::now();
     text_reveal_complete_ = config_.text_speed_ms == 0;
+    text_fade_complete_ = text_reveal_complete_;
 }
 
 bool Game::finish_text_reveal()
@@ -315,7 +316,9 @@ bool Game::finish_text_reveal()
     if (text_reveal_complete_) {
         return false;
     }
+    // Skipping ends both: the reader asked for the whole line now.
     text_reveal_complete_ = true;
+    text_fade_complete_ = true;
     return true;
 }
 

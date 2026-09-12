@@ -471,6 +471,25 @@ bool Game::ensure_pose_blend_target()
         pose_blend_target_.get(), SDL_BLENDMODE_BLEND_PREMULTIPLIED);
 }
 
+void Game::ensure_wash_texture()
+{
+    if (wash_texture_) {
+        return;
+    }
+    Surface pixel(SDL_CreateSurface(1, 1, SDL_PIXELFORMAT_ARGB8888));
+    if (!pixel) {
+        return;
+    }
+    SDL_FillSurfaceRect(pixel.get(), nullptr,
+                        SDL_MapSurfaceRGBA(pixel.get(), 0, 0, 0, 255));
+    wash_texture_.reset(
+        SDL_CreateTextureFromSurface(renderer_, pixel.get()));
+    if (wash_texture_) {
+        SDL_SetTextureBlendMode(wash_texture_.get(), SDL_BLENDMODE_BLEND);
+        SDL_SetTextureScaleMode(wash_texture_.get(), SDL_SCALEMODE_NEAREST);
+    }
+}
+
 void Game::ensure_shake_target()
 {
     if (shake_target_) {
@@ -766,6 +785,47 @@ void Game::draw_frame()
         draw_save_load();
     }
     draw_active_transition();
+    // Drawn after the transition, not before it: AVG_SetHalfTone() rebuilds
+    // BMP_BACKHALF from whatever BMP_BACK now holds, so the wash applies to
+    // the background the wipe is arriving at, not only the one it is leaving.
+    //
+    // The half tone belongs to the picture, not to the text.  In the original
+    // it is not an overlay at all: GRP_BACK is switched off and GRP_BACK+1, a
+    // darkened copy of the same bitmap, is switched on in its place, so it is
+    // moved, zoomed and rotated by whatever moves the background and can
+    // never come away from it.  Drawing it here, with the background's own
+    // destination and angle, is the same arrangement - and it is why nothing
+    // has to be extended to cover an edge: there is no edge to cover, because
+    // the wash and the background are the same shape.
+    if (ui_mode_ == UiMode::game && message_visible_ && !message_.empty()) {
+        if (const auto alpha = message_backdrop_alpha(); alpha > 0) {
+            SDL_FRect wash{0.0f, 0.0f, 800.0f, 600.0f};
+            double wash_angle = 0.0;
+            if (shake_background) {
+                wash = {
+                    -shake.x + 400.0f * (1.0f - shake.scale),
+                    -shake.y + 300.0f * (1.0f - shake.scale),
+                    800.0f * shake.scale,
+                    600.0f * shake.scale,
+                };
+                wash_angle = shake.angle;
+            }
+            SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
+            if (wash_angle == 0.0) {
+                SDL_SetRenderDrawColor(renderer_, 0, 0, 0, alpha);
+                SDL_RenderFillRect(renderer_, &wash);
+            } else {
+                // A rotated fill needs a texture; a one-pixel black one
+                // stretched over the same rect costs nothing and takes the
+                // same rotation the background did.
+                ensure_wash_texture();
+                SDL_SetTextureAlphaMod(wash_texture_.get(), alpha);
+                SDL_RenderTextureRotated(
+                    renderer_, wash_texture_.get(), nullptr, &wash,
+                    wash_angle, nullptr, SDL_FLIP_NONE);
+            }
+        }
+    }
     if (shake_art) {
         SDL_SetRenderTarget(renderer_, art_target);
         SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
@@ -797,30 +857,41 @@ void Game::draw_frame()
         if (font_.authentic()) {
             begin_authentic_text();
         }
-        SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
-        SDL_SetRenderDrawColor(renderer_, 0, 0, 0, message_backdrop_alpha());
-        SDL_RenderFillRect(renderer_, nullptr);
+        // The half tone is drawn with the art, above, so that it travels
+        // with the background rather than with this text.
+        // The width of the per-glyph fade, in the same units as
+        // reveal_position: the original's alph2 = LIM(text_cnt-cnt2,0,16)*16.
+        constexpr float fade_width = 16.0f;
         const auto visible = message_.visible();
         const auto reveal_start =
             std::min(text_reveal_start_, visible.size());
         const auto reveal_text = visible.substr(reveal_start);
         const auto reveal_character_count =
             utf8_character_count(reveal_text);
-        float reveal_position =
-            static_cast<float>(reveal_character_count);
-        if (!text_reveal_complete_ && config_.text_speed_ms > 0) {
+        const float fade_finished = static_cast<float>(reveal_character_count)
+            + fade_width - 1.0f;
+        float reveal_position = fade_finished;
+        if (!text_fade_complete_ && config_.text_speed_ms > 0) {
             const auto elapsed =
                 std::chrono::steady_clock::now() - text_reveal_started_;
             reveal_position =
                 std::chrono::duration<float, std::milli>(elapsed).count()
                 / config_.text_speed_ms;
+            // NovelMessage.max: the original's counter stops here, and this
+            // is what the click indicator and the wait for input key off.
             if (reveal_position >= reveal_character_count + 8.0f) {
                 text_reveal_complete_ = true;
-                reveal_position =
-                    static_cast<float>(reveal_character_count);
+            }
+            // The ramp runs on past that, because a glyph needs the full
+            // sixteen counts of alph2 = LIM(text_cnt - cnt2, 0, 16) * 16 to
+            // reach solid, and the last glyph only starts at count - 1.
+            // Ending the fade at the counter's threshold instead made the
+            // tail of every line jump from part-faded to solid.
+            if (reveal_position >= fade_finished) {
+                text_fade_complete_ = true;
+                reveal_position = fade_finished;
             }
         }
-        constexpr float fade_width = 16.0f;
         const float x = message_text_x();
         float y = message_text_y();
         std::size_t source_cursor = 0;
@@ -855,7 +926,7 @@ void Game::draw_frame()
                     std::string_view(line).substr(glyph_offset), 1);
                 const auto source_offset = line_start + glyph_offset;
                 float glyph_alpha = 1.0f;
-                if (!text_reveal_complete_
+                if (!text_fade_complete_
                     && source_offset >= reveal_start) {
                     const auto glyph_index = utf8_character_count(
                         visible.substr(

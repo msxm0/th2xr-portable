@@ -688,7 +688,14 @@ private:
     std::string current_line_key_;
     std::chrono::steady_clock::time_point text_reveal_started_{};
     std::size_t text_reveal_start_ = 0;
+    // The counter has reached NovelMessage.max (count + 8): the page is
+    // "done" as far as input and the click indicator are concerned.
     bool text_reveal_complete_ = true;
+    // The per-glyph ramp has finished too, sixteen counts after the last
+    // glyph started fading in.  Later than the above, and only this one may
+    // switch the fade off - conflating them either snapped the tail to solid
+    // or held the indicator back, depending on which threshold was used.
+    bool text_fade_complete_ = true;
     std::uint64_t next_transition_debug_id_ = 1;
     bool direct_scenario_ = false;
     th2::AudioChannel& waited_audio_channel();
@@ -1310,6 +1317,11 @@ private:
     // put it back when the animation ends.
     void hide_message_for_animation();
     void ensure_shake_target();
+    // A single black pixel, stretched to stand in for a rotated fill: SDL can
+    // rotate a texture but not a filled rectangle, and the half tone has to
+    // take the same rotation the background does.
+    void ensure_wash_texture();
+    Texture wash_texture_;
     // Cross-dissolves two character poses through a scratch target, the way
     // the original blends the pair inside one sprite.  False when the
     // renderer cannot do it, so the caller falls back.

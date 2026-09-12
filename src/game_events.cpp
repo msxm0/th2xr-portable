@@ -98,7 +98,23 @@ bool Game::handle(const th2::Event& event)
             std::chrono::steady_clock::now(),
         };
     } else if (name == "Q" || name == "SetShake") {
-        if ((number(event, 0) == 0 || number(event, 0) == 3)
+        // AVG_SetShake(): SHAKE_SIN (0) and SHAKE_ALL_SIN (6) put the
+        // message away before shaking.  Three is SHAKE_TXT_SIN, which shakes
+        // the *text* - hiding it there removed the only thing the effect
+        // moves - and six was missing, which is why a shake-everything took
+        // the message and its backdrop with it and showed the backdrop's
+        // rectangular edge sliding about.
+        //
+        // The original also calls AVG_ResetHalfTone() here; update_half_tone()
+        // already clears the wash as soon as the message is hidden, and lets
+        // it ramp back up from nothing when the message returns, which is the
+        // same thing a frame later.
+        //
+        // The count guard stands in for the original's type rewrite: with a
+        // zero count SHAKE_SIN becomes SHAKE_SIN_SET and SHAKE_ALL_SIN
+        // becomes SHAKE_ALL_SIN_SET, neither of which is in the list, so
+        // neither hides anything.
+        if ((number(event, 0) == 0 || number(event, 0) == 6)
             && number(event, 2) != 0) {
             message_visible_ = false;
         }
