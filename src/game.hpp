@@ -360,7 +360,12 @@ private:
     th2::GameFont font_;
     bool anime4k_available_ = false;
     bool last_anime4k_wanted_ = false;
-    Texture background_;
+    // BMP_BACK is the background as loaded plus whatever characters have
+    // been composited into it; BMP_BACK2 is the clean copy taken before any
+    // of them were, and BMP_BACKHALF the darkened copy of the plate.  All
+    // three belong to the display layer now - the game asks it for them.
+    bool has_background() const;
+    void load_background_bitmap(Texture texture);
     int bg_scene_ = -1;
     BackgroundKind background_kind_ = BackgroundKind::background;
     BackgroundView background_view_;
@@ -380,7 +385,6 @@ private:
     th2::AvgChar::Hooks character_hooks();
     // Points BMP_BACK / BMP_BACK2 at the plates the game still owns, so a
     // character can bake into them before the background is a graph itself.
-    void publish_background_bitmaps();
     // AVG_SetBackPos and the cases of AVG_ControlShake that transform
     // GRP_BACK, applied to the background graph and the darkened copy that
     // has to travel with it.
@@ -400,10 +404,6 @@ private:
         bool shake_characters);
 
     std::array<CharacterTexture, 32> character_textures_{};
-    // BMP_BACK: the background with the baked characters in it.  background_
-    // is BMP_BACK2, the clean copy taken before any of them were added, and
-    // is what this is rebuilt from.
-    Texture background_baked_;
     bool background_baked_dirty_ = true;
     void rebuild_baked_background();
     // AVG_CopyBack(OFF): BMP_BACK <- BMP_BACK2, creating the plate if it is
@@ -1380,7 +1380,6 @@ private:
     // reflected.  That is the engine's behaviour, not an oversight here.
     void build_half_tone_background();
     SDL_Texture* half_tone_background() const;
-    Texture half_tone_background_;
     // The full darkness the copy is made at: half_tone/128, with no ramp.
     // The ramp is done live on the background instead, which is why the two
     // are separate.

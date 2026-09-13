@@ -14,29 +14,9 @@ void Game::build_display()
     avg_char_.emplace(*display_, character_hooks());
 }
 
-void Game::publish_background_bitmaps()
+bool Game::has_background() const
 {
-    // BMP_BACK is the plate with the characters baked in and BMP_BACK2 the
-    // clean copy.  The game still owns both - the background is not a graph
-    // yet - so the slots borrow them rather than taking them over.  A
-    // character bakes into BMP_BACK through DSP_SetGraphTarget, which needs
-    // the slot to point at a texture that can be rendered into, and both of
-    // ours are created with target access.
-    const auto publish = [this](int slot, SDL_Texture* texture) {
-        if (!texture) {
-            display_->release_bmp(slot);
-            return;
-        }
-        float width = 0.0f;
-        float height = 0.0f;
-        SDL_GetTextureSize(texture, &width, &height);
-        display_->borrow_bmp(
-            slot, texture, static_cast<int>(width),
-            static_cast<int>(height), true);
-    };
-    publish(th2::bmp_back, background_baked_.get());
-    publish(th2::bmp_back2, background_.get());
-    publish(th2::bmp_backhalf, half_tone_background_.get());
+    return display().bmp_flag(th2::bmp_back2);
 }
 
 bool Game::transition_drives_graphs() const
@@ -153,12 +133,11 @@ void Game::control_back_change()
 void Game::setup_background_graphs(
     const ShakeSample& shake, bool shake_background, bool shake_characters)
 {
-    if (!background_) {
+    if (!has_background()) {
         display().reset_graph(th2::grp_back);
         display().reset_graph(th2::grp_back + 1);
         return;
     }
-    publish_background_bitmaps();
 
     // DSP_SetGraphBmp( GRP_BACK, BMP_BACK2 ) - a sine shake points both the
     // background and the half tone at the clean plate, which is why the
@@ -364,7 +343,7 @@ th2::AvgChar::Hooks Game::character_hooks()
     hooks.level = [this] { return config_.effect_speed != 0; };
     hooks.ami = [] { return false; };
 
-    hooks.back_flag = [this] { return background_ != nullptr; };
+    hooks.back_flag = [this] { return has_background(); };
     hooks.back_scrolling = [this] { return background_scroll_.has_value(); };
     hooks.back_zooming = [this] {
         const auto view = current_background_view();

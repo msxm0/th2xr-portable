@@ -376,64 +376,33 @@ float Game::half_tone_target_factor() const
 
 SDL_Texture* Game::half_tone_background() const
 {
-    return half_tone_background_.get();
+    return display().bmp_texture(th2::bmp_backhalf);
 }
 
 void Game::build_half_tone_background()
 {
-    // DSP_CopyBmp2( BMP_BACKHALF, BMP_BACK, NULL, 256,
-    //               BackStruct.r*Avg.half_tone/128, ... ) - the whole
-    // darkness at once.  What ramps is the background's own brightness,
-    // separately, until this copy takes over from it.
-    if (!background_) {
-        half_tone_background_.reset();
-        return;
-    }
-    float width = 0.0f;
-    float height = 0.0f;
-    SDL_GetTextureSize(background_.get(), &width, &height);
-    if (width <= 0.0f || height <= 0.0f) {
-        half_tone_background_.reset();
-        return;
-    }
-    float held_width = 0.0f;
-    float held_height = 0.0f;
-    if (half_tone_background_) {
-        SDL_GetTextureSize(half_tone_background_.get(),
-                           &held_width, &held_height);
-    }
-    if (!half_tone_background_ || held_width != width
-        || held_height != height) {
-        half_tone_background_.reset(SDL_CreateTexture(
-            renderer_, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET,
-            static_cast<int>(width), static_cast<int>(height)));
-        if (!half_tone_background_) {
-            return;
-        }
-        SDL_SetTextureBlendMode(
-            half_tone_background_.get(), SDL_BLENDMODE_NONE);
-    }
-    // Built from raise_half_tone(), during event handling - the scale there
-    // belongs to ImGui, not to the art.
-    SDL_Texture* const previous_target = SDL_GetRenderTarget(renderer_);
-    float scale_x = 1.0f;
-    float scale_y = 1.0f;
-    SDL_GetRenderScale(renderer_, &scale_x, &scale_y);
-    SDL_SetRenderTarget(renderer_, half_tone_background_.get());
-    SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
-    const auto shade = static_cast<Uint8>(std::clamp(
-        half_tone_target_factor() * 255.0f, 0.0f, 255.0f));
+    // AVG_SetHalfTone's TONE_NODISP branch:
+    //     DSP_CopyBmp2( BMP_BACKHALF, BMP_BACK, NULL, 256,
+    //                   BackStruct.r*Avg.half_tone/128, ... );
     // From BMP_BACK, not BMP_BACK2: the characters are already in it, which
-    // is how they come to be darkened without anything darkening them.
-    SDL_Texture* const plate =
-        background_baked_ ? background_baked_.get() : background_.get();
-    SDL_SetTextureColorMod(plate, shade, shade, shade);
-    SDL_SetTextureBlendMode(plate, SDL_BLENDMODE_NONE);
-    SDL_RenderTexture(renderer_, plate, nullptr, nullptr);
-    SDL_SetTextureColorMod(plate, 255, 255, 255);
-    SDL_SetTextureBlendMode(plate, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderScale(renderer_, scale_x, scale_y);
-    SDL_SetRenderTarget(renderer_, previous_target);
+    // is how they come to be darkened without anything darkening them.  The
+    // whole darkness at once, because the copy is only ever shown once the
+    // ramp has finished; what ramps is the background's own brightness.
+    if (!display().bmp_flag(th2::bmp_back)) {
+        display().release_bmp(th2::bmp_backhalf);
+        return;
+    }
+    // BackStruct.r*Avg.half_tone/128 per channel, not the half tone alone:
+    // the background's own fade is baked into the copy.  In practice it is
+    // always neutral here, because AVG_SetBackFade tears the wash down
+    // before it starts - but the copy is now a DSP_CopyBmp2 like the
+    // engine's, so there is no reason to leave it out.
+    const auto shade = [this](std::size_t channel) {
+        return static_cast<int>(
+            background_brightness_[channel] * half_tone_target_factor());
+    };
+    display().copy_bmp2(
+        th2::bmp_backhalf, th2::bmp_back, shade(0), shade(1), shade(2));
 }
 
 Uint8 Game::apply_background_fade(SDL_Texture* texture, float extra) const
@@ -520,11 +489,11 @@ void Game::reset_render_state()
         upscaler_->reset();
     }
     shake_target_.reset();
-    background_baked_.reset();
+    display().release_bmp(th2::bmp_back);
     background_baked_dirty_ = true;
     previous_frame_.reset();
     previous_frame_valid_ = false;
-    half_tone_background_.reset();
+    display().release_bmp(th2::bmp_backhalf);
     title_masked_.reset();
     if (imgui_) {
         imgui_->rebuild_font_atlas(imgui_display_scale());
@@ -666,51 +635,15 @@ void Game::ensure_shake_target()
 
 bool Game::copy_back_plate()
 {
-    // DSP_CopyBmp( BMP_BACK, BMP_BACK2 ): the clean plate back over the
-    // baked one.  A bake cannot be undone in place, so this is how a
-    // character comes out of the background again.
-    if (!background_) {
-        background_baked_.reset();
-        publish_background_bitmaps();
+    // AVG_CopyBack(OFF): DSP_CopyBmp( BMP_BACK, BMP_BACK2 ).  The clean
+    // plate back over the baked one, because a bake cannot be undone in
+    // place - this is how a character comes out of the background again.
+    if (!display().bmp_flag(th2::bmp_back2)) {
+        display().release_bmp(th2::bmp_back);
         return false;
     }
-    float width = 0.0f;
-    float height = 0.0f;
-    SDL_GetTextureSize(background_.get(), &width, &height);
-    if (width <= 0.0f || height <= 0.0f) {
-        background_baked_.reset();
-        publish_background_bitmaps();
-        return false;
-    }
-    float held_width = 0.0f;
-    float held_height = 0.0f;
-    if (background_baked_) {
-        SDL_GetTextureSize(background_baked_.get(), &held_width, &held_height);
-    }
-    if (!background_baked_ || held_width != width || held_height != height) {
-        background_baked_.reset(SDL_CreateTexture(
-            renderer_, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET,
-            static_cast<int>(width), static_cast<int>(height)));
-        if (!background_baked_) {
-            publish_background_bitmaps();
-            return false;
-        }
-        SDL_SetTextureBlendMode(background_baked_.get(), SDL_BLENDMODE_NONE);
-    }
-    SDL_Texture* const previous_target = SDL_GetRenderTarget(renderer_);
-    float scale_x = 1.0f;
-    float scale_y = 1.0f;
-    SDL_GetRenderScale(renderer_, &scale_x, &scale_y);
-    SDL_SetRenderTarget(renderer_, background_baked_.get());
-    SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
-    SDL_SetTextureBlendMode(background_.get(), SDL_BLENDMODE_NONE);
-    SDL_RenderTexture(renderer_, background_.get(), nullptr, nullptr);
-    SDL_SetTextureBlendMode(background_.get(), SDL_BLENDMODE_BLEND);
-    SDL_SetRenderScale(renderer_, scale_x, scale_y);
-    SDL_SetRenderTarget(renderer_, previous_target);
-    // The slots have to point at the plate before anything bakes into it.
-    publish_background_bitmaps();
-    return true;
+    display().copy_bmp(th2::bmp_back, th2::bmp_back2);
+    return display().bmp_flag(th2::bmp_back);
 }
 
 void Game::rebuild_baked_background()
@@ -740,7 +673,7 @@ void Game::rebuild_baked_background()
     // executing precedes the bake by a frame.  Re-copying here is the same
     // ordering expressed the only way this frame structure allows: the copy
     // is never older than the plate it is of.
-    if (half_tone_armed_ && half_tone_background_) {
+    if (half_tone_armed_ && display().bmp_flag(th2::bmp_backhalf)) {
         build_half_tone_background();
     }
 }
@@ -882,7 +815,7 @@ void Game::draw_frame()
     // GRP_BACK at LAY_BACK, with the shake's transform on it, and the
     // darkened copy next door at LAY_BACK+2 with the same transform.
     setup_background_graphs(shake, shake_background, shake_characters);
-    if (!background_ && bg_scene_ == 0) {
+    if (!display().bmp_flag(th2::bmp_back2) && bg_scene_ == 0) {
         SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
         const SDL_FRect game_area{0.0f, 0.0f, 800.0f, 600.0f};
         SDL_RenderFillRect(renderer_, &game_area);

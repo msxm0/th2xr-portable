@@ -181,7 +181,7 @@ void Game::update_character_animations()
     }
     if (half_tone_copy_stale_) {
         half_tone_copy_stale_ = false;
-        if (half_tone_armed_ && half_tone_background_) {
+        if (half_tone_armed_ && display().bmp_flag(th2::bmp_backhalf)) {
             build_half_tone_background();
         }
     }
@@ -596,10 +596,34 @@ void Game::update_audio()
     }
 }
 
+void Game::load_background_bitmap(Texture texture)
+{
+    // AVG_SetBack:
+    //     DSP_LoadBmp( BMP_BACK, ... );
+    //     DSP_CopyBmp( BMP_BACK2, BMP_BACK );
+    // The picture arrives in BMP_BACK and BMP_BACK2 is the clean copy taken
+    // before any character is composited in - so the plate can always be
+    // put back to it.
+    background_baked_dirty_ = true;
+    if (!texture) {
+        display().release_bmp(th2::bmp_back);
+        display().release_bmp(th2::bmp_back2);
+        return;
+    }
+    float width = 0.0f;
+    float height = 0.0f;
+    SDL_GetTextureSize(texture.get(), &width, &height);
+    display().set_bmp(
+        th2::bmp_back, std::move(texture), static_cast<int>(width),
+        static_cast<int>(height));
+    display().copy_bmp(th2::bmp_back2, th2::bmp_back);
+}
+
 void Game::set_background(const th2::Event& event, bool keep_characters)
 {
     if (number(event, 1) < 0) {
-        background_.reset();
+        display().release_bmp(th2::bmp_back);
+        display().release_bmp(th2::bmp_back2);
         background_baked_dirty_ = true;
         bg_scene_ = -1;
         background_kind_ = BackgroundKind::background;
@@ -634,10 +658,9 @@ void Game::set_background(const th2::Event& event, bool keep_characters)
         std::filesystem::path(name).replace_extension(".amp").string();
     background_tone_curve_ =
         graphics_.find(curve_name) ? curve_name : std::string{};
-    background_baked_dirty_ = true;
-    background_ = load_toned_texture(
+    load_background_bitmap(load_toned_texture(
         renderer_, backgrounds_, name, graphics_,
-        background_tone_curves());
+        background_tone_curves()));
     if (keep_characters) {
         reload_character_textures();
     }
@@ -660,10 +683,9 @@ void Game::set_cg(
     };
     background_scroll_.reset();
     update_background_sakura(visual, false);
-    background_baked_dirty_ = true;
-    background_ = load_toned_texture(
+    load_background_bitmap(load_toned_texture(
         renderer_, graphics_, std::format("{}{:06d}.tga", prefix, visual),
-        graphics_, background_tone_curves());
+        graphics_, background_tone_curves()));
     auto& unlocked = kind == BackgroundKind::visual
         ? unlocked_visual_cgs_ : unlocked_h_cgs_;
     if (unlocked.emplace(visual).second) {
@@ -690,11 +712,10 @@ void Game::restore_background()
     if (background_kind_ != BackgroundKind::background) {
         const char prefix =
             background_kind_ == BackgroundKind::visual ? 'v' : 'h';
-        background_baked_dirty_ = true;
-        background_ = load_toned_texture(
+        load_background_bitmap(load_toned_texture(
             renderer_, graphics_,
             std::format("{}{:06d}.tga", prefix, bg_scene_),
-            graphics_, background_tone_curves());
+            graphics_, background_tone_curves()));
     } else {
         const auto name = std::format(
             "B{:03d}{}{}{}.bmp", bg_scene_ / 10,
@@ -704,10 +725,9 @@ void Game::restore_background()
             std::filesystem::path(name).replace_extension(".amp").string();
         background_tone_curve_ =
             graphics_.find(curve_name) ? curve_name : std::string{};
-        background_baked_dirty_ = true;
-        background_ = load_toned_texture(
+        load_background_bitmap(load_toned_texture(
             renderer_, backgrounds_, name, graphics_,
-            background_tone_curves());
+            background_tone_curves()));
     }
     reload_character_textures();
 }

@@ -40,7 +40,7 @@ bool Game::handle(const th2::Event& event)
                 + std::max<std::int32_t>(0, number(event, 2));
         const bool unchanged_direct =
             number(event, 0) == -1
-            && background_
+            && has_background()
             && bg_scene_ == scene;
         if (unchanged_direct) {
             return true;
@@ -56,7 +56,7 @@ bool Game::handle(const th2::Event& event)
                 + std::max<std::int32_t>(0, number(event, 2));
             const bool unchanged_direct =
                 number(event, 0) == -1
-                && background_
+                && has_background()
                 && bg_scene_ == visual;
             if (unchanged_direct) {
                 return true;
@@ -71,7 +71,7 @@ bool Game::handle(const th2::Event& event)
             + std::max<std::int32_t>(0, number(event, 2));
         const bool unchanged_direct =
             number(event, 0) == -1
-            && background_
+            && has_background()
             && bg_scene_ == visual;
         if (unchanged_direct) {
             return true;

@@ -96,7 +96,8 @@ void Game::reset_play_state()
     movie_resume_script_ = false;
     movie_mode_ = -1;
 
-    background_.reset();
+    display().release_bmp(th2::bmp_back);
+    display().release_bmp(th2::bmp_back2);
     background_baked_dirty_ = true;
     bg_scene_ = -1;
     background_kind_ = BackgroundKind::background;
