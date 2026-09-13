@@ -1040,7 +1040,6 @@ void Game::iterate()
         config_.font_size, framebuffer_scale);
     draw_config();
     draw_name_input();
-    draw();
     update_transition();
     update_background_fade();
     update_audio_decode();
@@ -1051,6 +1050,13 @@ void Game::iterate()
     update_character_animations();
     update_clock_calendar();
     update_sakura();
+    // main.cpp runs EXEC_ControlLang, then MAIN_GameControl - the AVG_
+    // Control* chain - and only then MAIN_DrawGraph.  Drawing before the
+    // control pass meant anything the script had just set up was put on
+    // screen once with whatever DSP_SetGraph left on it: a character
+    // arriving showed at full opacity for a frame before AVG_ControlChar
+    // gave it DRW_BLD(0) and started the fade.
+    draw();
 #ifdef __EMSCRIPTEN__
     // run_loop() paces the browser build with requestAnimationFrame; there is
     // no thread to sleep on.  All animation is wall-clock driven, so a display

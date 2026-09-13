@@ -149,8 +149,12 @@ public:
     // script as a whole rather than one instruction.
     bool any_animating() const;
 
-    // AVG_ControlChar, run once a frame between the script and the draw.
-    void control_char();
+    // AVG_ControlChar, run between the script and the draw.  The engine
+    // calls it once per frame at sixty of them a second, so the graphs it
+    // drives are current on every frame that is drawn.  We may draw faster
+    // than that, so `tick` separates the two halves: false runs everything
+    // that decides what is on screen and leaves the counters alone.
+    void control_char(bool tick = true);
 
     void init_char();                                      // AVG_InitChar
 

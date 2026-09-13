@@ -171,11 +171,14 @@ void Game::update_character_animations()
     // A long stall must not be made up all at once, or an animation jumps.
     character_control_debt_ = std::min(character_control_debt_, 8.0);
     const int steps = static_cast<int>(character_control_debt_);
-    if (steps <= 0) {
-        return;
-    }
     character_control_debt_ -= steps;
     const bool was_animating = character_animation_active();
+    if (steps <= 0) {
+        // No sixtieth has gone by, but the frame is about to be drawn and
+        // the engine would have run AVG_ControlChar before it.  Everything
+        // that decides what is on screen runs; only the counters wait.
+        chars().control_char(false);
+    }
     for (int i = 0; i < steps; ++i) {
         chars().control_char();
     }

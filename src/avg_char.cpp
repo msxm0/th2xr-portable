@@ -237,7 +237,14 @@ void AvgChar::set_char(
         // Registered as already baked, which AVG_ControlChar's first loop
         // notices next frame and turns into a full plate rebuild.
         character.cut_mode = 1;
-                avg_load_char(index, char_no, pose, in_type);
+        avg_load_char(index, char_no, pose, in_type);
+        // AVG_LoadChar ends with DSP_SetGraph, which leaves DRW_NML on the
+        // graph, and the engine gets away with it because AVG_ControlChar
+        // always runs between the script and the draw.  Ours steps the
+        // counters on a sixtieth while the display may refresh faster, so a
+        // frame can pass with no control pass at all - and an entrance that
+        // has not begun must not be on screen.
+        display_.set_graph_param(grp_char + index, drw_bld_of(0));
     }
 }
 
@@ -550,7 +557,7 @@ void AvgChar::restore(
     display_.set_graph_fade(grp_char + index, bright);
 }
 
-void AvgChar::control_char()
+void AvgChar::control_char(bool tick)
 {
     const bool sp = hooks_.level && hooks_.level();
     const bool ami = hooks_.ami && hooks_.ami();
@@ -810,7 +817,7 @@ void AvgChar::control_char()
             }
         }
 
-        if (character.cond != char_cond_nomal
+        if (tick && character.cond != char_cond_nomal
             && character.cond != char_cond_wait) {
             // The message window closes for the length of an animation and
             // is put back afterwards, remembered by a flag - so the text
