@@ -1,0 +1,9 @@
+# Title menu, 800x600 client coords. はじめから (start) sits at about y=403.
+150 move 400 403
+200 lclick 3
+# then advance through whatever follows
+400 lclick 3
+500 lclick 3
+600 lclick 3
+700 lclick 3
+800 lclick 3

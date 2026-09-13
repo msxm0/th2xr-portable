@@ -26,6 +26,16 @@ unsigned long th2ref_current_tick(void);
  * and no scaling in it. */
 void th2ref_dump_frame(void *vram, int draw_mode);
 
+/* Replaces KEY_RenewKeybord and MUS_RenewMouse: fills KeyCond from a script
+ * keyed by tick, and leaves the real devices unread. */
+void th2ref_input(void);
+
+/* MUS_RenewMouse reads the real pointer three ways.  Redirecting these lets
+ * the function itself run untouched, so all of its rect and trigger
+ * bookkeeping still happens - on scripted coordinates. */
+int   th2ref_cursor_pos(POINT *p);
+short th2ref_async_key(int vk);
+
 #ifdef __cplusplus
 }
 #endif

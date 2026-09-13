@@ -45,6 +45,27 @@ differs lives here:
   `wine reg add 'HKCU\Software\Wine\Fonts\Replacements' /v "MS UI Gothic" /d "Noto Sans CJK JP" /f`
   (and `MS Gothic`, `MS PGothic`, `MS Mincho`, `MS PMincho`).
 
+## Trace runs
+
+Built with `TH2REF_FLAGS="-DTH2REF_TRACE -I$PWD/reference/shim"`, the engine
+takes three environment variables:
+
+| Variable | Meaning |
+|---|---|
+| `TH2REF_DUMP` | directory to write `fNNNNNN.bin` frames into |
+| `TH2REF_FROM` / `TH2REF_TO` | tick range to dump |
+| `TH2REF_INPUT` | input script (see `scripts/opening.txt`) |
+
+Input script lines are `<tick> <what> [args]`:
+
+    150 move 400 403     # pointer to client (400,403)
+    200 lclick 3         # left button held 3 ticks
+    420 ctrl 90          # a key held 90 ticks
+    320 enter            # single-frame press
+
+Two runs of `scripts/opening.txt` produce 900 byte-identical frames,
+through a title-menu click and eight lines of dialogue.
+
 ## Running
 
     ./build.sh                       # 41 files, then link

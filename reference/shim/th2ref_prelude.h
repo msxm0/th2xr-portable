@@ -48,6 +48,9 @@
 #include <mmsystem.h>
 #include "th2ref_hooks.h"
 #define timeGetTime() th2ref_time()
+#define GetCursorPos(p)       th2ref_cursor_pos(p)
+#define ScreenToClient(h,p)   ((void)(h), 1)
+#define GetAsyncKeyState(k)   th2ref_async_key(k)
 #endif
 
 #endif /* TH2REF_PRELUDE_H */

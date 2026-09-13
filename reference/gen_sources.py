@@ -96,6 +96,14 @@ PATCHES = [
      "\tSendMessage( MainWindow.hwnd, WM_PAINT,0,0);",
      "#ifdef TH2REF_TRACE\r\n\tth2ref_dump_frame( MainWindow.draw_mode2==32 ? (void*)&MainWindow.vram_true :\r\n\t                   MainWindow.draw_mode2==24 ? (void*)&MainWindow.vram_full :\r\n\t                   (void*)&MainWindow.vram_high, MainWindow.draw_mode2 );\r\n#endif\r\n\tSendMessage( MainWindow.hwnd, WM_PAINT,0,0);",
      "framebuffer dump after MAIN_DrawGraph"),
+    # Scripted input.  Both Renew calls read the real devices; the mouse is
+    # the subtle one, because the engine hit-tests the system bar against the
+    # live cursor, so where the pointer happens to be would change the path
+    # a trace run takes.
+    ("ScriptEngine/src/main.cpp",
+     "\tKEY_RenewKeybord( MainWindow.active );\r\n\tMUS_RenewMouse( MainWindow.hwnd, MainWindow.active, 0 );",
+     "#ifdef TH2REF_TRACE\r\n\tth2ref_input();\r\n\tMUS_RenewMouse( MainWindow.hwnd, MainWindow.active, 0 );\r\n#else\r\n\tKEY_RenewKeybord( MainWindow.active );\r\n\tMUS_RenewMouse( MainWindow.hwnd, MainWindow.active, 0 );\r\n#endif",
+     "scripted input replaces the real devices"),
     # A Windows path separator in an #include.
     ("ScriptEngine/src/Escript.cpp", r'#include "..\\mes\\escr.h"', '#include "escr.h"',
      "backslash include path"),

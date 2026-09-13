@@ -5,6 +5,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 G="$HERE/../../aquaplus_gpl"
 # The hooks TU must NOT get the prelude: it is the one place that has to call
 # the real timeGetTime rather than the macro that replaces it.
+# The input TU needs the engine's keybord.h, so it gets the engine include
+# path; it never calls timeGetTime so the prelude's redirect is harmless.
+i686-w64-mingw32-g++ -c "$HERE/shim/th2ref_input.cpp" -o "$HERE/build/th2ref_input.o" \
+  -I"$HERE/shim" -I"$HERE/shim/include" -I"$G/ToHeart2/my_inc2" \
+  -I"$G/ToHeart2/ScriptEngine/src" -m32 -w -fpermissive -funsigned-char -std=gnu++17 || exit 1
 i686-w64-mingw32-g++ -c "$HERE/shim/th2ref_hooks.cpp" -o "$HERE/build/th2ref_hooks.o" \
   -I"$HERE/shim" -m32 -w -funsigned-char -std=gnu++17 || exit 1
 i686-w64-mingw32-g++ -c "$HERE/shim/stubs.cpp" -o "$HERE/build/stubs.o" \
