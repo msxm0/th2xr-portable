@@ -855,7 +855,9 @@ private:
     std::array<char, 64> name_given_reading_{};
     std::array<char, 64> name_nickname_{};
     bool auto_mode_ = false;
-    bool skip_mode_ = false;
+    bool skip_mode_ = false;   // Avg.msg_cut_mode, the toggle
+    bool skip_held_ = false;   // Avg.msg_cut, the key
+    bool script_resume_ = false;
     bool demo_mode_ = false;
     bool replay_mode_ = false;
     int demo_delay_frames_ = 0;
@@ -930,6 +932,9 @@ private:
     // AVG_GetMesCut(): the message is being skipped, so every effect the
     // engine measures with AVG_EffCnt collapses to nothing.
     bool message_cut() const;
+    // Escr.h's EScroptOpr[].ret: true for an opcode the engine's virtual
+    // machine stops on for the rest of the frame.
+    static bool opcode_yields_frame(std::string_view name);
     int effect_frames(int frames) const;
     // AVG_EffCnt4: the same count in 30fps units, unscaled by the effect
     // speed, and nothing at all while skipping.
@@ -1034,6 +1039,15 @@ private:
         const th2::ScriptStep& step, std::string_view error);
     std::filesystem::path dump_runtime_error(std::string_view error);
     void advance(bool skipping = false);
+    // Something the script was waiting on has finished.  It does not run the
+    // virtual machine: main.cpp runs EXEC_ControlLang once at the top of the
+    // frame and only then MAIN_GameControl and MAIN_DrawGraph, so resuming
+    // from inside the AVG_Control* pass would let the instruction it lets
+    // through be drawn before its own control pass had run.
+    void resume_script();
+    // EXEC_ControlLang's slot: retires a parked ESC_WAIT and runs whatever
+    // resume_script() asked for, before any of the update_ pass.
+    void pump_script();
     void save(int slot);
     bool load(int slot);
     std::filesystem::path save_path(int slot) const;

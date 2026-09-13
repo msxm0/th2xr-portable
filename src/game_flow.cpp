@@ -209,7 +209,7 @@ bool Game::message_cut() const
 {
     // AVG_GetMesCut(): Avg.msg_cut is the skip key held, Avg.msg_cut_mode
     // the toggle.  Both come out as one flag here.
-    return skip_mode_;
+    return skip_mode_ || skip_held_;
 }
 
 int Game::effect_frames4(int frames) const

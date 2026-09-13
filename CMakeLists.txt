@@ -348,6 +348,7 @@ if(ANDROID)
         src/dsp.cpp
         src/avg_char.cpp
         src/game_display.cpp
+        src/script_wait.cpp
         src/game_title_draw.cpp
         src/icon.cpp
         src/image.cpp
@@ -384,6 +385,7 @@ else()
         src/dsp.cpp
         src/avg_char.cpp
         src/game_display.cpp
+        src/script_wait.cpp
         src/game_title_draw.cpp
         src/icon.cpp
         src/image.cpp

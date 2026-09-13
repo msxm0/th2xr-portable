@@ -558,6 +558,16 @@ void Game::sync_web_canvas_buffer()
 
 void Game::iterate()
 {
+    // An ESC_WAIT opcode parks the virtual machine for the rest of the frame
+    // it ran in.  That frame is over, so the park is retired before the
+    // player's input is looked at rather than after - a click arriving on
+    // the frame after a message would otherwise be swallowed by advance()'s
+    // wake_time_ guard.  Actually running the script waits for
+    // pump_script(), in EXEC_ControlLang's slot below.
+    if (wake_time_ && std::chrono::steady_clock::now() >= *wake_time_) {
+        wake_time_.reset();
+        script_resume_ = true;
+    }
     sync_web_viewport();
     // Reads two ints the page publishes and compares them; it does not go
     // near the browser unless they actually disagree.
@@ -945,6 +955,9 @@ void Game::iterate()
         && ((SDL_GetModState() & SDL_KMOD_CTRL) != 0
             || touch_input_.skip_held()
             || gamepad_input_.ctrl_skip_held());
+    // Avg.msg_cut, the half of AVG_GetMesCut() that is the key rather than
+    // the toggle.  Effects collapse to nothing for either.
+    skip_held_ = control_held;
     if (movie_) {
         movie_->set_speed(control_held ? 4.0 : 1.0);
     } else if (control_held && ui_mode_ == UiMode::title) {
@@ -953,16 +966,21 @@ void Game::iterate()
             *title_exit_started_ -= std::chrono::milliseconds(50);
         }
     } else if (control_held && ui_mode_ == UiMode::game) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= skip_next_time_) {
-            skip(true);
-            skip_next_time_ = now + std::chrono::milliseconds(40);
-        }
-    } else if (wake_time_
-               && std::chrono::steady_clock::now() >= *wake_time_) {
-        wake_time_.reset();
-        advance();
+        // The engine skips at one instruction per frame whatever else is
+        // going on: Avg.msg_cut collapses every AVG_EffCnt to zero, so the
+        // effects finish themselves and the waits stop holding.  pump_script
+        // below retires the parked ESC_WAIT, so all this has to do is the
+        // half advance() alone can do - turn the page.
+        skip(true);
     }
+    // EXEC_ControlLang.  main.cpp runs it, then MAIN_GameControl - the
+    // AVG_Control* chain, which is the update_ pass below - and only then
+    // MAIN_DrawGraph.  Every resumption of the script goes through here so
+    // that order holds; resuming from inside the control pass put a
+    // character on screen before AVG_ControlChar had given it its first
+    // DRW_BLD, and raised the half tone after AVG_ControlHalfTone had
+    // already run for the frame, which is text over an undarkened plate.
+    pump_script();
     if (soak_) {
         soak_->step();
     }

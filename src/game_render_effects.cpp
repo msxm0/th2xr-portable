@@ -382,10 +382,10 @@ void Game::update_transition()
     if (elapsed < duration) {
         return;
     }
-    const bool resume_script = transition_->resume_script;
+    const bool resumes = transition_->resume_script;
     transition_.reset();
-    if (resume_script) {
-        advance();
+    if (resumes) {
+        resume_script();
     }
 }
 
@@ -873,7 +873,7 @@ void Game::update_background_fade()
     if (progress >= 1.0f) {
         background_brightness_ = background_fade_->to;
         background_fade_.reset();
-        advance();
+        resume_script();
     }
 }
 
@@ -888,7 +888,7 @@ void Game::update_screen_flash()
         std::chrono::steady_clock::now() - screen_flash_->started).count();
     if (elapsed * 60.0 >= total_frames) {
         screen_flash_.reset();
-        advance();
+        resume_script();
     }
 }
 
@@ -923,7 +923,7 @@ void Game::update_shake()
         // back in the plate, which is the only thing that undoes cut_mode 2.
         chars().set_char_pos_shake(0, 0, 0);
         shake_.reset();
-        advance();
+        resume_script();
     }
 }
 
@@ -1158,7 +1158,7 @@ void Game::update_background_scroll()
         // for the whole scroll (BackStruct.sc_flag), so this is the only
         // thing that puts them back where they belong.
         background_baked_dirty_ = true;
-        advance();
+        resume_script();
     }
 }
 

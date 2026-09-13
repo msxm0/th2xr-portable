@@ -681,6 +681,29 @@ std::filesystem::path Game::dump_runtime_error(std::string_view error)
     return path;
 }
 
+void Game::resume_script()
+{
+    script_resume_ = true;
+}
+
+void Game::pump_script()
+{
+    // iterate() retires an expired ESC_WAIT park before input; this is
+    // where the script it parked comes back, before MAIN_GameControl and
+    // MAIN_DrawGraph rather than in the middle of them.
+    if (!script_resume_) {
+        return;
+    }
+    script_resume_ = false;
+    // Resuming is not a click.  advance() doubles as the player's advance -
+    // it marks the line read, finishes the reveal and turns the page - so a
+    // message or a choice parks the script until the player actually acts.
+    if (waiting_for_input_ || choosing_) {
+        return;
+    }
+    advance();
+}
+
 void Game::advance(bool skipping)
 {
     if (wake_time_ || audio_wait_ || transition_ || background_fade_
@@ -816,6 +839,16 @@ void Game::advance(bool skipping)
                 break;
             }
             if (character_animation_active()) {
+                break;
+            }
+            // EScroptOpr[].ret: an ESC_WAIT opcode stops the virtual
+            // machine for the rest of the frame, so the AVG_Control* pass
+            // and the draw both happen before the next instruction runs.
+            // Every opcode that touches the screen is one, which is what
+            // keeps a plate copy from being taken in the same frame as the
+            // bake it is supposed to contain.
+            if (opcode_yields_frame(step.event.instruction.name)) {
+                wake_time_ = std::chrono::steady_clock::now();
                 break;
             }
             if (clock_state_ || calendar_state_) {
