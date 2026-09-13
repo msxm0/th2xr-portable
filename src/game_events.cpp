@@ -129,12 +129,18 @@ bool Game::handle(const th2::Event& event)
         // AVG_SetFlash runs two AVG_ColtrolFade legs, both counted by
         // AVG_EffCnt, so the effect-speed setting scales them like any other
         // effect.
+        // AVG_SetFlash( r, g, b, fade1, fade2 ), whose counters stay raw so
+        // AVG_EffCnt is re-asked on every pass of AVG_ColtrolFade.
+        avgback().set_flash(
+            std::clamp(number(event, 0), 0, 255),
+            std::clamp(number(event, 1), 0, 255),
+            std::clamp(number(event, 2), 0, 255),
+            number(event, 3), number(event, 4));
         screen_flash_ = ScreenFlash{
             std::clamp(number(event, 0), 0, 255),
             std::clamp(number(event, 1), 0, 255),
             std::clamp(number(event, 2), 0, 255),
-            std::max(1, effect_frames(number(event, 3))),
-            std::max(1, effect_frames(number(event, 4))),
+            number(event, 3), number(event, 4),
             std::chrono::steady_clock::now(),
         };
     } else if (name == "Q" || name == "SetShake") {
@@ -471,7 +477,33 @@ bool Game::handle(const th2::Event& event)
         // AVG_AddNovelMessage( EscParam[0].str, EscParam[1].num ).
         msg().add_novel_message(text(event, 0), number(event, 1));
     } else if (name == "T") {
-        message_visible_ = number(event, 0) != 0;
+        // ESC_EOprT, verbatim:
+        //
+        //     if(EscParam[1].num==-1) EscParam[1].num = OFF;
+        //     if(EscParam[0].num){
+        //         if(EscParam[1].num){ AVG_SetHalfTone(); }
+        //         AVG_SetNovelMessageDisp(ON);
+        //     }else{
+        //         if(EscParam[1].num){ AVG_ResetHalfTone(); }
+        //         AVG_SetNovelMessageDisp(OFF);
+        //     }
+        //
+        // The second parameter is the half tone, and we had no half of it:
+        // T was only hiding and showing the text, so a script that took the
+        // text away for a moment left the wash sitting on the background
+        // with nothing on top of it.
+        const int tone = number(event, 1) == -1 ? 0 : number(event, 1);
+        if (number(event, 0)) {
+            if (tone) {
+                msg().set_half_tone();
+            }
+            msg().set_novel_message_disp(true);
+        } else {
+            if (tone) {
+                msg().reset_half_tone();
+            }
+            msg().set_novel_message_disp(false);
+        }
     } else if (name == "K") {
         waiting_for_input_ = true;
         message_ends_block_ = true;
@@ -781,7 +813,7 @@ bool Game::opcode_waiting(WaitKind kind, const th2::Event& event) const
         return avgback().wait_back();
     case WaitKind::fade:
         // !AVG_WaitFade(): FadeStruct.flag, the screen flash.
-        return screen_flash_.has_value();
+        return avgback().wait_fade();
     case WaitKind::back_fade:
         // !AVG_WaitBackFade(): BackStruct.br_flag.
         return avgback().wait_back_fade();

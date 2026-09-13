@@ -42,6 +42,9 @@ void AvgBack::control_back()
     control_back_change();
     control_back_scroll();
     control_shake();
+    // AVG_ColtrolFade is called from AVG_System's tail rather than from
+    // AVG_ControlBack, but it is one more counter in the same pass.
+    control_fade();
 }
 
 // --------------------------------------------------- AVG_ControlBackChange -
@@ -860,6 +863,68 @@ void AvgBack::begin_back(int bak_no, int x, int y, int chg_type, int cg_flag,
     back_.sc_type = 0;
     back_.redraw = 1;
     set_back_pos(x, y);
+}
+
+void AvgBack::set_fade(int r, int g, int b, int disp, int fade)
+{
+    // void AVG_SetFade( int r, int g, int b, int disp, int fade ).  The
+    // start of the ramp is wherever the last one left off, which is why a
+    // flash that is interrupted does not jump.
+    fade_.flag = 1;
+    fade_.cnt = 0;
+    fade_.sr = fade_.r;
+    fade_.sg = fade_.g;
+    fade_.sb = fade_.b;
+    fade_.er = r;
+    fade_.eg = g;
+    fade_.eb = b;
+    fade_.disp = disp;
+    fade_.flash = 0;
+    fade_.fade = fade;
+    // The rest of AVG_SetFade freezes the screen: DSP_GetDispBmp captures it
+    // into BMP_DISP, GRP_DISP draws that at LAY_BACK, and every graph
+    // without DSP_GetGraphBrightFlag is hidden for the duration.  Ours tints
+    // the composited frame instead, so there is nothing to hide - but the
+    // two legs and their counters are the same.
+}
+
+void AvgBack::set_flash(int r, int g, int b, int fade1, int fade2)
+{
+    // void AVG_SetFlash( int r, int g, int b, int fade1, int fade2 ):
+    //     AVG_SetFade( r, g, b, ON, fade1 );
+    //     if(fade2<=0) fade2=1;
+    //     FadeStruct.flash = fade2;
+    set_fade(r, g, b, 1, fade1);
+    if (fade2 <= 0) {
+        fade2 = 1;
+    }
+    fade_.flash = fade2;
+}
+
+void AvgBack::control_fade()
+{
+    // void AVG_ColtrolFade( void ).
+    const int max = eff_cnt(fade_.fade);
+    if (!fade_.flag) {
+        return;
+    }
+    fade_.cnt++;
+    if (fade_.cnt >= max) {
+        fade_.flag = 0;
+        fade_.r = fade_.er;
+        fade_.g = fade_.eg;
+        fade_.b = fade_.eb;
+        if (fade_.disp && fade_.flash) {
+            // The return leg, started from inside the control function
+            // rather than by anything outside it.
+            set_fade(bright_neutral, bright_neutral, bright_neutral,
+                     0, fade_.flash);
+        }
+    } else {
+        fade_.r = (fade_.sr * (max - fade_.cnt) + fade_.er * fade_.cnt) / max;
+        fade_.g = (fade_.sg * (max - fade_.cnt) + fade_.eg * fade_.cnt) / max;
+        fade_.b = (fade_.sb * (max - fade_.cnt) + fade_.eb * fade_.cnt) / max;
+    }
 }
 
 void AvgBack::open_back()

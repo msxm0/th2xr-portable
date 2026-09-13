@@ -842,35 +842,30 @@ void Game::update_background_fade()
 }
 void Game::update_screen_flash()
 {
-    if (!screen_flash_) {
-        return;
-    }
-    const int total_frames =
-        screen_flash_->fade_in_frames + screen_flash_->fade_out_frames;
-    const auto elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - screen_flash_->started).count();
-    if (elapsed * 60.0 >= total_frames || message_cut()) {
+    // AVG_ColtrolFade owns FadeStruct.cnt and starts the return leg itself,
+    // so all that is left is letting go of the overlay once flag clears.
+    if (screen_flash_ && !avgback().wait_fade()) {
         screen_flash_.reset();
-        // Nothing to resume: the parked instruction re-asks its own wait.
     }
 }
 
 float Game::screen_flash_alpha() const
 {
-    if (!screen_flash_) {
+    // FadeStruct.r/g/b, which AVG_ColtrolFade walks from where the last ramp
+    // left off to (er,eg,eb) and, for a flash, back to neutral afterwards.
+    // The engine puts that on GRP_DISP's brightness over a frozen snapshot;
+    // ours tints the composited frame, so the distance from neutral is the
+    // alpha.
+    if (!avg_back_) {
         return 0.0f;
     }
-    const float frame = static_cast<float>(
-        std::chrono::duration<double>(
-            std::chrono::steady_clock::now()
-            - screen_flash_->started).count() * 60.0);
-    if (frame < screen_flash_->fade_in_frames) {
-        return std::clamp(
-            frame / screen_flash_->fade_in_frames, 0.0f, 1.0f);
-    }
+    const auto& fade = avgback().fade();
+    const int distance = std::max({
+        std::abs(fade.r - th2::bright_neutral),
+        std::abs(fade.g - th2::bright_neutral),
+        std::abs(fade.b - th2::bright_neutral)});
     return std::clamp(
-        1.0f - (frame - screen_flash_->fade_in_frames)
-            / screen_flash_->fade_out_frames,
+        static_cast<float>(distance) / static_cast<float>(th2::bright_neutral),
         0.0f, 1.0f);
 }
 

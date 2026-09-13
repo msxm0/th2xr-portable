@@ -171,6 +171,24 @@ struct BackStruct {
     int redraw = 0;
 };
 
+// FADE_STRUCT, from GM_avg.h.  It lives in GM_Avg.cpp rather than
+// GM_AvgBack.cpp, but it is the same shape as everything here - a flag, a
+// counter and a raw max that AVG_EffCnt is re-asked about every frame - and
+// it needs the same Display, so it keeps them company.
+struct FadeStruct {
+    int flag = 0;
+    int cnt = 0;
+    int fade = 0;
+    int disp = 0;
+    // The second leg.  AVG_SetFlash is AVG_SetFade followed by a flash
+    // count, and AVG_ColtrolFade starts the return leg itself when the
+    // first one ends.
+    int flash = 0;
+    int sr = bright_neutral, sg = bright_neutral, sb = bright_neutral;
+    int er = bright_neutral, eg = bright_neutral, eb = bright_neutral;
+    int r = bright_neutral, g = bright_neutral, b = bright_neutral;
+};
+
 class AvgBack {
 public:
     // What AVG_ControlBack* calls out to that is not BackStruct or a graph.
@@ -247,6 +265,13 @@ public:
     void open_back();    // AVG_OpenBack
     void close_back();   // AVG_CloseBack
 
+    // AVG_SetFade / AVG_SetFlash / AVG_ColtrolFade / AVG_WaitFade.
+    void set_fade(int r, int g, int b, int disp, int fade);
+    void set_flash(int r, int g, int b, int fade1, int fade2);
+    void control_fade();
+    bool wait_fade() const { return fade_.flag != 0; }
+    const FadeStruct& fade() const { return fade_; }
+
     void init();
 
     int shake_text_dx() const { return shake_text_dx_; }
@@ -256,6 +281,7 @@ private:
     Display& display_;
     Hooks hooks_;
     BackStruct back_{};
+    FadeStruct fade_{};
 
     // DSP_SetTextMove( TXT_WINDOW, ShakeDx+x, ShakeDy+y ): the text shake's
     // offset, which the renderer adds to the message position.
