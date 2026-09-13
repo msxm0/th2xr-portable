@@ -42,14 +42,36 @@ bool Game::handle(const th2::Event& event)
             number(event, 0) == -1
             && has_background()
             && bg_scene_ == scene;
-        if (unchanged_direct) {
-            return true;
+        // ESC_EOprB is a two-phase opcode:
+        //
+        //     if(EOprFlag[ESC_B]==0){ EOprFlag[ESC_B]=1;
+        //         AVG_ResetBackHalfTone( bak_no, EscParam[0].num ); }
+        //     else if(EOprFlag[ESC_B]==1){ EOprFlag[ESC_B]=2;
+        //         AVG_SetBack( ... ); }
+        //
+        // so the wash comes off the plate on one frame and the new picture is
+        // copied from it on the next.  Copying in the same frame took the
+        // darkened plate into the new background.  BT and BCT have no such
+        // split and run both halves at once.
+        const bool split = name == "B" || name == "BC";
+        if (!split || opcode_phase_ == 1) {
+            // AVG_ResetBackHalfTone: nothing at all when the background is
+            // not really changing.
+            if (unchanged_direct) {
+                return true;
+            }
+            reset_half_tone();
+            message_visible_ = false;
         }
-        message_visible_ = false;
-        begin_transition(
-            number(event, 0), number(event, 3), number(event, 6), true);
-        set_background(
-            event, name == "BC" || name == "BCT");
+        if (!split || opcode_phase_ == 2) {
+            if (unchanged_direct) {
+                return true;
+            }
+            begin_transition(
+                number(event, 0), number(event, 3), number(event, 6), true);
+            set_background(
+                event, name == "BC" || name == "BCT");
+        }
     } else if (name == "H" || name == "HT") {
         if (number(event, 1) >= 0) {
             const int visual = number(event, 1) * 10
@@ -58,13 +80,22 @@ bool Game::handle(const th2::Event& event)
                 number(event, 0) == -1
                 && has_background()
                 && bg_scene_ == visual;
-            if (unchanged_direct) {
-                return true;
+            const bool split = name == "H";
+            if (!split || opcode_phase_ == 1) {
+                if (unchanged_direct) {
+                    return true;
+                }
+                reset_half_tone();
+                message_visible_ = false;
             }
-            message_visible_ = false;
-            begin_transition(
-                number(event, 0), number(event, 3), number(event, 7), true);
-            set_cg(event, BackgroundKind::hcg, 'h');
+            if (!split || opcode_phase_ == 2) {
+                if (unchanged_direct) {
+                    return true;
+                }
+                begin_transition(
+                    number(event, 0), number(event, 3), number(event, 7), true);
+                set_cg(event, BackgroundKind::hcg, 'h');
+            }
         }
     } else if (name == "V" || name == "VT") {
         const int visual = number(event, 1) * 10
@@ -73,13 +104,22 @@ bool Game::handle(const th2::Event& event)
             number(event, 0) == -1
             && has_background()
             && bg_scene_ == visual;
-        if (unchanged_direct) {
-            return true;
+        const bool split = name == "V";
+        if (!split || opcode_phase_ == 1) {
+            if (unchanged_direct) {
+                return true;
+            }
+            reset_half_tone();
+            message_visible_ = false;
         }
-        message_visible_ = false;
-        begin_transition(
-            number(event, 0), number(event, 3), number(event, 7), true);
-        set_cg(event, BackgroundKind::visual, 'v');
+        if (!split || opcode_phase_ == 2) {
+            if (unchanged_direct) {
+                return true;
+            }
+            begin_transition(
+                number(event, 0), number(event, 3), number(event, 7), true);
+            set_cg(event, BackgroundKind::visual, 'v');
+        }
     } else if (name == "FB") {
         message_visible_ = false;
         begin_background_fade(
@@ -681,27 +721,89 @@ std::filesystem::path Game::dump_runtime_error(std::string_view error)
     return path;
 }
 
-void Game::resume_script()
-{
-    script_resume_ = true;
-}
-
 void Game::pump_script()
 {
-    // iterate() retires an expired ESC_WAIT park before input; this is
-    // where the script it parked comes back, before MAIN_GameControl and
-    // MAIN_DrawGraph rather than in the middle of them.
-    if (!script_resume_) {
+    // main.cpp:
+    //     if(ScriptFlag){ script = EXEC_ControlLang( &ScriptData ); }
+    //     NextMainStep = MAIN_GameControl( script );
+    // and only then MAIN_DrawGraph.  Every frame, unconditionally: a parked
+    // instruction runs again and re-asks its wait, which is why nothing in
+    // the engine ever has to resume the script.
+    if (!script_flag_ || !running_) {
         return;
     }
-    script_resume_ = false;
-    // Resuming is not a click.  advance() doubles as the player's advance -
-    // it marks the line read, finishes the reveal and turns the page - so a
-    // message or a choice parks the script until the player actually acts.
-    if (waiting_for_input_ || choosing_) {
+    // EXEC_ControlTask checks the two wait forms before it runs anything:
+    //     if( BusyFlg == SCCODE_WAIT_TWAIT ) EXEC_LangTWait();
+    //     if( BusyFlg == SCCODE_WAIT_WAIT )  EXEC_LangWait();
+    //     if( BusyFlg == SCCODE_RUN ) while( EXEC_CallOprControl( mode ) );
+    if (wake_time_) {
+        if (std::chrono::steady_clock::now() < *wake_time_) {
+            return;
+        }
+        wake_time_.reset();
+    }
+    if (ui_mode_ != UiMode::game || movie_ || clock_state_ || calendar_state_) {
         return;
     }
-    advance();
+    exec_control_lang();
+}
+
+// The AVG_Wait* predicates, one per ESC_WAIT opcode.  True means the
+// instruction stays where it is; the polarity is the original's, which is not
+// uniform - AVG_WaitBack is true while busy, AVG_WaitNovelMessage is true when
+// the message is ready.
+bool Game::opcode_waiting(WaitKind kind, const th2::Event& event) const
+{
+    switch (kind) {
+    case WaitKind::none:
+    case WaitKind::frame:
+        // No predicate: one frame of ESC_WAIT and the machine moves on.
+        return false;
+    case WaitKind::character:
+        // !AVG_WaitChar( EscParam[0].num ).  Its own character, and nothing
+        // else - a background fade running at the same time cannot hold it.
+        return avg_char_ && chars().wait_char(number(event, 0));
+    case WaitKind::novel_message:
+        // AVG_WaitNovelMessage(): NovelMessage.step1 == MSG_NEXT.  MSG_DISP
+        // and MSG_WAIT both leave on AVG_GetMesCut(), so a held skip key
+        // takes the message to MSG_NEXT on its own.
+        if (message_cut()) {
+            return false;
+        }
+        return waiting_for_input_ || !text_reveal_complete_
+            || message_.has_hidden_segments();
+    case WaitKind::back:
+        // !AVG_WaitBack(): BackStruct.fd_flag, the background change.
+        return transition_.has_value();
+    case WaitKind::fade:
+        // !AVG_WaitFade(): FadeStruct.flag, the screen flash.
+        return screen_flash_.has_value();
+    case WaitKind::back_fade:
+        // !AVG_WaitBackFade(): BackStruct.br_flag.
+        return background_fade_.has_value();
+    case WaitKind::shake:
+        // !AVG_WaitShake(): sk_speed and sk_flag both non-zero.
+        return shake_ && shake_->frames > 0;
+    case WaitKind::back_scroll:
+        // !AVG_WaitBackScroll(): BackStruct.sc_flag.
+        return background_scroll_.has_value();
+    case WaitKind::key:
+        // AVG_WaitKey(): AVG_GetHitKey() || AVG_GetMesCut() || Avg.demo.
+        return waiting_for_input_ && !message_cut() && !demo_mode_;
+    case WaitKind::bgm:
+    case WaitKind::se:
+    case WaitKind::voice:
+        // AVG_WaitBGM / !AVG_WaitSe / AVG_WaitVoice, all of which come out of
+        // the channel the instruction started.
+        return audio_wait_.has_value();
+    case WaitKind::movie:
+        // !AVG_WaitMovie(): movPlayerFrm && !bEnd.
+        return movie_ != nullptr;
+    case WaitKind::select:
+        // AVG_WaitSelect() != -1: SelectWindow.res.
+        return choosing_;
+    }
+    return false;
 }
 
 void Game::advance(bool skipping)
@@ -714,6 +816,10 @@ void Game::advance(bool skipping)
         || movie_) {
         return;
     }
+    // A waiting instruction has already run its set-up, so re-entering the
+    // machine here would run it again.  The loop below picks it up from the
+    // latch instead, which is what EOprFlag is for.
+
     // Record whether the player is advancing past a block end (page end).
     // Used at the end of advance() to decide whether to autosave.
     just_advanced_past_block_end_ = false;
@@ -752,7 +858,26 @@ void Game::advance(bool skipping)
         choice_result_register_ = -1;
         choice_ex_ = false;
     }
-    while (running_ && !waiting_for_input_ && !choosing_) {
+    // The click does not run the machine.  AVG_GetGameKey only fills in
+    // GameKey; EXEC_ControlLang runs at the top of the frame and
+    // AVG_ControlNovelMessage reacts after it, so what a click does is change
+    // the state the parked instruction is about to ask about.  pump_script()
+    // is a few lines further down the same frame, which is where it lands.
+    static_cast<void>(skipping);
+}
+
+// EXEC_ControlLang / EXEC_ControlTask.  main.cpp runs this once at the top of
+// every frame while ScriptFlag is on, and the machine runs instructions until
+// one of them is ESC_WAIT:
+//
+//     if(ScriptFlag){ script = EXEC_ControlLang( &ScriptData ); }
+//     NextMainStep = MAIN_GameControl( script );
+//
+// It is not a resumption and there is no callback: a parked instruction is
+// simply run again, and re-asks its own wait.
+void Game::exec_control_lang(bool skipping)
+{
+    while (running_) {
         th2::ScriptStep step;
         try {
             step = runtime_.run();
@@ -795,74 +920,60 @@ void Game::advance(bool skipping)
             break;
         }
         if (step.reason == th2::VmYield::event) {
-            try {
-                if (!handle(step.event)) {
-                    throw std::runtime_error(std::format(
-                        "unimplemented event opcode: {}",
-                        step.event.instruction.name));
+            // EXEC_CallOprControl, which is where ESC_WAIT lives.  An
+            // ESC_NOWAIT opcode runs and the machine goes straight on; an
+            // ESC_WAIT one runs its set-up once, re-asks its own wait every
+            // frame after that, and stops the machine for the frame either
+            // way.  The program counter only moves when the wait clears, so
+            // a waiting instruction executes again next frame rather than
+            // needing anything to resume it.
+            const auto name = std::string_view(step.event.instruction.name);
+            const auto kind = opcode_wait_kind(name);
+            const auto opcode = step.event.instruction.opcode;
+            const int phases = opcode_phases(name);
+            auto& latch = eopr_flag_[opcode];
+
+            if (kind == WaitKind::none || latch < phases) {
+                if (kind != WaitKind::none) {
+                    // EOprFlag[ESC_x] = 1 - or 2, for the four background
+                    // opcodes that clear the old wash a frame before they
+                    // set the new picture.
+                    ++latch;
+                    opcode_phase_ = latch;
+                } else {
+                    opcode_phase_ = 1;
                 }
-            } catch (const std::exception& error) {
-                const auto dump = dump_engine_error(step, error.what());
-                throw std::runtime_error(std::format(
-                    "{}:{}: {} (state dumped to {})",
-                    step.script_name, step.event.instruction.offset,
-                    error.what(), dump.string()));
-            }
-            if (audio_wait_) {
-                if (skipping) {
-                    if (audio_wait_->kind == AudioWaitKind::bgm) {
-                        waited_audio_channel().finish_fade();
-                    } else {
-                        waited_audio_channel().stop();
+                try {
+                    if (!handle(step.event)) {
+                        throw std::runtime_error(std::format(
+                            "unimplemented event opcode: {}",
+                            step.event.instruction.name));
                     }
-                    audio_wait_.reset();
-                    continue;
+                } catch (const std::exception& error) {
+                    const auto dump = dump_engine_error(step, error.what());
+                    throw std::runtime_error(std::format(
+                        "{}:{}: {} (state dumped to {})",
+                        step.script_name, step.event.instruction.offset,
+                        error.what(), dump.string()));
                 }
-                break;
             }
-            if (wake_time_) {
-                break;
+
+            if (kind == WaitKind::none) {
+                // ESC_NOWAIT: `while( EXEC_CallOprControl( mode ) )` keeps
+                // going, so the next instruction runs in this same frame.
+                if (clock_state_ || calendar_state_ || choosing_
+                    || wake_time_ || ui_mode_ != UiMode::game) {
+                    break;
+                }
+                continue;
             }
-            if (transition_) {
-                break;
+
+            if (latch >= phases && !opcode_waiting(kind, step.event)) {
+                latch = 0;            // EXEC_AddPC: run() already moved it
+            } else {
+                runtime_.vm_rewind_to(step.event.instruction.offset);
             }
-            if (background_fade_) {
-                break;
-            }
-            if (screen_flash_) {
-                break;
-            }
-            if (shake_ && shake_->frames > 0) {
-                break;
-            }
-            if (background_scroll_) {
-                break;
-            }
-            if (character_animation_active()) {
-                break;
-            }
-            // EScroptOpr[].ret: an ESC_WAIT opcode stops the virtual
-            // machine for the rest of the frame, so the AVG_Control* pass
-            // and the draw both happen before the next instruction runs.
-            // Every opcode that touches the screen is one, which is what
-            // keeps a plate copy from being taken in the same frame as the
-            // bake it is supposed to contain.
-            if (opcode_yields_frame(step.event.instruction.name)) {
-                wake_time_ = std::chrono::steady_clock::now();
-                break;
-            }
-            if (clock_state_ || calendar_state_) {
-                break;
-            }
-            if (ui_mode_ != UiMode::game) {
-                break;
-            }
-            if (skipping && waiting_for_input_) {
-                break;
-            }
-            if (choosing_) {
-                break;
-            }
+            break;                    // ESC_WAIT: the frame is over
         }
     }
     // The interpreter has stopped for now, which is exactly when there is

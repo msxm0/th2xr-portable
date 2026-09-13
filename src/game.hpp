@@ -45,6 +45,28 @@
 #include <vector>
 namespace th2app {
 
+// What an ESC_WAIT opcode re-asks every frame until it can retire.  The
+// engine gives each one exactly one question - a C waits on AVG_WaitChar and
+// on nothing else - so a background fade cannot hold a character instruction
+// and no instruction has to be resumed by whoever finished its wait.
+enum class WaitKind {
+    none,           // ESC_NOWAIT: the machine runs straight on to the next
+    frame,          // ESC_WAIT with no predicate: one frame, then on
+    character,      // !AVG_WaitChar( EscParam[0].num )
+    novel_message,  // AVG_WaitNovelMessage()
+    back,           // !AVG_WaitBack()
+    fade,           // !AVG_WaitFade()
+    back_fade,      // !AVG_WaitBackFade()
+    shake,          // !AVG_WaitShake()
+    back_scroll,    // !AVG_WaitBackScroll()
+    key,            // AVG_WaitKey()
+    bgm,            // AVG_WaitBGM()
+    se,             // !AVG_WaitSe( EscParam[0].num )
+    voice,          // AVG_WaitVoice( EscParam[0].num )
+    movie,          // !AVG_WaitMovie()
+    select,         // AVG_WaitSelect() != -1
+};
+
 // Set by --cpu-transitions.  Forces the CPU blend even where the shader
 // would work, so the two paths can be compared without rebuilding.
 extern bool force_cpu_transitions;
@@ -857,7 +879,14 @@ private:
     bool auto_mode_ = false;
     bool skip_mode_ = false;   // Avg.msg_cut_mode, the toggle
     bool skip_held_ = false;   // Avg.msg_cut, the key
-    bool script_resume_ = false;
+    // EOprFlag[] from Escript.cpp, indexed by opcode the way the original
+    // indexes it by ESC_ id.  Non-zero means this instruction has already run
+    // its set-up and is only re-asking its wait; the four background opcodes
+    // count to two, because they clear the old half tone a frame before they
+    // set the new picture.
+    std::array<std::uint8_t, 256> eopr_flag_{};
+    // Which of those phases handle() is being called for.
+    int opcode_phase_ = 1;
     bool demo_mode_ = false;
     bool replay_mode_ = false;
     int demo_delay_frames_ = 0;
@@ -935,6 +964,12 @@ private:
     // Escr.h's EScroptOpr[].ret: true for an opcode the engine's virtual
     // machine stops on for the rest of the frame.
     static bool opcode_yields_frame(std::string_view name);
+    // The one question that opcode re-asks each frame.
+    static WaitKind opcode_wait_kind(std::string_view name);
+    // How many frames of setting-up it does before it starts asking.
+    static int opcode_phases(std::string_view name);
+    // The predicate itself: true while the instruction must stay put.
+    bool opcode_waiting(WaitKind kind, const th2::Event& event) const;
     int effect_frames(int frames) const;
     // AVG_EffCnt4: the same count in 30fps units, unscaled by the effect
     // speed, and nothing at all while skipping.
@@ -1039,12 +1074,13 @@ private:
         const th2::ScriptStep& step, std::string_view error);
     std::filesystem::path dump_runtime_error(std::string_view error);
     void advance(bool skipping = false);
-    // Something the script was waiting on has finished.  It does not run the
-    // virtual machine: main.cpp runs EXEC_ControlLang once at the top of the
-    // frame and only then MAIN_GameControl and MAIN_DrawGraph, so resuming
-    // from inside the AVG_Control* pass would let the instruction it lets
-    // through be drawn before its own control pass had run.
-    void resume_script();
+    // The virtual machine itself, run once a frame from EXEC_ControlLang's
+    // slot.  advance() is the player's advance and calls into it; this is
+    // what keeps a parked instruction asking.
+    void exec_control_lang(bool skipping = false);
+    // MAIN_SetScriptFlag / MAIN_GetScriptFlag: the one gate on the machine,
+    // turned off by the modes that take the screen over.
+    bool script_flag_ = true;
     // EXEC_ControlLang's slot: retires a parked ESC_WAIT and runs whatever
     // resume_script() asked for, before any of the update_ pass.
     void pump_script();

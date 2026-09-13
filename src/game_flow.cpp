@@ -207,9 +207,27 @@ std::vector<std::string> Game::choice_lines(
 
 bool Game::message_cut() const
 {
-    // AVG_GetMesCut(): Avg.msg_cut is the skip key held, Avg.msg_cut_mode
-    // the toggle.  Both come out as one flag here.
-    return skip_mode_ || skip_held_;
+    // AVG_GetMesCut():
+    //
+    //     if(Avg.msg_cut_optin&1){
+    //         return Avg.msg_cut || Avg.msg_cut_mode;
+    //     }else{
+    //         return (Avg.msg_cut || Avg.msg_cut_mode) && AVG_CheckScenarioFlag();
+    //     }
+    //
+    // Avg.msg_cut is the key held, Avg.msg_cut_mode the toggle, and
+    // msg_cut_optin&1 is the "skip unread text" setting: with it off, the cut
+    // only applies to a line that has been read before.  Reading it here
+    // rather than in the skip handler is the whole of skipping - every
+    // AVG_EffCnt goes to zero, every AVG_Wait clears, and the machine runs an
+    // instruction a frame with nothing forcing anything.
+    if (!skip_mode_ && !skip_held_) {
+        return false;
+    }
+    if (config_.skip_unread) {
+        return true;
+    }
+    return current_text_is_read();
 }
 
 int Game::effect_frames4(int frames) const
@@ -354,78 +372,19 @@ bool Game::finish_text_reveal()
 
 void Game::skip(bool force_unread)
 {
-    if (clock_state_) {
-        if (force_unread) {
-            clock_state_->started -= std::chrono::milliseconds(250);
-        }
+    // The engine has no skip function.  Holding the key sets Avg.msg_cut and
+    // that is all it does: AVG_GetMesCut() then makes every AVG_EffCnt return
+    // zero, so each effect finishes itself on its next control pass, and the
+    // message state machine leaves MSG_WAIT on the same flag.  Nothing is
+    // rewound and nothing is forced - which is why the original cannot get
+    // stuck part-way through an animation the way ours did.
+    //
+    // What is left here is the half a key press really does do: turn the
+    // page.  It is the same thing a click does, and it goes through the same
+    // guard, so it cannot fire in the middle of an effect.
+    static_cast<void>(force_unread);
+    if (clock_state_ || calendar_state_ || choosing_ || movie_) {
         return;
-    }
-    if (calendar_state_) {
-        if (!calendar_state_->dismissing) {
-            calendar_state_->dismissing = true;
-            calendar_state_->started = std::chrono::steady_clock::now();
-        } else if (force_unread) {
-            calendar_state_->started -= std::chrono::milliseconds(250);
-        }
-        return;
-    }
-    if (choosing_) {
-        return;
-    }
-    if (transition_) {
-        if (force_unread) {
-            transition_->started = std::chrono::steady_clock::now()
-                - std::chrono::duration_cast<
-                    std::chrono::steady_clock::duration>(
-                    std::chrono::duration<double>(
-                        transition_->frames / 60.0));
-        }
-        return;
-    }
-    if (background_fade_) {
-        if (force_unread) {
-            background_fade_->started -= background_fade_->duration;
-        }
-        return;
-    }
-    if (screen_flash_) {
-        if (force_unread) {
-            const auto frames = screen_flash_->fade_in_frames
-                + screen_flash_->fade_out_frames;
-            screen_flash_->started -= std::chrono::milliseconds(
-                frames * 1000 / 60);
-        }
-        return;
-    }
-    if (shake_ && shake_->frames > 0) {
-        if (force_unread) {
-            shake_->started -= std::chrono::milliseconds(
-                shake_->frames * 1000 / 60);
-        }
-        return;
-    }
-    if (background_scroll_) {
-        if (force_unread) {
-            background_scroll_->started -= std::chrono::milliseconds(
-                background_scroll_->frames * 1000 / 60);
-        }
-        return;
-    }
-    if (character_animation_active()) {
-        if (force_unread) {
-            chars().finish_animations();
-        }
-        return;
-    }
-    if (waiting_for_input_ && !force_unread && !config_.skip_unread
-        && !current_text_is_read()) {
-        skip_mode_ = false;
-        return;
-    }
-    wake_time_.reset();
-    if (audio_wait_) {
-        waited_audio_channel().stop();
-        audio_wait_.reset();
     }
     if (waiting_for_input_) {
         mark_current_text_read();
@@ -441,7 +400,6 @@ void Game::skip(bool force_unread)
         }
         waiting_for_input_ = false;
     }
-    advance(true);
 }
 
 

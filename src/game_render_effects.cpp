@@ -379,13 +379,16 @@ void Game::update_transition()
         - transition_->started;
     const auto duration = std::chrono::duration<double>(
         static_cast<double>(transition_->frames) / 60.0);
-    if (elapsed < duration) {
+    // AVG_ControlBackChange recomputes AVG_EffCnt( BackStruct.fd_max ) every
+    // frame, so a skip key pressed mid-wipe takes its length to zero and it
+    // finishes on this pass rather than running on under the next line.
+    if (elapsed < duration && !message_cut()) {
         return;
     }
     const bool resumes = transition_->resume_script;
     transition_.reset();
     if (resumes) {
-        resume_script();
+        // Nothing to resume: the parked instruction re-asks its own wait.
     }
 }
 
@@ -870,10 +873,10 @@ void Game::update_background_fade()
             static_cast<int>(background_brightness_[1]),
             static_cast<int>(background_brightness_[2]));
     }
-    if (progress >= 1.0f) {
+    if (progress >= 1.0f || message_cut()) {
         background_brightness_ = background_fade_->to;
         background_fade_.reset();
-        resume_script();
+        // Nothing to resume: the parked instruction re-asks its own wait.
     }
 }
 
@@ -886,9 +889,9 @@ void Game::update_screen_flash()
         screen_flash_->fade_in_frames + screen_flash_->fade_out_frames;
     const auto elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - screen_flash_->started).count();
-    if (elapsed * 60.0 >= total_frames) {
+    if (elapsed * 60.0 >= total_frames || message_cut()) {
         screen_flash_.reset();
-        resume_script();
+        // Nothing to resume: the parked instruction re-asks its own wait.
     }
 }
 
@@ -918,12 +921,12 @@ void Game::update_shake()
     }
     const auto elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - shake_->started).count();
-    if (elapsed * 60.0 >= shake_->frames) {
+    if (elapsed * 60.0 >= shake_->frames || message_cut()) {
         // AVG_StopShake: SetCharPosShake(0, 0, OFF) puts the characters
         // back in the plate, which is the only thing that undoes cut_mode 2.
         chars().set_char_pos_shake(0, 0, 0);
         shake_.reset();
-        resume_script();
+        // Nothing to resume: the parked instruction re-asks its own wait.
     }
 }
 
@@ -1147,7 +1150,7 @@ void Game::update_background_scroll()
     const auto elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now()
         - background_scroll_->started).count();
-    if (elapsed * 60.0 >= background_scroll_->frames) {
+    if (elapsed * 60.0 >= background_scroll_->frames || message_cut()) {
         background_view_ = background_scroll_->to;
         background_scroll_.reset();
         // AVG_ControlBackScroll ends with
@@ -1158,7 +1161,7 @@ void Game::update_background_scroll()
         // for the whole scroll (BackStruct.sc_flag), so this is the only
         // thing that puts them back where they belong.
         background_baked_dirty_ = true;
-        resume_script();
+        // Nothing to resume: the parked instruction re-asks its own wait.
     }
 }
 

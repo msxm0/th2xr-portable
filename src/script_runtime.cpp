@@ -181,6 +181,11 @@ std::size_t ScriptRuntime::vm_pc() const
     return vm_ ? vm_->pc() : 0;
 }
 
+void ScriptRuntime::vm_rewind_to(std::size_t pc)
+{
+    vm_->set_pc(pc);
+}
+
 void ScriptRuntime::vm_restore(
     std::span<const std::int32_t> registers,
     std::span<const std::int32_t> stack,

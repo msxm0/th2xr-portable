@@ -188,15 +188,10 @@ void Game::update_character_animations()
             build_half_tone_background();
         }
     }
-    if (was_animating && !character_animation_active()) {
-        // The script is held while anything is animating, so it comes back
-        // on the frame the last one settles - which is after the bake, not
-        // before it.  It comes back at the top of the *next* frame, though:
-        // running it here would put the instruction it lets through on
-        // screen without a AVG_ControlChar pass of its own, which is a
-        // character at full opacity for a frame before its fade starts.
-        resume_script();
-    }
+    static_cast<void>(was_animating);
+    // Nothing is resumed here.  The C instruction that started the animation
+    // is still the current instruction - the program counter never moved -
+    // and it asks AVG_WaitChar again at the top of the next frame.
 }
 
 // The decoder a channel is about to play from.  Read-ahead usually means it
@@ -597,7 +592,6 @@ void Game::update_audio()
             : !channel.playing();
         if (complete) {
             audio_wait_.reset();
-            resume_script();
         }
     }
 }

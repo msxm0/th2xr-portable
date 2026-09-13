@@ -43,6 +43,10 @@ public:
     std::span<const std::int32_t> vm_stack() const;
     std::span<const std::uint8_t> vm_bytecode() const;
     std::size_t vm_pc() const;
+    // EXEC_AddPC's opposite.  A waiting opcode leaves the program counter on
+    // itself so that the same instruction runs again next frame and re-asks
+    // its wait; run() has already stepped past it, so this puts it back.
+    void vm_rewind_to(std::size_t pc);
     void vm_restore(std::span<const std::int32_t> registers,
                     std::span<const std::int32_t> stack,
                     std::size_t pc);

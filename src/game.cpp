@@ -564,10 +564,6 @@ void Game::iterate()
     // the frame after a message would otherwise be swallowed by advance()'s
     // wake_time_ guard.  Actually running the script waits for
     // pump_script(), in EXEC_ControlLang's slot below.
-    if (wake_time_ && std::chrono::steady_clock::now() >= *wake_time_) {
-        wake_time_.reset();
-        script_resume_ = true;
-    }
     sync_web_viewport();
     // Reads two ints the page publishes and compares them; it does not go
     // near the browser unless they actually disagree.
@@ -959,7 +955,13 @@ void Game::iterate()
     // the toggle.  Effects collapse to nothing for either.
     skip_held_ = control_held;
     if (movie_) {
-        movie_->set_speed(control_held ? 4.0 : 1.0);
+        // Winmain.cpp stops a movie, it never speeds one up:
+        //     if( AVG_KeySkip() || movPlayerFrm->bEnd ){
+        //         movPlayerFrm->Release(); ... movPlayerFrm=NULL; }
+        // and AVG_KeySkip() reads the click, escape and space keys - not the
+        // skip key, which does nothing to a movie at all.  Running the video
+        // at four times its rate left the audio playing at its own, which is
+        // the desync; the click path below is what actually skips it.
     } else if (control_held && ui_mode_ == UiMode::title) {
         title_started_ -= std::chrono::milliseconds(50);
         if (title_exit_started_) {
