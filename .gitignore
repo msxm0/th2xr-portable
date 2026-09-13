@@ -30,3 +30,8 @@ ffmpeg-*.7z
 
 # Agent scratch tooling: harnesses and probes, not part of the build
 /claude-scratchpad/
+
+# Reference build artefacts (regenerate with reference/build.sh)
+reference/build/
+reference/gen/
+reference/run/

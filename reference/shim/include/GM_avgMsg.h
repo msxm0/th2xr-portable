@@ -1,0 +1,1 @@
+/home/msx/Dokumenty/th2wasm/aquaplus_gpl/ToHeart2/ScriptEngine/src/GM_AvgMsg.h

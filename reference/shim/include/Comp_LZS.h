@@ -1,0 +1,1 @@
+/home/msx/Dokumenty/th2wasm/aquaplus_gpl/ToHeart2/my_inc2/comp_LZS.h
