@@ -205,12 +205,42 @@ std::vector<std::string> Game::choice_lines(
     return lines;
 }
 
+bool Game::message_cut() const
+{
+    // AVG_GetMesCut(): Avg.msg_cut is the skip key held, Avg.msg_cut_mode
+    // the toggle.  Both come out as one flag here.
+    return skip_mode_;
+}
+
+int Game::effect_frames4(int frames) const
+{
+    // AVG_EffCnt4( cnt ): 30fps units with no Avg.wait, and zero while the
+    // message is being cut.  The scroll, the waits and the audio fades all
+    // measure themselves with this rather than AVG_EffCnt.
+    if (message_cut()) {
+        return 0;
+    }
+    const int count = frames == -1 ? 15
+        : frames == -2 ? 30
+        : std::max(0, frames);
+    return count * 2;  // Avg.frame / 30, and Avg.frame is 60
+}
+
 int Game::effect_frames(int frames) const
 {
     // AVG_EffCnt() reads a script's frame count the same way everywhere: -1
     // means fifteen frames, -2 thirty, and anything else is the count
     // itself, so a zero really is instant.  The effect-speed setting
     // (Avg.wait in the original) scales all of them.
+    // AVG_EffCnt's first question is whether the message is being cut:
+    //     if( cut ) ret = 0;
+    //     else      ret = Avg.wait*cnt*Avg.frame/60;
+    // Skipping makes every effect instant, not merely fast.  Without that a
+    // wipe kept running while the script raced past it, and the next line
+    // of text went up over the top of it.
+    if (message_cut()) {
+        return 0;
+    }
     const int count = frames == -1 ? 15
         : frames == -2 ? 30
         : std::max(0, frames);

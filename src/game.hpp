@@ -927,7 +927,13 @@ private:
     float message_text_width() const;
     // Scales an effect's frame count by the effect speed setting; 0 makes
     // it instant, which is what the original does while skipping too.
+    // AVG_GetMesCut(): the message is being skipped, so every effect the
+    // engine measures with AVG_EffCnt collapses to nothing.
+    bool message_cut() const;
     int effect_frames(int frames) const;
+    // AVG_EffCnt4: the same count in 30fps units, unscaled by the effect
+    // speed, and nothing at all while skipping.
+    int effect_frames4(int frames) const;
     static std::chrono::milliseconds audio_fade_duration(int frames);
     float text_line_height() const;
     std::vector<std::string> display_lines(std::string_view source) const;

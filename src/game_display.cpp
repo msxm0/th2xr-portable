@@ -326,7 +326,7 @@ th2::AvgChar::Hooks Game::character_hooks()
     // standing for fifteen and thirty frames, and nothing at all while the
     // message is being skipped.  Avg.frame is 60, so the rate cancels.
     hooks.eff_cnt = [this](int cnt) {
-        if (skip_mode_) {
+        if (message_cut()) {
             return 0;
         }
         const int wait = std::clamp(config_.effect_speed, 0, 4);

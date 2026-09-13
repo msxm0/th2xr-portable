@@ -46,7 +46,7 @@ void Game::begin_background_scroll(
     background_scroll_ = BackgroundScroll{
         current_background_view(),
         {x, y, width, height},
-        std::max(1, frames) * 2,
+        std::max(1, effect_frames4(frames)),
         type % 3,
         type / 3 == 1,
         std::chrono::steady_clock::now(),

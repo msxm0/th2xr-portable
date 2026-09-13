@@ -144,9 +144,11 @@ bool Game::handle(const th2::Event& event)
         // frames, i.e. cnt/30 seconds at any frame rate), unlike the effect
         // durations, which are 60fps based.  The values in the scripts agree:
         // 15, 30, 60, 90, 120 are half a second through five seconds.
-        const int frames = std::max<std::int32_t>(0, number(event, 0));
+        // ...and AVG_EffCnt4 is zero while the message is being cut, so a
+        // skipped wait is no wait.
+        const int frames = effect_frames4(number(event, 0));
         wake_time_ = std::chrono::steady_clock::now()
-            + std::chrono::milliseconds(frames * 1000 / 30);
+            + std::chrono::milliseconds(frames * 1000 / 60);
     } else if (name == "WaitTime") {
         const auto now = static_cast<std::uint32_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(

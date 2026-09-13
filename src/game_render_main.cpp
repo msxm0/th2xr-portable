@@ -139,6 +139,12 @@ float Game::half_tone_pulse() const
     // AVG_EffCntPuls(): how far the sixteen-step counter moves each frame.
     // The original computes k*30/Avg.frame at 60 fps, so the slowest setting
     // truncates to zero and is clamped back up to one.
+    // AVG_EffCntPuls opens with
+    //     if( AVG_GetMesCut() ) ret = 9999;
+    // so the wash arrives whole rather than ramping while skipping.
+    if (message_cut()) {
+        return half_tone_steps;
+    }
     switch (std::clamp(config_.effect_speed, 0, 4)) {
     case 0:
         return half_tone_steps;  // effects off: no ramp at all
@@ -178,6 +184,21 @@ void Game::raise_half_tone()
 
 void Game::update_half_tone()
 {
+    // AVG_Main calls AVG_ControlHalfTone from AVG_GAME and AVG_CONFIG and
+    // from nowhere else - AVG_SAVE, AVG_LOAD, AVG_SETTING and AVG_MAP all
+    // leave it alone.  So opening the save menu freezes the wash where it
+    // is and closing it finds it still there.  Running the ramp anyway sent
+    // it back to zero the moment the message went, and the background came
+    // back undarkened for a beat afterwards.
+    switch (ui_mode_) {
+    case UiMode::game:
+    case UiMode::system_menu:
+    case UiMode::backlog:
+        break;
+    default:
+        half_tone_updated_ = std::chrono::steady_clock::now();
+        return;
+    }
     const auto now = std::chrono::steady_clock::now();
     const float frames = std::clamp(
         static_cast<float>(
@@ -346,8 +367,16 @@ void Game::begin_authentic_text()
 
 float Game::half_tone_factor() const
 {
-    if (ui_mode_ != UiMode::game || transition_ || !half_tone_armed_
-        || !message_visible_ || message_.empty()) {
+    // DSP_DrawGraph keeps drawing GRP_BACK+1 whatever state the game is in,
+    // so a menu over the top does not undarken what is behind it.  What
+    // takes the wash away is the message going, and only in the states that
+    // still run the ramp.
+    const bool ramping = ui_mode_ == UiMode::game
+        || ui_mode_ == UiMode::system_menu || ui_mode_ == UiMode::backlog;
+    if (transition_ || !half_tone_armed_) {
+        return 1.0f;
+    }
+    if (ramping && (!message_visible_ || message_.empty())) {
         return 1.0f;
     }
     const int half_tone = std::clamp(
