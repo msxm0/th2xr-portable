@@ -212,15 +212,21 @@ th2::AvgChar::Hooks Game::character_hooks()
     // AVG_GetWindowCond reads - so setting a character can hide the text
     // while the window is still up, and that is what lets AVG_ControlChar
     // notice it and put it back afterwards.
-    hooks.novel_message_disp = [this](bool on) { message_visible_ = on; };
-    hooks.window_cond = [this] { return message_window_open_; };
+    hooks.novel_message_disp = [this](bool on) {
+        msg().set_novel_message_disp(on);
+    };
+    hooks.window_cond = [this] { return msg().window_cond() != 0; };
+    // AVG_CloseWindow(OFF) / AVG_OpenWindow(OFF,OFF).  Closing parks the
+    // message machine at MSG_NODISP and remembers where it was, so the
+    // typewriter stops for the length of the animation and comes back on
+    // the character it had reached.
     hooks.close_window = [this] {
         message_window_open_ = false;
-        message_visible_ = false;
+        msg().close_window();
     };
     hooks.open_window = [this] {
         message_window_open_ = true;
-        message_visible_ = true;
+        msg().open_window(false);
     };
 
     // AVG_CopyBack(OFF): BMP_BACK <- BMP_BACK2, the clean plate back over
@@ -366,6 +372,19 @@ th2::AvgMsg::Hooks Game::message_hooks()
         chars().set_char_bright_all(r, g, b);
     };
     hooks.wav_effect = [] { return false; };
+    hooks.demo = [this] { return demo_mode_; };
+    // AVG_EffCnt3( Avg.demo_max ): 30fps units, and the one AVG_EffCnt that
+    // ignores the skip key.
+    hooks.demo_max = [this] {
+        return effect_frames3(std::max(0, demo_delay_frames_));
+    };
+    hooks.script_objects_disp = [this](bool on) {
+        for (int i = 0; i < th2::max_script_obj; ++i) {
+            if (overlay_states_[static_cast<std::size_t>(i)].visible) {
+                display().set_graph_disp(th2::grp_script + i, on);
+            }
+        }
+    };
     return hooks;
 }
 

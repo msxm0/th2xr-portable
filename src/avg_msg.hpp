@@ -115,6 +115,15 @@ public:
         // AVG_GetWavEffectFlag(): the wave effect cuts the ramp short.  No
         // retail script starts one, so this is always false.
         std::function<bool()> wav_effect;
+        // AVG_CloseWindow hides every script overlay that was showing and
+        // AVG_OpenWindow puts them back:
+        //     for( i=0; i<MAX_SCRIPT_OBJ ; i++ )
+        //         if(SpriteBmp[i].disp) DSP_SetGraphDisp( GRP_SCRIPT+i, x );
+        std::function<void(bool)> script_objects_disp;
+        // Avg.demo / AVG_EffCnt3(Avg.demo_max): the attract loop, which
+        // reads at a fixed rate and turns its own pages.
+        std::function<bool()> demo;
+        std::function<int()> demo_max;
     };
 
     AvgMsg(Display& display, BackStruct& back, Hooks hooks)
@@ -128,6 +137,15 @@ public:
     // AVG_WaitNovelMessage: the one state that lets the opcode retire.
     bool wait_novel_message() const { return message_.step1 == msg_next; }
     void set_novel_message_disp(bool disp);      // AVG_SetNovelMessageDisp
+    // AVG_OpenWindow( tdisp, flag ) / AVG_CloseWindow( flag ).  Closing the
+    // window parks the message machine at MSG_NODISP and remembers where it
+    // was; opening puts it back.  That is what stops the typewriter for the
+    // length of a character animation and starts it again afterwards.
+    void open_window(bool tdisp);
+    void close_window();
+    // AVG_GetWindowCond(): 1 while the window is up, -1 while it is moving,
+    // 0 when it is not there.
+    int window_cond() const { return wstep_ == 0 ? 0 : 1; }
     // AVG_ControlNovelMessage, run from AVG_System between the script and
     // the draw.  One call per sixtieth of a second.
     void control_novel_message(const GameKey& key);
@@ -173,6 +191,12 @@ private:
     // The two statics inside AVG_ControlNovelMessage.
     int key_wait_count_ = 0;
     int key_wait_count2_ = 0;
+    // Message.wstep, reduced to the two states our window has: it is drawn
+    // at monitor resolution rather than as GRP_WINDOW graphs, so MWIN_OPEN
+    // and MWIN_CLOSE - the slide, which SetMessageWindowEffect drives - have
+    // no counterpart here.  MWIN_NODISP is 0, MWIN_STOP is 1.
+    int wstep_ = 0;
+    int demo_cnt_ = 0;   // Avg.demo_cnt
 
     // TXT_GetTextCount( DSP_GetTextStr(TXT_WINDOW), step ).
     int text_count(int step) const { return txt_get_text_count(counted_, step); }

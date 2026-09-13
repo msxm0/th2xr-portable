@@ -827,10 +827,40 @@ bool Game::opcode_waiting(WaitKind kind, const th2::Event& event) const
         // AVG_WaitKey(): AVG_GetHitKey() || AVG_GetMesCut() || Avg.demo.
         return waiting_for_input_ && !message_cut() && !demo_mode_;
     case WaitKind::bgm:
+        // AVG_WaitBGM(): the track is stopped or playing - that is, not
+        // still fading - so MW holds only for the length of a fade.
+        return audio_wait_.has_value();
     case WaitKind::se:
+        // int AVG_WaitSe( int sno ), verbatim:
+        //
+        //     if(!Avg.se) return 0;
+        //     if(SeStruct[sno].flag && SeStruct[sno].dno!=-1){
+        //         if( AVG_GetMesCut() ){ AVG_StopSE2( sno, 0 ); return FALSE; }
+        //         else return !SeStruct[sno].loop;
+        //     }
+        //     return FALSE;
+        //
+        // Two things we did not have.  With sound effects off it never
+        // waits at all, and a held skip key *stops the sound* rather than
+        // waiting it out - which is why skipping past a long effect in the
+        // original is silent instead of dragging its tail along.
+        if (config_.se_volume <= 0) {
+            return false;
+        }
+        if (message_cut()) {
+            // AVG_StopSE2( sno, 0 ) - the sound is cut, not waited out.
+            // The stop itself is done by the caller, which is not const.
+            se_cut_pending_ = true;
+            return false;
+        }
+        return audio_wait_.has_value();
     case WaitKind::voice:
-        // AVG_WaitBGM / !AVG_WaitSe / AVG_WaitVoice, all of which come out of
-        // the channel the instruction started.
+        // int AVG_WaitVoice( int vc_no ): with voices off it returns 1 -
+        // ready - so VW never holds the script when the reader has turned
+        // them off.
+        if (config_.voice_volume <= 0) {
+            return false;
+        }
         return audio_wait_.has_value();
     case WaitKind::movie:
         // !AVG_WaitMovie(): movPlayerFrm && !bEnd.
@@ -992,6 +1022,13 @@ void Game::exec_control_lang(bool skipping)
                 continue;
             }
 
+            if (se_cut_pending_) {
+                se_cut_pending_ = false;
+                if (audio_wait_) {
+                    waited_audio_channel().stop();
+                    audio_wait_.reset();
+                }
+            }
             if (latch >= phases && !opcode_waiting(kind, step.event)) {
                 latch = 0;            // EXEC_AddPC: run() already moved it
             } else {

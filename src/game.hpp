@@ -1007,6 +1007,9 @@ private:
     // sixtieth in the AVG_Control* pass, like everything else.
     int global_count_ = 0;
     int control_steps_ = 0;
+    // AVG_WaitSe cuts the sound when the skip key is down.  It is asked from
+    // a const predicate, so the stop happens on the way out of the VM.
+    mutable bool se_cut_pending_ = false;
     // AVG_EffCnt4: the same count in 30fps units, unscaled by the effect
     // speed, and nothing at all while skipping.
     int effect_frames4(int frames) const;

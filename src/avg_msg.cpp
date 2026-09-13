@@ -21,6 +21,7 @@ void AvgMsg::init()
     auto_count_ = 0;
     key_wait_count_ = 0;
     key_wait_count2_ = 0;
+    demo_cnt_ = 0;
 }
 
 // ---------------------------------------------------------- the messages --
@@ -91,6 +92,47 @@ void AvgMsg::set_novel_message_disp(bool disp)
     }
 }
 
+void AvgMsg::open_window(bool tdisp)
+{
+    // void AVG_OpenWindow( int tdisp, int flag ):
+    //
+    //     AVG_SetNovelMessageDisp( ON );
+    //     NovelMessage.step1 = NovelMessage.step2;
+    //     for(i=0;i<10;i++) DSP_SetGraphDisp( GRP_WINDOW+i, ON );
+    //     if(tdisp) for(i=0;i<5;i++) DSP_SetTextDisp( TXT_WINDOW+i, ON );
+    //     for( i=0; i<MAX_SCRIPT_OBJ ; i++ )
+    //         if(SpriteBmp[i].disp) DSP_SetGraphDisp( GRP_SCRIPT+i, ON );
+    wstep_ = 1;
+    if (tdisp) {
+        set_novel_message_disp(true);
+    }
+    message_.step1 = message_.step2;
+    if (hooks_.script_objects_disp) {
+        hooks_.script_objects_disp(true);
+    }
+}
+
+void AvgMsg::close_window()
+{
+    // void AVG_CloseWindow( int flag ):
+    //
+    //     AVG_SetNovelMessageDisp( OFF );
+    //     NovelMessage.step2 = NovelMessage.step1;
+    //     NovelMessage.step1 = MSG_NODISP;
+    //     ...hide GRP_WINDOW, GRP_SCRIPT and TXT_WINDOW...
+    //
+    // Parking step1 is the part that matters: the typewriter stops where it
+    // is for the length of whatever closed the window, and open_window puts
+    // it back on exactly the character it had reached.
+    set_novel_message_disp(false);
+    message_.step2 = message_.step1;
+    message_.step1 = msg_nodisp;
+    wstep_ = 0;
+    if (hooks_.script_objects_disp) {
+        hooks_.script_objects_disp(false);
+    }
+}
+
 bool AvgMsg::wait_auto_mode()
 {
     // BOOL AVG_WaitAutoMode( void ), verbatim.  The delay is the page one at
@@ -143,9 +185,21 @@ void AvgMsg::advance_step()
 
 void AvgMsg::control_wait(const GameKey& key)
 {
-    // The MSG_WAIT / MSG_STOP body: the click indicator is up and the reader
-    // decides.  GRP_KEYWAIT gets BMP_KEYWAIT+1 at a line end and
-    // BMP_KEYWAIT+0 at a page end:
+    // The MSG_WAIT / MSG_STOP body.  The whole thing is wrapped in
+    //     if( Avg.demo ){ ...counter... }else{ ...the reader... }
+    // so the attract loop never shows a click indicator and never reads the
+    // keyboard - it just counts Avg.demo_max frames and moves on.
+    if (hooks_.demo && hooks_.demo()) {
+        demo_cnt_++;
+        const int demo_max = hooks_.demo_max ? hooks_.demo_max() : 60;
+        if (demo_cnt_ >= demo_max) {
+            demo_cnt_ = 0;
+            advance_step();
+        }
+        return;
+    }
+    // GRP_KEYWAIT gets BMP_KEYWAIT+1 at a line end and BMP_KEYWAIT+0 at a
+    // page end:
     //
     //     if(NovelMessage.step1==MSG_WAIT || NovelMessage.add_flag!=2)
     //         DSP_SetGraph( GRP_KEYWAIT, BMP_KEYWAIT+1, ... );
@@ -244,8 +298,15 @@ void AvgMsg::control_novel_message(const GameKey& key)
                 message_.count = text_count(message_.kstep);
             }
         } else {
-            //     NovelMessage.count += AVG_MsgCnt();
-            message_.count += hooks_.msg_cnt ? hooks_.msg_cnt() : 1;
+            //     if( Avg.demo ) NovelMessage.count+=(short)(2*30/Avg.frame);
+            //     else           NovelMessage.count+=AVG_MsgCnt();
+            // The attract loop reads at a fixed rate rather than the
+            // reader's text-speed setting.
+            if (hooks_.demo && hooks_.demo()) {
+                message_.count += 2 * 30 / 60;
+            } else {
+                message_.count += hooks_.msg_cnt ? hooks_.msg_cnt() : 1;
+            }
         }
         break;
     }
