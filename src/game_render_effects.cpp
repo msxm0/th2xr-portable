@@ -1128,6 +1128,14 @@ void Game::update_background_scroll()
     if (elapsed * 60.0 >= background_scroll_->frames) {
         background_view_ = background_scroll_->to;
         background_scroll_.reset();
+        // AVG_ControlBackScroll ends with
+        //     AVG_CopyBack(ON);
+        //     AVG_SetBackChar( BackStruct.x, BackStruct.y, ON );
+        // because the characters were composited into the plate at the
+        // window's old offset.  AVG_ControlChar's invalidation is suppressed
+        // for the whole scroll (BackStruct.sc_flag), so this is the only
+        // thing that puts them back where they belong.
+        background_baked_dirty_ = true;
         advance();
     }
 }

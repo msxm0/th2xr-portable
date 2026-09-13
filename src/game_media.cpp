@@ -34,6 +34,15 @@ namespace th2app {
 void Game::begin_background_scroll(
     float x, float y, float width, float height, int frames, int type)
 {
+    // AVG_SetBackScroll.  back_max is AVG_EffCnt4, which is 30fps units and
+    // carries no Avg.wait, so it doubles at sixty; the easing is sc_type%3
+    // (linear, accelerating, decelerating) and sc_type/3 picks between a
+    // moving window, a zoom, and a four-point warp.
+    //
+    // The warp is AVG_SetBackScrollPoly, sc_type 6..8, and is unreachable:
+    // the only two opcodes that start a scroll are S, whose six uses all
+    // pass type 0 or 1, and Z, whose three all pass 3.  So a scroll is
+    // always a window or a zoom.
     background_scroll_ = BackgroundScroll{
         current_background_view(),
         {x, y, width, height},

@@ -721,7 +721,16 @@ void Game::rebuild_baked_background()
     if (!copy_back_plate()) {
         return;
     }
-    chars().set_back_char(0, 0, 1);
+    // AVG_SetBackChar( BackStruct.x, BackStruct.y, ON ) - the plate is the
+    // background *bitmap*, and the background is shown through a window at
+    // (x, y), so a character standing at screen X has to be composited at
+    // bitmap X + x.  Passing zero here only looked right because the window
+    // sits at the origin until something scrolls it.
+    {
+        const auto view = current_background_view();
+        chars().set_back_char(
+            static_cast<int>(view.x), static_cast<int>(view.y), 1);
+    }
     // AVG_SetBackChar() bakes, AVG_SetHalfTone() copies, in that order - so
     // BMP_BACKHALF is always of a plate that already has its characters.
     //

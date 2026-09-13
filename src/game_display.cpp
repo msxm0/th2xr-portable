@@ -335,7 +335,13 @@ th2::AvgChar::Hooks Game::character_hooks()
     // counter.  Ours has the same hold, but the bake lands a frame after the
     // script resumes, so the copy has to be told.
     hooks.plate_baked = [this] { half_tone_copy_stale_ = true; };
-    hooks.create_back_cscope = [] {};  // AVG_CreateBackCScope: no cscope yet
+    // AVG_CreateBackCScope draws the cinemascope bars.  Its opcode exists
+    // (Escript.cpp calls AVG_SetBackCScope) but no script in the game uses
+    // it - it does not appear once in the 123,413 instructions of SDT.PAK -
+    // so there is nothing to create.  The same goes for AVG_ControlNoise,
+    // whose DRW_FLT has no SDL equivalent and would need a shader written
+    // for an effect nothing asks for.
+    hooks.create_back_cscope = [] {};
 
     // AVG_EffCnt( cnt ): Avg.wait * cnt * Avg.frame / 60, with -1 and -2
     // standing for fifteen and thirty frames, and nothing at all while the
