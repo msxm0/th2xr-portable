@@ -381,6 +381,14 @@ void Game::begin_transition(
 
 void Game::update_transition()
 {
+    // A menu cross-fade keeps its own clock.
+    if (menu_transition_frames_ > 0) {
+        if (transition_progress() >= 1.0f) {
+            menu_transition_frames_ = 0;
+            transition_.reset();
+        }
+        return;
+    }
     // AVG_ControlBackChange owns the counter now; all that is left here is
     // letting go of the pixels the wipe borrowed once fd_flag has cleared.
     // Nothing is resumed: the B instruction that started this is still the

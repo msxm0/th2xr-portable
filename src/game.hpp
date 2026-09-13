@@ -1007,6 +1007,10 @@ private:
     // sixtieth in the AVG_Control* pass, like everything else.
     int global_count_ = 0;
     int control_steps_ = 0;
+    // The menu cross-fades use begin_transition's machinery but are not
+    // AVG_SetBack, so they keep their own clock rather than BackStruct's.
+    int menu_transition_frames_ = 0;
+    std::chrono::steady_clock::time_point menu_transition_started_{};
     // AVG_WaitSe cuts the sound when the skip key is down.  It is asked from
     // a const predicate, so the stop happens on the way out of the VM.
     mutable bool se_cut_pending_ = false;

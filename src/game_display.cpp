@@ -26,6 +26,13 @@ bool Game::transition_drives_graphs() const
     if (!transition_ || !back().fd_flag) {
         return false;
     }
+    // A menu cross-fade is of the whole composited screen, not of GRP_BACK:
+    // it has to go through draw_active_transition() instead, or setting the
+    // background graph up for it undoes whatever AVG_SetHalfTone had left
+    // there - which took the wash away every time the menu closed.
+    if (menu_transition_frames_ > 0) {
+        return false;
+    }
     // The types the scripts actually use, minus BAK_PATTERN which needs its
     // mask: BAK_CFADE, the four BAK_CFZOOM* and the four BAK_SLIDE_*.
     const int type = transition_->type;
@@ -106,12 +113,36 @@ void Game::setup_background_graphs(
         display().set_graph(
             th2::grp_back + 1, th2::bmp_back + 1, th2::lay_back, true,
             th2::check_none);
-    } else if (display().graph(th2::grp_back).bno != back_bmp
-               || display().graph(th2::grp_back).layer != th2::lay_back) {
-        // Back from a wipe, or the plate swapped under a sine shake.
-        display().set_graph(
-            th2::grp_back, back_bmp, th2::lay_back,
-            display().graph(th2::grp_back).disp, th2::check_none);
+    } else {
+        // Not wiping.  GRP_BACK+1 is shared between the wipe's outgoing
+        // snapshot and the half tone's darkened plate - AVG_SetBack parks
+        // one there and AVG_SetHalfTone the other - and they never overlap
+        // in the engine because AVG_ResetBackHalfTone runs first.  Ours can
+        // leave the snapshot behind, because our transition texture outlives
+        // BackStruct.fd_flag, so HalfTone.tstep is re-asserted here: it is
+        // the one that knows what should be in the slot.
+        const bool washed = msg().check_half_tone_step() == th2::tone_disp
+            && display().bmp_flag(th2::bmp_backhalf);
+        if (display().graph(th2::grp_back).bno != back_bmp
+            || display().graph(th2::grp_back).layer != th2::lay_back) {
+            display().set_graph(
+                th2::grp_back, back_bmp, th2::lay_back, !washed,
+                th2::check_none);
+        }
+        if (washed) {
+            display().set_graph(
+                th2::grp_back + 1, th2::bmp_backhalf, th2::lay_back + 2,
+                true, th2::check_none);
+            display().set_graph_pos(
+                th2::grp_back + 1, 0, 0,
+                back().x, back().y,
+                th2::display_width, th2::display_height);
+            display().set_graph_disp(th2::grp_back, false);
+        } else if (display().graph(th2::grp_back + 1).bno == th2::bmp_back + 1
+                   || msg().check_half_tone_step() == th2::tone_nodisp) {
+            display().reset_graph(th2::grp_back + 1);
+            display().set_graph_disp(th2::grp_back, true);
+        }
     }
 
     const auto view = current_background_view();
