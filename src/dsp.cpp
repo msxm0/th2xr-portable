@@ -899,6 +899,84 @@ void Display::get_graph_bright(int gno, int* r, int* g, int* b) const
 
 // --- drawing -----------------------------------------------------------
 
+SDL_Texture* Display::blend_pair(const Graph& graph)
+{
+    // DSP_SetGraphBSet hangs a second bitmap off the graph and the
+    // rasteriser blends the pair by param2 before anything else touches
+    // them - DRW_DrawBMP_FFF rather than DRW_DrawBMP_FF.  That is what makes
+    // a character change pose without ever becoming see-through: it is one
+    // solid sprite whose pixels are a mix, not two sprites laid over each
+    // other.
+    if (graph.bset != 1 || graph.bno2 < 0 || graph.bno2 >= bitmap_max) {
+        return nullptr;
+    }
+    const Bitmap& first = bitmaps_[graph.bno];
+    const Bitmap& second = bitmaps_[graph.bno2];
+    if (!first.valid() || !second.valid()) {
+        return nullptr;
+    }
+    const int width = std::max(first.width, second.width);
+    const int height = std::max(first.height, second.height);
+    if (width <= 0 || height <= 0) {
+        return nullptr;
+    }
+    float held_width = 0.0f;
+    float held_height = 0.0f;
+    if (blend_target_) {
+        SDL_GetTextureSize(blend_target_.get(), &held_width, &held_height);
+    }
+    if (!blend_target_ || static_cast<int>(held_width) != width
+        || static_cast<int>(held_height) != height) {
+        blend_target_.reset(SDL_CreateTexture(
+            renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET,
+            width, height));
+        if (!blend_target_) {
+            return nullptr;
+        }
+        SDL_SetTextureBlendMode(blend_target_.get(), SDL_BLENDMODE_BLEND);
+    }
+    // Both go in weighted by their share, alpha weighted the same way, so
+    // the two add up to one opaque sprite.
+    const auto accumulate = SDL_ComposeCustomBlendMode(
+        SDL_BLENDFACTOR_SRC_ALPHA, SDL_BLENDFACTOR_ONE,
+        SDL_BLENDOPERATION_ADD,
+        SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE,
+        SDL_BLENDOPERATION_ADD);
+    SDL_Texture* const a = first.view;
+    SDL_Texture* const b = second.view;
+    if (!SDL_SetTextureBlendMode(a, accumulate)
+        || !SDL_SetTextureBlendMode(b, accumulate)) {
+        SDL_SetTextureBlendMode(a, SDL_BLENDMODE_BLEND);
+        SDL_SetTextureBlendMode(b, SDL_BLENDMODE_BLEND);
+        return nullptr;  // no custom blending here; the plain path stands in
+    }
+    const int rate = std::clamp(draw_alpha_of(graph.param2), 0, 256);
+    SDL_Texture* const held = SDL_GetRenderTarget(renderer_);
+    float scale_x = 1.0f;
+    float scale_y = 1.0f;
+    SDL_GetRenderScale(renderer_, &scale_x, &scale_y);
+    SDL_SetRenderTarget(renderer_, blend_target_.get());
+    SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
+    SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 0);
+    SDL_RenderClear(renderer_);
+    // bno2 is the pose being left, bno the one arriving, and param2 rises
+    // from nothing to all of it.
+    for (const auto& [texture, weight] :
+         {std::pair{b, 256 - rate}, std::pair{a, rate}}) {
+        SDL_SetTextureColorMod(texture, 255, 255, 255);
+        SDL_SetTextureAlphaMod(
+            texture,
+            static_cast<Uint8>(std::clamp(weight * 255 / 256, 0, 255)));
+        SDL_RenderTexture(renderer_, texture, nullptr, nullptr);
+    }
+    SDL_SetRenderScale(renderer_, scale_x, scale_y);
+    SDL_SetRenderTarget(renderer_, held);
+    SDL_SetTextureBlendMode(a, SDL_BLENDMODE_BLEND);
+    SDL_SetTextureBlendMode(b, SDL_BLENDMODE_BLEND);
+    return blend_target_.get();
+}
+
 void Display::draw_graph_bmp(
     const Graph& graph, SDL_Texture*, int global_x, int global_y)
 {
@@ -913,7 +991,9 @@ void Display::draw_graph_bmp(
         graph, global_x, global_y, bitmap.pos_x, bitmap.pos_y,
         bright_r_, bright_g_, bright_b_);
 
-    SDL_Texture* const texture = bitmap.view;
+    // A graph with a second bitmap is blended into one sprite first.
+    SDL_Texture* const paired = blend_pair(graph);
+    SDL_Texture* const texture = paired ? paired : bitmap.view;
     SDL_SetTextureColorMod(
         texture, geometry.red, geometry.green, geometry.blue);
     const int alpha = draw_alpha_of(graph.param);

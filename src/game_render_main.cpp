@@ -405,50 +405,6 @@ void Game::build_half_tone_background()
         th2::bmp_backhalf, th2::bmp_back, shade(0), shade(1), shade(2));
 }
 
-Uint8 Game::apply_background_fade(SDL_Texture* texture, float extra) const
-{
-    // 128 is normal, below it darkens, above it brightens.  The darkening
-    // half is a plain colour modulation; the brightening half has to be
-    // added on afterwards, because modulation cannot exceed the source.
-    const auto& fade = background_brightness_;
-    float highest = 0.0f;
-    for (const float channel : fade) {
-        highest = std::max(highest, std::clamp(channel, 0.0f, 256.0f));
-    }
-    std::array<Uint8, 3> modulate{};
-    Uint8 brighten = 0;
-    for (std::size_t i = 0; i < fade.size(); ++i) {
-        const float channel = std::clamp(fade[i], 0.0f, 256.0f);
-        modulate[i] = static_cast<Uint8>(
-            std::clamp(std::min(channel, 128.0f) * 255.0f / 128.0f * extra,
-                       0.0f, 255.0f));
-    }
-    if (highest > 128.0f) {
-        brighten = static_cast<Uint8>(
-            std::clamp((highest - 128.0f) * 255.0f / 128.0f, 0.0f, 255.0f));
-    }
-    SDL_SetTextureColorMod(texture, modulate[0], modulate[1], modulate[2]);
-    return brighten;
-}
-
-void Game::finish_background_fade(
-    SDL_Texture* texture, Uint8 brighten, const SDL_FRect* source,
-    const SDL_FRect* destination, double angle, SDL_FlipMode flip)
-{
-    if (brighten > 0) {
-        // The same picture again, added on: additive keeps the object's own
-        // shape, where a screen-blended rectangle over the destination would
-        // light up everything transparent in it as well.
-        const auto previous = SDL_BLENDMODE_BLEND;
-        SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_ADD);
-        SDL_SetTextureColorMod(texture, brighten, brighten, brighten);
-        SDL_RenderTextureRotated(
-            renderer_, texture, source, destination, angle, nullptr, flip);
-        SDL_SetTextureBlendMode(texture, previous);
-    }
-    SDL_SetTextureColorMod(texture, 255, 255, 255);
-}
-
 float Game::imgui_display_scale() const
 {
     // Cap the scale so ImGui doesn't become enormous on high-DPI phones.

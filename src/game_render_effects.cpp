@@ -816,6 +816,14 @@ void Game::draw_script_position()
 
 void Game::begin_background_fade(int red, int green, int blue, int frames)
 {
+    // AVG_SetBackFade opens with
+    //     AVG_ResetHalfTone();
+    //     AVG_SetNovelMessageDisp(OFF);
+    // which is what keeps the darkened copy from being on screen while the
+    // background's brightness is being driven out from under it - the copy
+    // is of a plate at the old brightness and nothing would refresh it.
+    reset_half_tone();
+    message_visible_ = false;
     const int effective_frames = effect_frames(frames);
     background_fade_ = BackgroundFade{
         background_brightness_,
@@ -847,6 +855,20 @@ void Game::update_background_fade()
         background_brightness_[i] = background_fade_->from[i]
             + (background_fade_->to[i] - background_fade_->from[i])
                 * progress;
+    }
+    // AVG_ControlBackFade sets the same brightness on GRP_BACK and on every
+    // script overlay:
+    //     for(i=GRP_SCRIPT;i<GRP_ENDING;i++)
+    //         DSP_SetGraphBright( i, rr, gg, bb );
+    // A fade to black that left the overlays lit would be very visible, and
+    // this stopped happening when they became graphs of their own - the
+    // fade used to be folded into each overlay's draw by hand.
+    for (int i = 0; i < th2::max_script_obj; ++i) {
+        display().set_graph_bright(
+            th2::grp_script + i,
+            static_cast<int>(background_brightness_[0]),
+            static_cast<int>(background_brightness_[1]),
+            static_cast<int>(background_brightness_[2]));
     }
     if (progress >= 1.0f) {
         background_brightness_ = background_fade_->to;

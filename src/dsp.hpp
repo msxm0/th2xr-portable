@@ -365,6 +365,10 @@ public:
 private:
     Graph& at(int gno) { return graphs_.at(gno); }
     bool ensure_renderable(int bno);
+    // DRW_DrawBMP_*FF and friends: bset says the graph is two bitmaps
+    // blended by param2 before param draws the result.  Returns the blended
+    // texture, or null when the graph is a single bitmap after all.
+    SDL_Texture* blend_pair(const Graph& graph);
     void draw_graph_bmp(const Graph& graph, SDL_Texture* dest,
                         int global_x, int global_y);
     void draw_graph_prim(const Graph& graph, SDL_Texture* dest,
@@ -382,6 +386,8 @@ private:
     int bright_g_ = bright_neutral;
     int bright_b_ = bright_neutral;
 
+    // Scratch for the two-bitmap blend above.
+    Texture blend_target_;
     int capture_bno_ = -1;   // GetBackNo
     bool capture_ = false;   // GetBackFlag
 };

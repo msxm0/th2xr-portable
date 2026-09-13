@@ -1350,8 +1350,6 @@ private:
     //
     // Returns how much has to be added back on a second pass: colour
     // modulation can only darken, and the fade also brightens.
-    Uint8 apply_background_fade(SDL_Texture* texture,
-                                float extra = 1.0f) const;
     // What the half tone multiplies the picture by while the message window
     // is up: BackStruct.r * Avg.half_tone / 128, ramped over the sixteen
     // steps of TONE_FADEOUT.  One, when there is no wash.
@@ -1384,10 +1382,6 @@ private:
     // The ramp is done live on the background instead, which is why the two
     // are separate.
     float half_tone_target_factor() const;
-    void finish_background_fade(SDL_Texture* texture, Uint8 brighten,
-                                const SDL_FRect* source,
-                                const SDL_FRect* destination, double angle,
-                                SDL_FlipMode flip);
     void ensure_shake_target();
     // The engine never clears its framebuffer, so whatever a transform fails
     // to cover keeps the pixels from the frame before.  That is visible in
