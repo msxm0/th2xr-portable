@@ -10,6 +10,7 @@
 #include "texture.hpp"
 #include "dsp.hpp"
 #include "avg_back.hpp"
+#include "avg_msg.hpp"
 #include "avg_char.hpp"
 #include "gl_transition.hpp"
 #include "gamepad_input.hpp"
@@ -403,6 +404,8 @@ private:
     // counts in whole frames here, and AVG_EffCnt is re-asked on each pass,
     // which is what lets the skip key collapse one mid-flight.
     std::optional<th2::AvgBack> avg_back_;
+    // NovelMessage and HalfTone, and AVG_ControlNovelMessage.
+    std::optional<th2::AvgMsg> avg_msg_;
     th2::Display& display() { return *display_; }
     const th2::Display& display() const { return *display_; }
     th2::AvgChar& chars() { return *avg_char_; }
@@ -411,10 +414,18 @@ private:
     const th2::AvgBack& avgback() const { return *avg_back_; }
     th2::BackStruct& back() { return avg_back_->back(); }
     const th2::BackStruct& back() const { return avg_back_->back(); }
+    th2::AvgMsg& msg() { return *avg_msg_; }
+    const th2::AvgMsg& msg() const { return *avg_msg_; }
     void build_display();
     // AVG_ControlChar's view of BackStruct, and the calls it makes outward.
     th2::AvgChar::Hooks character_hooks();
     th2::AvgBack::Hooks background_hooks();
+    th2::AvgMsg::Hooks message_hooks();
+    // AVG_GetGameKey's output, sampled once at the top of the frame.
+    th2::GameKey game_key_{};
+    th2::KeyCond key_cond_{};
+    void get_game_key();          // AVG_GetGameKey
+    void control_system2();       // AVG_ControlSystem2
     // AVG_ControlChar runs at sixty frames a second in the original and
     // counts in whole ones.  On a faster display the AVG_Control* pass has
     // to be stepped by elapsed time instead, and this is the accumulator
@@ -1180,6 +1191,20 @@ private:
     void draw_config();
     void draw_name_input();
     void open_backlog();
+    // GRP_KEYWAIT's state, set by AVG_ControlNovelMessage and read by
+    // draw_click_indicator().
+    bool keywait_visible_ = false;
+    bool keywait_page_end_ = false;
+    // AVG_PlaySE3( no, volume ), for the two sounds the message machine makes.
+    void play_system_se(int number, int volume);
+    // AVG_MsgCnt(): how far NovelMessage.count moves in one frame.
+    int message_count_step() const;
+    // AVG_EffCntPuls(): how far HalfTone.tcount moves in one frame.
+    int effect_count_pulse() const;
+    // Avg.msg_wait, the text-speed setting, as the engine numbers it: 0 is
+    // instant, 3 the slowest.  Ours is a millisecond-per-character slider,
+    // so it is folded back into the four the original has.
+    int message_wait_setting() const;
     void close_backlog();
     // Starts background transfers for the assets the script is about to
     // need, so their reads do not stall a frame (browser build; a no-op

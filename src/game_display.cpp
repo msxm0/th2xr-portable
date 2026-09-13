@@ -13,6 +13,7 @@ void Game::build_display()
     display_.emplace(renderer_);
     avg_char_.emplace(*display_, character_hooks());
     avg_back_.emplace(*display_, background_hooks());
+    avg_msg_.emplace(*display_, avg_back_->back(), message_hooks());
 }
 
 bool Game::has_background() const
@@ -78,10 +79,6 @@ void Game::setup_background_graphs(
     const bool have_plate = display().bmp_flag(th2::bmp_back);
     const int back_bmp = (shake_characters || !have_plate)
         ? th2::bmp_back2 : th2::bmp_back;
-    const bool copy_shown = !shake_characters && half_tone_settled()
-        && display().bmp_flag(th2::bmp_backhalf);
-    const int half_bmp = shake_characters
-        ? th2::bmp_back2 : th2::bmp_backhalf;
 
     // GRP_BACK at LAY_BACK and GRP_BACK+1 at LAY_BACK+2.  Once the ramp has
     // finished the engine turns GRP_BACK off and shows the darkened copy in
@@ -94,23 +91,27 @@ void Game::setup_background_graphs(
     // so the outgoing snapshot sits at the bottom with the incoming picture
     // above it - and the darkened copy simply has nowhere to be, which is
     // why the half tone vanishes for a wipe without anyone suppressing it.
+    // Which bitmap each of the two graphs holds, whether it is shown and
+    // what layer it sits on are AVG_SetHalfTone's, AVG_ResetHalfTone's and
+    // AVG_ControlShake's - they set them once, when something changes, and
+    // leave them.  The only one left here is the wipe, whose outgoing
+    // snapshot is a texture of ours rather than a bitmap the engine made.
     const bool wiping = transition_drives_graphs();
-    display().set_graph(
-        th2::grp_back, back_bmp,
-        wiping ? th2::lay_back + 1 : th2::lay_back,
-        wiping || !copy_shown, th2::check_none);
     if (wiping) {
+        display().set_graph(
+            th2::grp_back, back_bmp, th2::lay_back + 1, true, th2::check_none);
         display().borrow_bmp(
             th2::bmp_back + 1, transition_->previous.get(),
             th2::display_width, th2::display_height, false);
         display().set_graph(
             th2::grp_back + 1, th2::bmp_back + 1, th2::lay_back, true,
             th2::check_none);
-    } else {
-        display().release_bmp(th2::bmp_back + 1);
+    } else if (display().graph(th2::grp_back).bno != back_bmp
+               || display().graph(th2::grp_back).layer != th2::lay_back) {
+        // Back from a wipe, or the plate swapped under a sine shake.
         display().set_graph(
-            th2::grp_back + 1, half_bmp, th2::lay_back + 2, copy_shown,
-            th2::check_none);
+            th2::grp_back, back_bmp, th2::lay_back,
+            display().graph(th2::grp_back).disp, th2::check_none);
     }
 
     const auto view = current_background_view();
@@ -174,20 +175,9 @@ void Game::setup_background_graphs(
         }
     }
 
-    // AVG_ControlBackFade: DSP_SetGraphBright( GRP_BACK, rr, gg, bb ), with
-    // the half tone's own ramp multiplied in while it is still running.
-    // GRP_BACK+1 keeps a neutral brightness, as it does in the original -
-    // the darkness is already in the bitmap, and AVG_SetBackFade tears the
-    // wash down before it starts anyway.
-    const float shade = half_tone_factor();
-    display().set_graph_bright(
-        th2::grp_back,
-        static_cast<int>(background_brightness_[0] * shade),
-        static_cast<int>(background_brightness_[1] * shade),
-        static_cast<int>(background_brightness_[2] * shade));
-
-    // Last, because every one of its calls lands on the geometry above.
-    control_back_change();
+    // GRP_BACK's brightness belongs to AVG_ControlBackFade and, while the
+    // wash is ramping, to AVG_ControlHalfTone.  They cannot fight:
+    // AVG_SetBackFade calls AVG_ResetHalfTone before it starts.
 }
 
 th2::AvgChar::Hooks Game::character_hooks()
@@ -327,6 +317,55 @@ th2::AvgBack::Hooks Game::background_hooks()
     hooks.novel_message_disp = [this](bool on) { message_visible_ = on; };
     hooks.reset_half_tone = [this] { reset_half_tone(); };
     hooks.global_count = [this] { return global_count_; };
+    return hooks;
+}
+
+th2::AvgMsg::Hooks Game::message_hooks()
+{
+    th2::AvgMsg::Hooks hooks;
+    // GRP_KEYWAIT.  Ours is drawn by draw_click_indicator() at monitor
+    // resolution, so this only says whether it is up and which of the two
+    // marks it is.
+    hooks.set_keywait = [this](bool page) {
+        keywait_visible_ = true;
+        keywait_page_end_ = page;
+    };
+    hooks.reset_keywait = [this] { keywait_visible_ = false; };
+    hooks.play_se = [this](int number, int volume) {
+        play_system_se(number, volume);
+    };
+    hooks.wait_voice = [this] { return !voice_playing(); };
+    // AVG_GetHitKey(): GameKey.click && the pointer is not over a button.
+    hooks.hit_key = [this] { return game_key_.click != 0; };
+    hooks.mes_cut = [this] { return message_cut(); };
+    hooks.msg_cnt = [this] { return message_count_step(); };
+    hooks.eff_cnt_puls = [this] { return effect_count_pulse(); };
+    hooks.log_start = [this] { open_backlog(); };
+    hooks.set_text_disp = [this](bool on) { message_visible_ = on; };
+    hooks.reveal_step = [this](int) { message_.reveal_next(); };
+    hooks.auto_flag = [this] { return auto_mode_ || demo_mode_; };
+    // Avg.auto_key / Avg.auto_page, in frames.
+    hooks.auto_key = [this] {
+        return th2::auto_delay_ms(
+                   config_, current_text_is_read(), true, false) * 60 / 1000;
+    };
+    hooks.auto_page = [this] {
+        return th2::auto_delay_ms(
+                   config_, current_text_is_read(), false, true) * 60 / 1000;
+    };
+    // Avg.msg_page: the "show the whole page at once" reading mode.
+    hooks.msg_page = [] { return false; };
+    hooks.half_tone_depth = [this] {
+        return std::clamp(
+            config_.message_half_tone,
+            th2::GameConfig::min_message_half_tone,
+            th2::GameConfig::max_message_half_tone);
+    };
+    hooks.set_char_half_tone = [](bool) {};
+    hooks.set_char_bright = [this](int r, int g, int b) {
+        chars().set_char_bright_all(r, g, b);
+    };
+    hooks.wav_effect = [] { return false; };
     return hooks;
 }
 

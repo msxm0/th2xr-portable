@@ -62,6 +62,11 @@ void Game::mark_current_text_read()
 
 void Game::manual_advance()
 {
+    // The player clicked.  In the engine this is nothing but an edge in
+    // GameKey: AVG_GetGameKey sets GameKey.click, AVG_ControlSystem2 clears
+    // the skip flags because of it, and AVG_ControlNovelMessage reads it on
+    // the same frame to leave MSG_WAIT.  Nothing runs the script here.
+    key_cond_.trg_enter = true;
     auto_mode_ = false;
     skip_mode_ = false;
     auto_next_time_.reset();

@@ -431,15 +431,27 @@ bool Game::handle(const th2::Event& event)
             current_backlog_voices_.push_back(*pending_backlog_voice_);
             pending_backlog_voice_.reset();
         }
-        message_visible_ = true;
         message_window_open_ = true;
-        raise_half_tone();
+        // void AVG_SetScenarioFlag( int block_no ), which ESC_EOprSetMessage2
+        // calls right after AVG_SetNovelMessage:
+        //
+        //     if(BlockNo!=-1){ STD_SetBit( ScenarioFlag[i], 1, BlockNo, ON ); }
+        //     BlockNo = block_no;
+        //
+        // It marks the block the reader has just finished, not the one about
+        // to start - reaching the next message is what proves the last one
+        // was read.  AVG_CheckScenarioFlag then asks about the *current*
+        // BlockNo, which is how AVG_GetMesCut knows whether this line may be
+        // skipped.  Marking on the click instead left almost nothing marked,
+        // and the skip key stopped working on a second read-through.
+        mark_current_text_read();
         current_line_key_ = runtime_.script_name() + ':'
             + std::to_string(runtime_.vm_pc());
         message_ends_block_ = number(event, 1) == 2;
-        waiting_for_input_ = true;
-        start_text_reveal(0);
-        auto_next_time_.reset();
+        // AVG_SetNovelMessage( EscParam[0].str, EscParam[1].num ).  It sets
+        // MSG_DISP, takes the half tone and shows the text; everything after
+        // that is AVG_ControlNovelMessage's, one frame at a time.
+        msg().set_novel_message(text(event, 0), number(event, 1));
     } else if (name == "AddMessage2") {
         const auto reveal_start = message_.visible().size();
         message_.append(th2::substitute_player_name(
@@ -451,15 +463,13 @@ bool Game::handle(const th2::Event& event)
             current_backlog_voices_.push_back(*pending_backlog_voice_);
             pending_backlog_voice_.reset();
         }
-        message_visible_ = true;
         message_window_open_ = true;
-        raise_half_tone();
         current_line_key_ = runtime_.script_name() + ':'
             + std::to_string(runtime_.vm_pc());
         message_ends_block_ = number(event, 1) == 2;
-        waiting_for_input_ = true;
-        start_text_reveal(reveal_start);
-        auto_next_time_.reset();
+        static_cast<void>(reveal_start);
+        // AVG_AddNovelMessage( EscParam[0].str, EscParam[1].num ).
+        msg().add_novel_message(text(event, 0), number(event, 1));
     } else if (name == "T") {
         message_visible_ = number(event, 0) != 0;
     } else if (name == "K") {
@@ -763,12 +773,9 @@ bool Game::opcode_waiting(WaitKind kind, const th2::Event& event) const
     case WaitKind::novel_message:
         // AVG_WaitNovelMessage(): NovelMessage.step1 == MSG_NEXT.  MSG_DISP
         // and MSG_WAIT both leave on AVG_GetMesCut(), so a held skip key
-        // takes the message to MSG_NEXT on its own.
-        if (message_cut()) {
-            return false;
-        }
-        return waiting_for_input_ || !text_reveal_complete_
-            || message_.has_hidden_segments();
+        // takes the message to MSG_NEXT on its own and nothing here has to
+        // know about skipping.
+        return !msg().wait_novel_message();
     case WaitKind::back:
         // !AVG_WaitBack(): BackStruct.fd_flag, the background change.
         return avgback().wait_back();
@@ -817,26 +824,14 @@ void Game::advance(bool skipping)
     // machine here would run it again.  The loop below picks it up from the
     // latch instead, which is what EOprFlag is for.
 
-    // Record whether the player is advancing past a block end (page end).
-    // Used at the end of advance() to decide whether to autosave.
+    // The reveal, the page turn and the read mark are AVG_ControlNovelMessage's
+    // now.  A click is an edge in GameKey, which it reads on the same frame;
+    // this is left with the two things that are not the message machine's -
+    // the choice the player picked, and the autosave at a page end.
     just_advanced_past_block_end_ = false;
-    if (waiting_for_input_ && message_ends_block_ && !message_.has_hidden_segments()) {
+    if (msg().state().step1 == th2::msg_stop && message_ends_block_) {
         just_advanced_past_block_end_ = true;
     }
-    if (waiting_for_input_) {
-        mark_current_text_read();
-    }
-    if (waiting_for_input_ && finish_text_reveal()) {
-        auto_next_time_.reset();
-        return;
-    }
-    const auto reveal_start = message_.visible().size();
-    if (waiting_for_input_ && message_.reveal_next()) {
-        start_text_reveal(reveal_start);
-        auto_next_time_.reset();
-        return;
-    }
-    waiting_for_input_ = false;
     if (choosing_) {
         if (choice_selected_ < 0) {
             return;

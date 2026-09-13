@@ -118,20 +118,15 @@ void Game::set_message_scroll_from_y(float y)
 
 Uint8 Game::message_backdrop_alpha() const
 {
-    // The original multiplies the background by half_tone/128 while the
-    // message window is up - in the log too, which shows its text in the
-    // same window over the same darkened background - and compositing black
-    // at the complementary alpha is the same thing.  It never reaches solid
-    // because half_tone stops at 36.
+    // The wash is BMP_BACKHALF, a darkened copy of the plate drawn by
+    // GRP_BACK+1, rather than black composited over the top.  What is left
+    // here is the save and load screens, which darken behind their own
+    // panels and are ours.
     const int half_tone = std::clamp(
         config_.message_half_tone,
         th2::GameConfig::min_message_half_tone,
         th2::GameConfig::max_message_half_tone);
-    // AVG_ControlHalfTone() walks the background from its own brightness to
-    // the dimmed one over sixteen steps when the window comes up, so the
-    // wash arrives with the text rather than snapping in behind it.
-    const float ramp = std::clamp(half_tone_count_ / half_tone_steps, 0.0f, 1.0f);
-    return static_cast<Uint8>(255.0f * (128 - half_tone) / 128.0f * ramp);
+    return static_cast<Uint8>(255.0f * (128 - half_tone) / 128.0f);
 }
 
 float Game::half_tone_pulse() const
@@ -157,83 +152,25 @@ float Game::half_tone_pulse() const
 
 void Game::reset_half_tone()
 {
-    half_tone_count_ = 0.0f;
-    half_tone_fading_ = false;
-    half_tone_armed_ = false;
+    // AVG_ResetHalfTone(), in avg_msg.cpp.
+    msg().reset_half_tone();
 }
 
 void Game::raise_half_tone()
 {
-
-    // AVG_SetHalfTone().  From TONE_NODISP it copies the background and
-    // starts the ramp with the copy still hidden; called again while the
-    // ramp is running, or once it is shown, it goes straight to TONE_DISP
-    // without copying again.
-    const bool from_nothing =
-        !half_tone_armed_ || (!half_tone_fading_ && half_tone_count_ <= 0.0f);
-    half_tone_armed_ = true;
-    if (from_nothing) {
-        build_half_tone_background();
-        half_tone_fading_ = false;
-        half_tone_count_ = 0.0f;
-        return;
-    }
-    half_tone_fading_ = false;
-    half_tone_count_ = half_tone_steps;
+    // AVG_SetHalfTone(), in avg_msg.cpp.
+    msg().set_half_tone();
 }
 
 void Game::update_half_tone()
 {
-    // AVG_Main calls AVG_ControlHalfTone from AVG_GAME and AVG_CONFIG and
-    // from nowhere else - AVG_SAVE, AVG_LOAD, AVG_SETTING and AVG_MAP all
-    // leave it alone.  So opening the save menu freezes the wash where it
-    // is and closing it finds it still there.  Running the ramp anyway sent
-    // it back to zero the moment the message went, and the background came
-    // back undarkened for a beat afterwards.
-    switch (ui_mode_) {
-    case UiMode::game:
-    case UiMode::system_menu:
-    case UiMode::backlog:
-        break;
-    default:
-        half_tone_updated_ = std::chrono::steady_clock::now();
+    // AVG_ControlHalfTone() runs in AVG_System's chain, not here.  AVG_Main
+    // calls it from AVG_GAME and AVG_CONFIG and from nowhere else, so the
+    // save and load menus freeze the wash where it is rather than resetting
+    // it - which is why opening the save menu used to take the wash away.
+    if (ui_mode_ != UiMode::game && ui_mode_ != UiMode::system_menu
+        && ui_mode_ != UiMode::backlog) {
         return;
-    }
-    const auto now = std::chrono::steady_clock::now();
-    const float frames = std::clamp(
-        static_cast<float>(
-            std::chrono::duration<double>(now - half_tone_updated_).count()
-            * 60.0),
-        0.0f, 8.0f);
-    half_tone_updated_ = now;
-    if (transition_) {
-        // AVG_ControlBackChange drives the wipe through GRP_BACK and parks
-        // the outgoing background in GRP_BACK+1, so the darkened copy has
-        // nowhere to be drawn while one runs.
-        half_tone_count_ = 0.0f;
-        half_tone_fading_ = false;
-        half_tone_armed_ = false;
-        return;
-    }
-    if (!half_tone_armed_ || !message_visible_ || message_.empty()) {
-        // AVG_ResetHalfTone() drops it in one go; the fade back in is
-        // commented out in the original and never runs.
-        half_tone_count_ = 0.0f;
-        half_tone_fading_ = false;
-        return;
-    }
-    if (half_tone_count_ >= half_tone_steps) {
-        return;
-    }
-    if (!half_tone_fading_) {
-        half_tone_fading_ = true;
-        half_tone_count_ = 0.0f;
-        return;
-    }
-    half_tone_count_ =
-        std::min(half_tone_steps, half_tone_count_ + half_tone_pulse() * frames);
-    if (half_tone_count_ >= half_tone_steps) {
-        half_tone_fading_ = false;
     }
 }
 
@@ -268,13 +205,13 @@ bool Game::handle_backlog_scroll_press(float x, float y)
 
 void Game::draw_click_indicator()
 {
-    if (!waiting_for_input_ || !message_visible_ || message_.empty()
-        || !text_reveal_complete_) {
+    // GRP_KEYWAIT.  AVG_ControlNovelMessage puts it up in MSG_WAIT and
+    // MSG_STOP and takes it down everywhere else, so this only has to say
+    // where it goes.
+    if (!keywait_visible_ || !message_visible_ || message_.empty()) {
         return;
     }
-
-    const bool end_of_block =
-        !message_.has_hidden_segments() && message_ends_block_;
+    const bool end_of_block = keywait_page_end_;
     auto& tex = end_of_block ? ui_keywait_ : ui_pageend_;
     if (!tex) return;
 
@@ -367,31 +304,16 @@ void Game::begin_authentic_text()
 
 float Game::half_tone_factor() const
 {
-    // DSP_DrawGraph keeps drawing GRP_BACK+1 whatever state the game is in,
-    // so a menu over the top does not undarken what is behind it.  What
-    // takes the wash away is the message going, and only in the states that
-    // still run the ramp.
-    const bool ramping = ui_mode_ == UiMode::game
-        || ui_mode_ == UiMode::system_menu || ui_mode_ == UiMode::backlog;
-    if (transition_ || !half_tone_armed_) {
-        return 1.0f;
-    }
-    if (ramping && (!message_visible_ || message_.empty())) {
-        return 1.0f;
-    }
-    const int half_tone = std::clamp(
-        config_.message_half_tone,
-        th2::GameConfig::min_message_half_tone,
-        th2::GameConfig::max_message_half_tone);
-    const float ramp =
-        std::clamp(half_tone_count_ / half_tone_steps, 0.0f, 1.0f);
-    return 1.0f - (128.0f - static_cast<float>(half_tone)) / 128.0f * ramp;
+    // AVG_ControlHalfTone drives GRP_BACK's brightness directly now, so
+    // there is no separate shade to fold in anywhere.
+    return 1.0f;
 }
 
 bool Game::half_tone_settled() const
 {
-    return half_tone_factor() < 1.0f
-        && half_tone_count_ >= half_tone_steps;
+    // HalfTone.tstep == TONE_DISP: the ramp is over and BMP_BACKHALF is
+    // what is on screen.
+    return msg().check_half_tone_step() == th2::tone_disp;
 }
 
 float Game::half_tone_target_factor() const
@@ -850,39 +772,13 @@ void Game::draw_frame()
         }
         // The half tone is drawn with the art, above, so that it travels
         // with the background rather than with this text.
-        // The width of the per-glyph fade, in the same units as
-        // reveal_position: the original's alph2 = LIM(text_cnt-cnt2,0,16)*16.
-        constexpr float fade_width = 16.0f;
+        // The typewriter is NovelMessage.count, advanced once per frame by
+        // AVG_MsgCnt() in AVG_ControlNovelMessage, and each character fades
+        // in over the sixteen counts after its own:
+        //     alph2 = LIM( text_cnt - cnt2, 0, 16 ) * 16
+        // AvgMsg::glyph_alpha is that line; nothing here measures a clock.
         const auto visible = message_.visible();
-        const auto reveal_start =
-            std::min(text_reveal_start_, visible.size());
-        const auto reveal_text = visible.substr(reveal_start);
-        const auto reveal_character_count =
-            utf8_character_count(reveal_text);
-        const float fade_finished = static_cast<float>(reveal_character_count)
-            + fade_width - 1.0f;
-        float reveal_position = fade_finished;
-        if (!text_fade_complete_ && config_.text_speed_ms > 0) {
-            const auto elapsed =
-                std::chrono::steady_clock::now() - text_reveal_started_;
-            reveal_position =
-                std::chrono::duration<float, std::milli>(elapsed).count()
-                / config_.text_speed_ms;
-            // NovelMessage.max: the original's counter stops here, and this
-            // is what the click indicator and the wait for input key off.
-            if (reveal_position >= reveal_character_count + 8.0f) {
-                text_reveal_complete_ = true;
-            }
-            // The ramp runs on past that, because a glyph needs the full
-            // sixteen counts of alph2 = LIM(text_cnt - cnt2, 0, 16) * 16 to
-            // reach solid, and the last glyph only starts at count - 1.
-            // Ending the fade at the counter's threshold instead made the
-            // tail of every line jump from part-faded to solid.
-            if (reveal_position >= fade_finished) {
-                text_fade_complete_ = true;
-                reveal_position = fade_finished;
-            }
-        }
+        const std::size_t shown = msg().visible_glyphs();
         const float x = message_text_x();
         float y = message_text_y();
         std::size_t source_cursor = 0;
@@ -916,18 +812,13 @@ void Game::draw_frame()
                 const auto glyph_bytes = utf8_prefix_bytes(
                     std::string_view(line).substr(glyph_offset), 1);
                 const auto source_offset = line_start + glyph_offset;
-                float glyph_alpha = 1.0f;
-                if (!text_fade_complete_
-                    && source_offset >= reveal_start) {
-                    const auto glyph_index = utf8_character_count(
-                        visible.substr(
-                            reveal_start,
-                            source_offset - reveal_start));
-                    glyph_alpha = std::clamp(
-                        reveal_position
-                            - static_cast<float>(glyph_index),
-                        0.0f, fade_width) / fade_width;
-                }
+                const auto glyph_index =
+                    utf8_character_count(visible.substr(0, source_offset));
+                float glyph_alpha = glyph_index < shown
+                    ? static_cast<float>(msg().glyph_alpha(glyph_index))
+                          / 256.0f
+                    : 0.0f;
+                glyph_alpha = std::clamp(glyph_alpha, 0.0f, 1.0f);
                 if (glyph_alpha > 0.0f) {
                     const auto glyph_end = glyph_offset + glyph_bytes;
                     const auto glyph = std::string_view(line).substr(

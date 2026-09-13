@@ -946,14 +946,18 @@ void Game::iterate()
 #endif
         return;
     }
+    // AVG_GetGameKey is the top of MAIN_SystemControl, which runs once per
+    // frame at sixty of them a second - so every edge it folds is seen by
+    // exactly one control pass.  On a faster display most frames have no
+    // sixtieth in them at all, and folding there would throw the edge away
+    // before AVG_ControlNovelMessage ever looked at it: a click would be
+    // dropped on two frames out of three at 144Hz.  So the fold happens with
+    // the control pass, and trg_ edges accumulate in KeyCond until then.
     const bool control_held =
         !config_open_ && !name_input_open_
         && ((SDL_GetModState() & SDL_KMOD_CTRL) != 0
             || touch_input_.skip_held()
             || gamepad_input_.ctrl_skip_held());
-    // Avg.msg_cut, the half of AVG_GetMesCut() that is the key rather than
-    // the toggle.  Effects collapse to nothing for either.
-    skip_held_ = control_held;
     if (movie_) {
         // Winmain.cpp stops a movie, it never speeds one up:
         //     if( AVG_KeySkip() || movPlayerFrm->bEnd ){
@@ -993,6 +997,16 @@ void Game::iterate()
     update_title();
     if (soak_) {
         control_steps_ = control_ticks_due();
+        if (control_steps_ > 0) {
+            get_game_key();
+        } else {
+            game_key_ = {};
+        }
+        control_system2();
+        for (int i = 0; i < control_steps_; ++i) {
+            msg().control_novel_message(game_key_);
+            msg().control_half_tone();
+        }
         update_avg_back(control_steps_);
         update_audio_decode();
         update_half_tone();
@@ -1062,6 +1076,25 @@ void Game::iterate()
     // for the whole pass, so the background, the half tone and the
     // characters all advance by the same number of sixtieths.
     control_steps_ = control_ticks_due();
+    if (control_steps_ > 0) {
+        get_game_key();
+    } else {
+        // No sixtieth has gone by.  The frame is still drawn, but nothing
+        // that counts advances and no edge is consumed.
+        game_key_ = {};
+    }
+    // AVG_System's chain, in its order:
+    //     AVG_ControlSystem2();
+    //     AVG_ControlNovelMessage();
+    //     AVG_ControlHalfTone();
+    //     AVG_ControlText();
+    //     AVG_ControlBack();
+    //     AVG_ControlChar();
+    control_system2();
+    for (int i = 0; i < control_steps_; ++i) {
+        msg().control_novel_message(game_key_);
+        msg().control_half_tone();
+    }
     update_avg_back(control_steps_);
     update_audio_decode();
     update_half_tone();

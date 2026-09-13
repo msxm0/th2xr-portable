@@ -138,44 +138,14 @@ void Game::update_playback_modes()
         auto_next_time_.reset();
         return;
     }
-    const auto now = std::chrono::steady_clock::now();
-    if (skip_mode_) {
-        if (now >= skip_next_time_) {
-            if (waiting_for_input_ && !config_.skip_unread
-                && !current_text_is_read()) {
-                skip_mode_ = false;
-                return;
-            }
-            skip(true);
-            skip_next_time_ = now + std::chrono::milliseconds(40);
-        }
-        return;
-    }
-    if (transition_ || back().br_flag || screen_flash_
-        || (back().sk_flag && back().sk_speed > 0)
-        || background_scroll_ || character_animation_active()
-        || clock_state_ || calendar_state_
-        || wake_time_ || audio_wait_) {
-        auto_next_time_.reset();
-        return;
-    }
-    if ((!auto_mode_ && !demo_mode_)
-        || !waiting_for_input_ || !text_reveal_complete_
-        || voice_playing()) {
-        auto_next_time_.reset();
-        return;
-    }
-    if (!auto_next_time_) {
-        const int delay = demo_mode_
-            ? std::max(0, demo_delay_frames_) * 1000 / 60
-            : th2::auto_delay_ms(
-                config_, current_text_is_read(),
-                message_.has_hidden_segments(), message_ends_block_);
-        auto_next_time_ = now + std::chrono::milliseconds(delay);
-    } else if (now >= *auto_next_time_) {
-        auto_next_time_.reset();
-        advance();
-    }
+    // Skipping and auto mode are both AVG_ControlNovelMessage's, and both
+    // are one line of it:
+    //     }else if( ( AVG_GetHitKey() ... ) || ( AVG_GetMesCut() )
+    //               || ... || AVG_WaitAutoMode() ){
+    // AVG_GetMesCut() reads Avg.msg_cut_mode, which AVG_ControlSystem2 has
+    // already set from the key, and AVG_WaitAutoMode counts its own frames
+    // against Avg.auto_key or Avg.auto_page.  There is nothing left to do
+    // here, and no timer of ours to keep in step with either of them.
 }
 
 float Game::choice_y_start() const
@@ -242,6 +212,70 @@ int Game::effect_frames4(int frames) const
         : frames == -2 ? 30
         : std::max(0, frames);
     return count * 2;  // Avg.frame / 30, and Avg.frame is 60
+}
+
+int Game::message_wait_setting() const
+{
+    // Avg.msg_wait is one of four settings; ours is milliseconds per
+    // character.  0 is instant in both.
+    if (config_.text_speed_ms <= 0) return 0;
+    if (config_.text_speed_ms <= 12) return 1;
+    if (config_.text_speed_ms <= 28) return 2;
+    return 3;
+}
+
+int Game::message_count_step() const
+{
+    // int AVG_MsgCnt( void ), verbatim:
+    //
+    //     if( AVG_GetMesCut() ) ret = 9999;
+    //     else switch(Avg.msg_wait){
+    //         case 0: ret = 9999;            break;
+    //         case 1: ret = 4*30/Avg.frame;  break;
+    //         case 2: ret = 2*30/Avg.frame;  break;
+    //         case 3: ret = 1*30/Avg.frame;  break;
+    //     }
+    //     if(ret==0) ret=1;
+    //
+    // Avg.frame is 60, so the divisions halve each rate.  Zero is "no
+    // typewriter at all", which is the fastest text setting rather than the
+    // slowest - and 9999 while skipping is what puts a whole line up at once.
+    if (message_cut()) {
+        return 9999;
+    }
+    int ret = 0;
+    switch (message_wait_setting()) {
+    default:
+    case 0: ret = 9999; break;
+    case 1: ret = 4 * 30 / 60; break;
+    case 2: ret = 2 * 30 / 60; break;
+    case 3: ret = 1 * 30 / 60; break;
+    }
+    if (ret == 0) {
+        ret = 1;
+    }
+    return ret;
+}
+
+int Game::effect_count_pulse() const
+{
+    // int AVG_EffCntPuls( void ), verbatim - the same shape as AVG_MsgCnt
+    // but keyed off Avg.wait, the effect speed, rather than Avg.msg_wait.
+    if (message_cut()) {
+        return 9999;
+    }
+    int ret = 0;
+    switch (std::clamp(config_.effect_speed, 0, 4)) {
+    default:
+    case 0: ret = 9999; break;
+    case 1: ret = 4 * 30 / 60; break;
+    case 2: ret = 2 * 30 / 60; break;
+    case 4: ret = 1 * 30 / 60; break;
+    }
+    if (ret == 0) {
+        ret = 1;
+    }
+    return ret;
 }
 
 int Game::effect_frames3(int frames) const
@@ -379,6 +413,61 @@ bool Game::finish_text_reveal()
     text_reveal_complete_ = true;
     text_fade_complete_ = true;
     return true;
+}
+
+void Game::get_game_key()
+{
+    // void AVG_GetGameKey(void).  The device state is SDL's rather than
+    // KeyCond's, but the fold is the original's: click and cansel are edges,
+    // mes_cut is a level, and a click always beats a held skip key.
+    const bool blocked = config_open_ || name_input_open_;
+    key_cond_.btn_ctrl = !blocked
+        && ((SDL_GetModState() & SDL_KMOD_CTRL) != 0
+            || touch_input_.skip_held()
+            || gamepad_input_.ctrl_skip_held());
+    key_cond_.btn_alt = (SDL_GetModState() & SDL_KMOD_ALT) != 0;
+    th2::get_game_key(game_key_, key_cond_, 0);
+    // The edges have now been consumed by exactly one control pass, so they
+    // are cleared - KEY_RenewKeybord does this at the top of
+    // MAIN_SystemControl, which in the original is every frame.
+    key_cond_.clear_triggers();
+}
+
+void Game::control_system2()
+{
+    // void AVG_ControlSystem2( void ), the part that matters:
+    //
+    //     Avg.msg_cut = GameKey.mes_cut;
+    //     if( GameKey.mes_cut_mode ){ Avg.msg_cut_mode = !Avg.msg_cut_mode; }
+    //     if( GameKey.cansel || GameKey.click || GameKey.diswin || ... ){
+    //         Avg.msg_cut = OFF; Avg.msg_cut_mode = OFF; }
+    //     if(GameKey.mes_cut){ Avg.msg_cut_mode = OFF; Avg.auto_flag=OFF; }
+    //     if( GameKey.cansel || GameKey.diswin || GameKey.pup ){
+    //         Avg.auto_flag=OFF; }
+    skip_held_ = game_key_.mes_cut != 0;
+    if (game_key_.mes_cut_mode) {
+        skip_mode_ = !skip_mode_;
+    }
+    if (game_key_.cansel || game_key_.click || game_key_.diswin
+        || game_key_.home || game_key_.end || game_key_.pdown
+        || game_key_.pup || demo_mode_) {
+        skip_held_ = false;
+        skip_mode_ = false;
+    }
+    if (game_key_.mes_cut) {
+        skip_mode_ = false;
+        auto_mode_ = false;
+    }
+    if (game_key_.cansel || game_key_.diswin || game_key_.pup) {
+        auto_mode_ = false;
+    }
+}
+
+void Game::play_system_se(int number, int volume)
+{
+    // AVG_PlaySE3( sno, volume ): the two sounds AVG_ControlNovelMessage
+    // makes - 9104 for a button and 9012 for the log.
+    play_se(0, number, false, volume);
 }
 
 void Game::skip(bool force_unread)
