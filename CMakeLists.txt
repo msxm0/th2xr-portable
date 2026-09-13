@@ -254,6 +254,12 @@ if(BUILD_TESTING AND NOT EMSCRIPTEN)
     target_link_libraries(th2-avg-char-test PRIVATE SDL3::SDL3)
     add_test(NAME character-machine COMMAND th2-avg-char-test)
 
+    add_executable(th2-text-count-test
+        src/text_count_test.cpp
+        src/text_count.cpp
+    )
+    add_test(NAME text-count COMMAND th2-text-count-test)
+
     add_executable(th2-lzs-test
         src/lzs_test.cpp
         src/image.cpp

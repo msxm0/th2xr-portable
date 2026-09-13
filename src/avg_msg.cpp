@@ -57,10 +57,21 @@ void AvgMsg::add_novel_message(const std::string& raw, int cr)
     // counters carry over, because the new text is appended to the same
     // window and the typewriter picks up where it stopped.
     //
+    //     wsprintf( buf2, "\\k%s", buf1 );
+    //     DSP_AddText( TXT_WINDOW, buf2 );
     //     NovelMessage.kstep++;
     //     NovelMessage.count = NovelMessage.max;
     //     NovelMessage.max = TXT_GetTextCount( ..., NovelMessage.kstep ) + 8;
-    raw_ = raw;
+    //
+    // The text object *accumulates*, with a \k in front of each addition, and
+    // every TXT_GetTextCount after this measures the whole of it.  Keeping
+    // only the latest chunk here left NovelMessage.count - which carries over
+    // - running off the end of the table: the line was cut short, the glyph
+    // alphas were read at the wrong indices so already-shown text faded in
+    // again, and the machine reached MSG_STOP early and put the click
+    // indicator up in the middle of nowhere.
+    raw_ += "\\k";
+    raw_ += raw;
     counted_ = txt_count_text(raw_);
     end_key_wait_ = txt_get_text_end_key_wait(raw_);
 

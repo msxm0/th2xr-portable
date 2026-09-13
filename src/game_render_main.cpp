@@ -215,7 +215,13 @@ void Game::draw_click_indicator()
     auto& tex = end_of_block ? ui_keywait_ : ui_pageend_;
     if (!tex) return;
 
-    const auto lines = display_lines(message_.visible());
+    // DSP_GetTextDispPos( TXT_WINDOW, &px, &py ): where the *next* character
+    // would be drawn, which is the end of what has actually been revealed -
+    // not the end of the string.  Taking it from the whole string left the
+    // indicator floating past the text whenever the two disagreed.
+    const auto revealed = utf8_prefix_bytes(
+        message_.visible(), msg().visible_glyphs());
+    const auto lines = display_lines(message_.visible().substr(0, revealed));
     if (lines.empty()) return;
 
     // Sits on the row the last line actually occupies, which is not the last
