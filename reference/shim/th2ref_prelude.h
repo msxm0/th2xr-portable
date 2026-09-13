@@ -37,4 +37,17 @@
 #define min(a,b) (((a) < (b)) ? (a) : (b))
 #endif
 
+/* The virtual clock.  mmsystem.h is pulled in first so its declaration of
+ * timeGetTime is parsed before the name becomes a macro - the same ordering
+ * problem as min/max above.  Every caller is redirected at once: there are
+ * four live clock sources in this engine (timeGetTime2, the TWait opcode's
+ * direct call, STD_timeGetTime behind GetTime/WaitTime, and GetLocalTime
+ * behind GetSystemTime) and patching them one at a time would miss some. */
+#ifdef TH2REF_TRACE
+#include <windows.h>
+#include <mmsystem.h>
+#include "th2ref_hooks.h"
+#define timeGetTime() th2ref_time()
+#endif
+
 #endif /* TH2REF_PRELUDE_H */

@@ -83,6 +83,19 @@ PATCHES = [
      "\tfor(int i=0;i<ArcFile[arcFileNum].fileCount;i++){",
      "\tint i;\n\tfor(i=0;i<ArcFile[arcFileNum].fileCount;i++){",
      "MSVC for-scope leak: i is used after the loop"),
+    # --- harness instrumentation (only these three touch behaviour) ---
+    # The virtual clock's tick.  MAIN_Loop is the engine's frame, so this is
+    # where a frame begins.
+    ("ScriptEngine/src/main.cpp",
+     "void MAIN_Loop( void )\r\n{\r\n\tstatic int\t\tFrameLimit  = 1000;",
+     "void MAIN_Loop( void )\r\n{\r\n#ifdef TH2REF_TRACE\r\n\tth2ref_advance_tick();\r\n#endif\r\n\tstatic int\t\tFrameLimit  = 1000;",
+     "virtual clock: advance one tick per MAIN_Loop"),
+    # The framebuffer, taken where MAIN_DrawGraph left it and before the
+    # DirectDraw blit - no window, no compositor, no scaling.
+    ("ScriptEngine/src/main.cpp",
+     "\tSendMessage( MainWindow.hwnd, WM_PAINT,0,0);",
+     "#ifdef TH2REF_TRACE\r\n\tth2ref_dump_frame( MainWindow.draw_mode2==32 ? (void*)&MainWindow.vram_true :\r\n\t                   MainWindow.draw_mode2==24 ? (void*)&MainWindow.vram_full :\r\n\t                   (void*)&MainWindow.vram_high, MainWindow.draw_mode2 );\r\n#endif\r\n\tSendMessage( MainWindow.hwnd, WM_PAINT,0,0);",
+     "framebuffer dump after MAIN_DrawGraph"),
     # A Windows path separator in an #include.
     ("ScriptEngine/src/Escript.cpp", r'#include "..\\mes\\escr.h"', '#include "escr.h"',
      "backslash include path"),

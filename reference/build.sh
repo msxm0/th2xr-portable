@@ -20,10 +20,10 @@ INC="-I$HERE/shim/include \
 # sign-extends its flag byte (`flags = *src2 | 0xff00` with signed char) and
 # every compressed file in the PAKs fails its size check.
 FLAGS="-m32 -O1 -w -fpermissive -fno-strict-aliasing -funsigned-char -std=gnu++17 \
- -include $HERE/shim/th2ref_prelude.h -DWIN32 -D_WIN32 -DNDEBUG"
+ -include $HERE/shim/th2ref_prelude.h -DWIN32 -D_WIN32 -DNDEBUG ${TH2REF_FLAGS:-}"
 
 # five files come from gen/ with the MSVC asm removed; the rest straight from the GPL tree
-DEASM="MM_std Draw24 DrawPrim24 Draw32 DrawPrim32 GM_Avg Winmain GM_Demo readFile Escript"
+DEASM="MM_std Draw24 DrawPrim24 Draw32 DrawPrim32 GM_Avg Winmain GM_Demo readFile Escript main"
 sources=()
 for f in "$G"/ToHeart2/my_inc2/*.cpp "$G"/ToHeart2/my_inc2/*.CPP "$G"/ToHeart2/ScriptEngine/src/*.cpp; do
     [ -e "$f" ] || continue

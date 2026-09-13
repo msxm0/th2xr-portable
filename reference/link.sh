@@ -3,6 +3,10 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 G="$HERE/../../aquaplus_gpl"
+# The hooks TU must NOT get the prelude: it is the one place that has to call
+# the real timeGetTime rather than the macro that replaces it.
+i686-w64-mingw32-g++ -c "$HERE/shim/th2ref_hooks.cpp" -o "$HERE/build/th2ref_hooks.o" \
+  -I"$HERE/shim" -m32 -w -funsigned-char -std=gnu++17 || exit 1
 i686-w64-mingw32-g++ -c "$HERE/shim/stubs.cpp" -o "$HERE/build/stubs.o" \
   -I"$HERE/shim/include" -I"$G/XViD/XVidDec" -I"$G/OGG/oggDec" \
   -I"$G/OGG/ogg/include" -I"$G/OGG/vorbis/include" \
