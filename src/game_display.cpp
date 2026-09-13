@@ -12,6 +12,7 @@ void Game::build_display()
 {
     display_.emplace(renderer_);
     avg_char_.emplace(*display_, character_hooks());
+    avg_back_.emplace(*display_, background_hooks());
 }
 
 bool Game::has_background() const
@@ -21,7 +22,7 @@ bool Game::has_background() const
 
 bool Game::transition_drives_graphs() const
 {
-    if (!transition_ || transition_->frames <= 0) {
+    if (!transition_ || !back().fd_flag) {
         return false;
     }
     // The types the scripts actually use, minus BAK_PATTERN which needs its
@@ -33,103 +34,35 @@ bool Game::transition_drives_graphs() const
 
 float Game::transition_progress() const
 {
-    if (!transition_ || transition_->frames <= 0) {
+    // AVG_ControlBackChange's `rate`:
+    //     int back_max = AVG_EffCnt(BackStruct.fd_max);
+    //     rate = 256*BackStruct.fd_cnt/back_max;
+    // recomputed from the raw fd_max on every pass rather than measured
+    // against a start time, which is what lets the skip key end a wipe that
+    // is already running - back_max goes to zero and fd_cnt is past it.
+    if (!transition_) {
         return 0.0f;
     }
-    const auto elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - transition_->started);
+    int back_max = effect_frames(back().fd_max);
+    if (back().fd_type == th2::bak_fade
+        && (back().r != th2::bright_neutral || back().g != th2::bright_neutral
+            || back().b != th2::bright_neutral)) {
+        back_max *= 2;
+    }
+    if (back_max <= 0) {
+        return 1.0f;
+    }
     return std::clamp(
-        static_cast<float>(elapsed.count() * 60.0 / transition_->frames),
+        static_cast<float>(back().fd_cnt) / static_cast<float>(back_max),
         0.0f, 1.0f);
 }
 
 void Game::control_back_change()
 {
-    // AVG_ControlBackChange, for the types that are only graph parameters.
-    // GRP_BACK+1 holds the outgoing snapshot at LAY_BACK and GRP_BACK the
-    // incoming background at LAY_BACK+1, so "the wipe" is what these calls
-    // do to the two of them between now and the end.
-    if (!transition_drives_graphs()) {
-        return;
-    }
-    const int back = th2::grp_back;
-    const int snap = th2::grp_back + 1;
-    const auto bld = [](int alpha) {
-        return th2::drw_bld
-            | (static_cast<std::uint32_t>(std::clamp(alpha, 0, 256)) << 16);
-    };
-    const int rate = std::clamp(
-        static_cast<int>(transition_progress() * 256.0f), 0, 256);
-    const int centre_x = th2::display_width / 2;
-    const int centre_y = th2::display_height / 2;
-
-    switch (transition_->type) {
-    case 1:  // BAK_CFADE
-        display().set_graph_param(back, bld(rate));
-        break;
-    case 11: {  // BAK_CFZOOM1
-        // Two rates: the first is the alpha, the second the zoom.  They
-        // agree only at the ends of the wipe.
-        const int faded = 256 - rate * rate / 256;
-        const int inverse = 256 - rate;
-        display().set_graph_param(back, bld(128 - faded / 2));
-        display().set_graph_zoom2(
-            back, centre_x, centre_y, inverse * inverse / 256);
-        break;
-    }
-    case 12: {  // BAK_CFZOOM2 - the snapshot is the one that zooms
-        const int inverse = 256 - rate;
-        const int eased = 256 - inverse * inverse / 256;
-        display().set_graph_param(back, bld(eased));
-        display().set_graph_zoom2(snap, centre_x, centre_y, eased * 2);
-        break;
-    }
-    case 13: {  // BAK_CFZOOM3 - the snapshot shrinks away and the incoming
-                // picture is left plain underneath it
-        const int inverse = 256 - rate;
-        const int eased = inverse * inverse / 256;
-        display().set_graph_param(snap, bld(eased));
-        display().set_graph_zoom2(snap, centre_x, centre_y, eased / 2 - 128);
-        break;
-    }
-    case 14: {  // BAK_CFZOOM4
-        const int inverse = 256 - rate;
-        display().set_graph_param(back, bld(32 - inverse / 8));
-        display().set_graph_zoom2(
-            back, centre_x, centre_y, -(inverse * inverse / 256) / 2);
-        break;
-    }
-    default: {  // BAK_SLIDE_UP / DO / RI / LE
-        const int inverse = 256 - rate;
-        const int x = th2::display_width
-            - th2::display_width * inverse * inverse / (256 * 256);
-        const int y = th2::display_height
-            - th2::display_height * inverse * inverse / (256 * 256);
-        display().set_graph_param(back, bld(rate));
-        display().set_graph_param(snap, bld(rate));
-        switch (transition_->type) {
-        case 16:
-            display().set_graph_move(back, 0, y - th2::display_height);
-            display().set_graph_move(snap, 0, y);
-            break;
-        case 17:
-            display().set_graph_move(back, 0, th2::display_height - y);
-            display().set_graph_move(snap, 0, -y);
-            break;
-        case 18:
-            display().set_graph_move(back, th2::display_width - x, 0);
-            display().set_graph_move(snap, -x, 0);
-            break;
-        default:  // 19
-            display().set_graph_move(back, x - th2::display_width, 0);
-            display().set_graph_move(snap, x, 0);
-            break;
-        }
-        break;
-    }
-    }
+    // Superseded by AVG_ControlBackChange in avg_back.cpp, which does every
+    // fd_type rather than the nine that were only graph parameters.
+    avgback().control_back_change();
 }
-
 void Game::setup_background_graphs(
     const ShakeSample& shake, bool shake_background, bool shake_characters)
 {
@@ -364,4 +297,38 @@ th2::AvgChar::Hooks Game::character_hooks()
     return hooks;
 }
 
+th2::AvgBack::Hooks Game::background_hooks()
+{
+    th2::AvgBack::Hooks hooks;
+    // AVG_EffCnt / AVG_EffCnt3 / AVG_EffCnt4.  These are the whole of
+    // skipping: AVG_GetMesCut() makes each of them return zero, so every
+    // counter in BackStruct is already past its max on the next pass.
+    hooks.eff_cnt = [this](int n) { return effect_frames(n); };
+    hooks.eff_cnt3 = [this](int n) { return effect_frames3(n); };
+    hooks.eff_cnt4 = [this](int n) { return effect_frames4(n); };
+    hooks.level = [this] { return config_.effect_speed != 0; };
+    hooks.half_tone = [this] {
+        return std::clamp(
+            config_.message_half_tone,
+            th2::GameConfig::min_message_half_tone,
+            th2::GameConfig::max_message_half_tone);
+    };
+    hooks.copy_back = [this](bool) { background_baked_dirty_ = true; };
+    hooks.set_back_char = [this](int x, int y, bool disp) {
+        background_baked_dirty_ = true;
+        chars().set_back_char(x, y, disp);
+    };
+    hooks.set_char_pos_shake = [this](int x, int y, int disp) {
+        chars().set_char_pos_shake(x, y, disp);
+    };
+    hooks.set_char_bright = [this](int r, int g, int b) {
+        chars().set_char_bright_all(r, g, b);
+    };
+    hooks.novel_message_disp = [this](bool on) { message_visible_ = on; };
+    hooks.reset_half_tone = [this] { reset_half_tone(); };
+    hooks.global_count = [this] { return global_count_; };
+    return hooks;
+}
+
 }  // namespace th2app
+

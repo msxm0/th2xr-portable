@@ -231,6 +231,45 @@ enum : std::uint32_t {
 // Directions for the pattern wipes.
 enum { dir_up = 0, dir_do = 1, dir_ri = 2, dir_le = 3, dir_ce = 4, dir_ou = 5 };
 
+// MM_std.h's trig.  SinTbl[256] is one turn scaled by 4096, and the engine's
+// COS(X) is SinTbl[X%256] - the sine - while SIN(X) is SinTbl[(X+64)%256].
+// The names are kept the wrong way round on purpose: a transcribed line says
+// COS(cnt2)*pich/4096 and has to keep meaning what it meant.
+int COS(int rate);
+int SIN(int rate);
+
+// MM_std.h's direction constants, used by every shake and slide.
+enum {
+    DIR_D = 0, DIR_DL = 1, DIR_L = 2, DIR_UL = 3,
+    DIR_U = 4, DIR_UR = 5, DIR_R = 6, DIR_DR = 7,
+};
+
+// Draw.h's DRW_ macros.  Each packs the mode in the low sixteen bits and a
+// parameter in the high sixteen, which is what DSP_SetGraphParam stores:
+//
+//     #define DRW_BLD(P)      (DRW_BLD2 | ((P)<<16))
+//     #define DRW_LCF(D,P)    ((DRW_LCF0+(D)) | ((P)<<16))
+//
+// so a transcribed line can keep saying DRW_BLD(rate).
+constexpr std::uint32_t drw_param(std::uint32_t mode, int parameter)
+{
+    return mode
+        | (static_cast<std::uint32_t>(parameter < 0 ? 0 : parameter) << 16);
+}
+constexpr std::uint32_t DRW_BLD(int p) { return drw_param(drw_bld, p); }
+constexpr std::uint32_t DRW_AMI(int p) { return drw_param(drw_ami, p); }
+constexpr std::uint32_t DRW_NIS(int p) { return drw_param(drw_nis, p); }
+constexpr std::uint32_t DRW_RPL(int p) { return drw_param(drw_rpl, p); }
+constexpr std::uint32_t DRW_LST(int p, int o) {
+    return drw_param(drw_lst, p) | (static_cast<std::uint32_t>(o & 0xff) << 8);
+}
+constexpr std::uint32_t DRW_LCF(int d, int p) { return drw_param(drw_lcf + d, p); }
+constexpr std::uint32_t DRW_LPP(int d, int p) { return drw_param(drw_lpp + d, p); }
+constexpr std::uint32_t DRW_DIA(int d, int p) { return drw_param(drw_dia + d, p); }
+constexpr std::uint32_t DRW_DIO(int d, int p) { return drw_param(drw_dio + d, p); }
+constexpr std::uint32_t DRW_ADD = drw_add;
+constexpr std::uint32_t DRW_NML = drw_nml;
+
 // The rate carried in the high half, as an alpha.  DRW_BLD means it
 // exactly; AMI's dither mesh and the LCF/LPP/DIA/DIO pattern wipes carry a
 // 0..256 rate in the same place and are approximated by it, since none of

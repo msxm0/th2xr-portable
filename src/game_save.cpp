@@ -34,7 +34,7 @@ namespace th2app {
 void Game::save(int slot)
 {
     if (replay_mode_ || wake_time_ || audio_wait_ || transition_
-        || background_fade_ || screen_flash_
+        || back().br_flag || screen_flash_
         || (shake_ && shake_->frames > 0)
         || background_scroll_ || character_animation_active()
         || clock_state_ || calendar_state_ || movie_) {

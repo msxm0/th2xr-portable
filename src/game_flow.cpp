@@ -151,8 +151,8 @@ void Game::update_playback_modes()
         }
         return;
     }
-    if (transition_ || background_fade_ || screen_flash_
-        || (shake_ && shake_->frames > 0)
+    if (transition_ || back().br_flag || screen_flash_
+        || (back().sk_flag && back().sk_speed > 0)
         || background_scroll_ || character_animation_active()
         || clock_state_ || calendar_state_
         || wake_time_ || audio_wait_) {
@@ -238,6 +238,17 @@ int Game::effect_frames4(int frames) const
     if (message_cut()) {
         return 0;
     }
+    const int count = frames == -1 ? 15
+        : frames == -2 ? 30
+        : std::max(0, frames);
+    return count * 2;  // Avg.frame / 30, and Avg.frame is 60
+}
+
+int Game::effect_frames3(int frames) const
+{
+    // AVG_EffCnt3( cnt ): 30fps units like AVG_EffCnt4, and the only one of
+    // the family that does not consult AVG_GetMesCut() - so an effect timed
+    // with it runs at full length even while the skip key is down.
     const int count = frames == -1 ? 15
         : frames == -2 ? 30
         : std::max(0, frames);

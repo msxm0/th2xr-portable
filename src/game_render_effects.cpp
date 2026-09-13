@@ -368,27 +368,25 @@ void Game::begin_transition(
         transition.mask_height = mask.height;
     }
     transition_ = std::move(transition);
+    // AVG_SetBack's tail: fd_flag on, fd_cnt zeroed, fd_max left as the raw
+    // number the script wrote so AVG_EffCnt can be re-asked every frame.
+    // The menu fades keep their own count, which is AVG_EffCnt4's.
+    back().fd_flag = 1;
+    back().fd_type = type;
+    back().fd_cnt = 0;
+    back().fd_max = timing == EffectTiming::menu ? frames : frames;
+    back().fd_vague = vague >= 0 ? vague : 128;
+    back().redraw = 1;
 }
 
 void Game::update_transition()
 {
-    if (!transition_) {
-        return;
-    }
-    const auto elapsed = std::chrono::steady_clock::now()
-        - transition_->started;
-    const auto duration = std::chrono::duration<double>(
-        static_cast<double>(transition_->frames) / 60.0);
-    // AVG_ControlBackChange recomputes AVG_EffCnt( BackStruct.fd_max ) every
-    // frame, so a skip key pressed mid-wipe takes its length to zero and it
-    // finishes on this pass rather than running on under the next line.
-    if (elapsed < duration && !message_cut()) {
-        return;
-    }
-    const bool resumes = transition_->resume_script;
-    transition_.reset();
-    if (resumes) {
-        // Nothing to resume: the parked instruction re-asks its own wait.
+    // AVG_ControlBackChange owns the counter now; all that is left here is
+    // letting go of the pixels the wipe borrowed once fd_flag has cleared.
+    // Nothing is resumed: the B instruction that started this is still the
+    // current instruction and re-asks AVG_WaitBack at the top of the frame.
+    if (transition_ && !back().fd_flag) {
+        transition_.reset();
     }
 }
 
@@ -825,61 +823,23 @@ void Game::begin_background_fade(int red, int green, int blue, int frames)
     // which is what keeps the darkened copy from being on screen while the
     // background's brightness is being driven out from under it - the copy
     // is of a plate at the old brightness and nothing would refresh it.
-    reset_half_tone();
-    message_visible_ = false;
-    const int effective_frames = effect_frames(frames);
-    background_fade_ = BackgroundFade{
-        background_brightness_,
-        {
-            static_cast<float>(std::clamp(red, 0, 256)),
-            static_cast<float>(std::clamp(green, 0, 256)),
-            static_cast<float>(std::clamp(blue, 0, 256)),
-        },
-        std::chrono::steady_clock::now(),
-        std::chrono::milliseconds(effective_frames * 1000 / 60),
-    };
+    avgback().set_back_fade(
+        std::clamp(red, 0, 256), std::clamp(green, 0, 256),
+        std::clamp(blue, 0, 256), frames);
 }
 
 void Game::update_background_fade()
 {
-    if (!background_fade_) {
-        return;
-    }
-    const auto elapsed = std::chrono::steady_clock::now()
-        - background_fade_->started;
-    const auto duration =
-        std::chrono::duration<float>(background_fade_->duration).count();
-    const float progress = duration > 0.0f
-        ? std::clamp(
-              std::chrono::duration<float>(elapsed).count() / duration,
-              0.0f, 1.0f)
-        : 1.0f;
-    for (std::size_t i = 0; i < background_brightness_.size(); ++i) {
-        background_brightness_[i] = background_fade_->from[i]
-            + (background_fade_->to[i] - background_fade_->from[i])
-                * progress;
-    }
-    // AVG_ControlBackFade sets the same brightness on GRP_BACK and on every
-    // script overlay:
-    //     for(i=GRP_SCRIPT;i<GRP_ENDING;i++)
-    //         DSP_SetGraphBright( i, rr, gg, bb );
-    // A fade to black that left the overlays lit would be very visible, and
-    // this stopped happening when they became graphs of their own - the
-    // fade used to be folded into each overlay's draw by hand.
-    for (int i = 0; i < th2::max_script_obj; ++i) {
-        display().set_graph_bright(
-            th2::grp_script + i,
-            static_cast<int>(background_brightness_[0]),
-            static_cast<int>(background_brightness_[1]),
-            static_cast<int>(background_brightness_[2]));
-    }
-    if (progress >= 1.0f || message_cut()) {
-        background_brightness_ = background_fade_->to;
-        background_fade_.reset();
-        // Nothing to resume: the parked instruction re-asks its own wait.
-    }
+    // AVG_ControlBackFade owns br_cnt and the rr/gg/bb interpolation, and
+    // sets the brightness on GRP_BACK and on every script overlay itself.
+    // What is left here is handing the result to the parts of the draw that
+    // are not graphs yet.
+    background_brightness_ = {
+        static_cast<float>(back().rr),
+        static_cast<float>(back().gg),
+        static_cast<float>(back().bb),
+    };
 }
-
 void Game::update_screen_flash()
 {
     if (!screen_flash_) {
@@ -914,37 +874,41 @@ float Game::screen_flash_alpha() const
         0.0f, 1.0f);
 }
 
+void Game::update_avg_back(int steps)
+{
+    // AVG_ControlBack, from AVG_System's chain:
+    //     AVG_ControlBackFade(); AVG_ControlBackChange();
+    //     AVG_ControlBackScroll(); AVG_ControlShake();
+    // Every one of them increments its own counter and re-asks AVG_EffCnt,
+    // so a step is a whole frame of the original and nothing measures
+    // itself against a clock.
+    for (int i = 0; i < steps; ++i) {
+        avgback().control_back();
+    }
+    update_transition();
+    update_background_fade();
+    update_background_scroll();
+}
+
 void Game::update_shake()
 {
-    if (!shake_ || shake_->frames == 0) {
-        return;
-    }
-    const auto elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - shake_->started).count();
-    if (elapsed * 60.0 >= shake_->frames || message_cut()) {
-        // AVG_StopShake: SetCharPosShake(0, 0, OFF) puts the characters
-        // back in the plate, which is the only thing that undoes cut_mode 2.
-        chars().set_char_pos_shake(0, 0, 0);
-        shake_.reset();
-        // Nothing to resume: the parked instruction re-asks its own wait.
-    }
+    // AVG_ControlShake owns sk_cnt and calls AVG_StopShake itself, which is
+    // where SetCharPosShake(0,0,OFF) puts the characters back in the plate.
 }
 
 Game::ShakeSample Game::shake_sample()
 {
     ShakeSample result;
-    if (!shake_) {
+    if (!back().sk_flag) {
         return result;
     }
-    // AVG_ControlShake() runs once per frame and increments sk_cnt before it
-    // does anything, so the first frame of a shake is count 1.
-    const float elapsed = static_cast<float>(
-        std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - shake_->started).count()
-        * 60.0);
-    const int count = std::max(1, static_cast<int>(elapsed) + 1);
-    const int span = shake_->frames;  // AVG_EffCnt4(sk_speed)
-    const int pitch = shake_->pitch;
+    // AVG_ControlShake() increments sk_cnt before it does anything, so the
+    // first frame of a shake is count 1.  The counter is BackStruct's now,
+    // stepped once per sixtieth by the AVG_Control* pass, so this samples
+    // the same integer the engine would be looking at.
+    const int count = std::max(1, back().sk_cnt);
+    const int span = effect_frames4(back().sk_speed);  // AVG_EffCnt4(sk_speed)
+    const int pitch = back().sk_pich;
 
     // COS(X) is SinTbl[X%256] and SIN(X) is SinTbl[(X+64)%256], so despite
     // the names the engine's COS is a sine - COS(0) is zero, not the peak.
@@ -976,7 +940,7 @@ Game::ShakeSample Game::shake_sample()
         return static_cast<double>(rate) * 360.0 / 256.0;
     };
 
-    const int type = shake_->type;
+    const int type = back().sk_type;
     bool translates = false;
     float amount = 0.0f;
 
@@ -990,7 +954,7 @@ Game::ShakeSample Game::shake_sample()
         // scaled by the wave.  Both branches of the original divide by the
         // same 4096; only the taper differs.
         amount = static_cast<float>(pitch)
-            * wave(count * shake_->swing / 8) * taper;
+            * wave(count * back().sk_swing / 8) * taper;
         translates = true;
         break;
     case 1:   // SHAKE_2TI
@@ -1006,13 +970,13 @@ Game::ShakeSample Game::shake_sample()
         // A fresh direction every frame, never the one just used, at full
         // pitch.  Advanced per frame rather than per call so a frame that
         // samples twice does not roll twice.
-        while (shake_->sampled_frame < count) {
+        while (back().sk_cnt2 < count) {
             int direction = std::rand() % 8;
-            while (direction == shake_->direction) {
+            while (direction == back().sk_dir) {
                 direction = std::rand() % 8;
             }
-            shake_->direction = direction;
-            ++shake_->sampled_frame;
+            back().sk_dir = direction;
+            ++back().sk_cnt2;
         }
         amount = static_cast<float>(pitch);
         translates = true;
@@ -1042,7 +1006,7 @@ Game::ShakeSample Game::shake_sample()
         const float eased = 256.0f - linear * linear / 256.0f;
         float rate = std::fmod(eased * static_cast<float>(pitch) / 2.0f,
                                256.0f);
-        if ((shake_->direction % 2) == 0) {
+        if ((back().sk_dir % 2) == 0) {
             rate = 256.0f - rate;
         }
         result.roll_rate = static_cast<int>(rate);
@@ -1051,7 +1015,7 @@ Game::ShakeSample Game::shake_sample()
     }
     case 13: {  // SHAKE_ROLL_SIN
         const float rate =
-            -wave(count * shake_->swing / 8) * static_cast<float>(pitch)
+            -wave(count * back().sk_swing / 8) * static_cast<float>(pitch)
             * taper;
         // (256+y)%256 - the rate wraps into a turn rather than going
         // negative, which is what DSP_SetGraphRoll indexes the table with.
@@ -1077,7 +1041,7 @@ Game::ShakeSample Game::shake_sample()
     if (translates) {
         // DIR_D 0, DIR_DL 1, DIR_L 2, DIR_UL 3, DIR_U 4, DIR_UR 5, DIR_R 6,
         // DIR_DR 7.
-        const int dir = shake_->direction;
+        const int dir = back().sk_dir;
         const bool left = dir == 1 || dir == 2 || dir == 3;
         const bool right = dir == 5 || dir == 6 || dir == 7;
         const bool up = dir == 3 || dir == 4 || dir == 5;
@@ -1095,11 +1059,11 @@ Game::BackgroundView Game::current_background_view() const
     if (!background_scroll_) {
         return background_view_;
     }
+    // AVG_ControlBackScroll's cnt/max, with AVG_EffCnt4 re-asked here the
+    // same way it is re-asked there.
+    const int back_max = std::max(1, effect_frames4(back().sc_max));
     const float raw = std::clamp(
-        static_cast<float>(std::chrono::duration<double>(
-            std::chrono::steady_clock::now()
-            - background_scroll_->started).count()
-            * 60.0 / background_scroll_->frames),
+        static_cast<float>(back().sc_cnt) / static_cast<float>(back_max),
         0.0f, 1.0f);
     const float progress = background_scroll_->easing == 1
         ? raw * raw
@@ -1147,10 +1111,10 @@ void Game::update_background_scroll()
     if (!background_scroll_) {
         return;
     }
-    const auto elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now()
-        - background_scroll_->started).count();
-    if (elapsed * 60.0 >= background_scroll_->frames || message_cut()) {
+    // AVG_ControlBackScroll owns sc_cnt and runs AVG_CopyBack(ON) and
+    // AVG_SetBackChar at the end itself; this lets go of the view the draw
+    // interpolates once sc_flag has cleared.
+    if (!back().sc_flag) {
         background_view_ = background_scroll_->to;
         background_scroll_.reset();
         // AVG_ControlBackScroll ends with

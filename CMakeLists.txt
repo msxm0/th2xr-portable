@@ -244,6 +244,10 @@ if(BUILD_TESTING AND NOT EMSCRIPTEN)
     add_executable(th2-avg-char-test
         src/avg_char_test.cpp
         src/avg_char.cpp
+        src/avg_msg.cpp
+        src/avg_back.cpp
+        src/avg_key.cpp
+        src/text_count.cpp
         src/dsp.cpp
         src/texture.cpp
     )
@@ -347,6 +351,10 @@ if(ANDROID)
         src/texture.cpp
         src/dsp.cpp
         src/avg_char.cpp
+        src/avg_msg.cpp
+        src/avg_back.cpp
+        src/avg_key.cpp
+        src/text_count.cpp
         src/game_display.cpp
         src/script_wait.cpp
         src/game_title_draw.cpp
@@ -384,6 +392,10 @@ else()
         src/texture.cpp
         src/dsp.cpp
         src/avg_char.cpp
+        src/avg_msg.cpp
+        src/avg_back.cpp
+        src/avg_key.cpp
+        src/text_count.cpp
         src/game_display.cpp
         src/script_wait.cpp
         src/game_title_draw.cpp

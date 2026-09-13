@@ -92,6 +92,16 @@ bool clip_source(const Bitmap& bitmap, SDL_FRect& source, SDL_FRect& destination
 
 }  // namespace
 
+int COS(int rate)
+{
+    return engine_cos(rate);
+}
+
+int SIN(int rate)
+{
+    return engine_sin(rate);
+}
+
 int draw_alpha_of(std::uint32_t param)
 {
     const std::uint32_t mode = draw_mode_of(param);

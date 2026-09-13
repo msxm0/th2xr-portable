@@ -158,18 +158,15 @@ bool Game::handle(const th2::Event& event)
             && number(event, 2) != 0) {
             message_visible_ = false;
         }
-        shake_ = ShakeState{
-            number(event, 0),
-            number(event, 1),
-            // AVG_EffCnt4: the script's count is in 30fps units.  Zero still
-            // means an endless shake, which AVG_ControlShake never retires.
-            std::max(0, number(event, 2)) * 2,
+        // BOOL AVG_SetShake( type, pich, speed, dir, swing ).  The speed
+        // stays the raw number the script wrote; AVG_EffCnt4 is re-asked on
+        // every pass of AVG_ControlShake, so zero is an endless shake and a
+        // held skip key ends any of them on the next pass.
+        avgback().set_shake(
+            number(event, 0), number(event, 1), std::max(0, number(event, 2)),
             number(event, 3),
             event.arguments.size() > 4 && number(event, 4) >= 0
-                ? number(event, 4) : 256,
-            0,
-            std::chrono::steady_clock::now(),
-        };
+                ? number(event, 4) : 256);
     } else if (name == "S") {
         begin_background_scroll(
             number(event, 0), number(event, 1), 800.0f, 600.0f,
@@ -774,19 +771,19 @@ bool Game::opcode_waiting(WaitKind kind, const th2::Event& event) const
             || message_.has_hidden_segments();
     case WaitKind::back:
         // !AVG_WaitBack(): BackStruct.fd_flag, the background change.
-        return transition_.has_value();
+        return avgback().wait_back();
     case WaitKind::fade:
         // !AVG_WaitFade(): FadeStruct.flag, the screen flash.
         return screen_flash_.has_value();
     case WaitKind::back_fade:
         // !AVG_WaitBackFade(): BackStruct.br_flag.
-        return background_fade_.has_value();
+        return avgback().wait_back_fade();
     case WaitKind::shake:
         // !AVG_WaitShake(): sk_speed and sk_flag both non-zero.
-        return shake_ && shake_->frames > 0;
+        return avgback().wait_shake();
     case WaitKind::back_scroll:
         // !AVG_WaitBackScroll(): BackStruct.sc_flag.
-        return background_scroll_.has_value();
+        return avgback().wait_back_scroll();
     case WaitKind::key:
         // AVG_WaitKey(): AVG_GetHitKey() || AVG_GetMesCut() || Avg.demo.
         return waiting_for_input_ && !message_cut() && !demo_mode_;
@@ -808,9 +805,9 @@ bool Game::opcode_waiting(WaitKind kind, const th2::Event& event) const
 
 void Game::advance(bool skipping)
 {
-    if (wake_time_ || audio_wait_ || transition_ || background_fade_
+    if (wake_time_ || audio_wait_ || transition_ || back().br_flag
         || screen_flash_
-        || (shake_ && shake_->frames > 0)
+        || (back().sk_flag && back().sk_speed > 0)
         || background_scroll_ || character_animation_active()
         || clock_state_ || calendar_state_
         || movie_) {

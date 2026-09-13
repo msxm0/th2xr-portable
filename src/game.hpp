@@ -9,6 +9,7 @@
 #include "image.hpp"
 #include "texture.hpp"
 #include "dsp.hpp"
+#include "avg_back.hpp"
 #include "avg_char.hpp"
 #include "gl_transition.hpp"
 #include "gamepad_input.hpp"
@@ -398,13 +399,30 @@ private:
     // Both need the renderer, so they are built in the constructor body.
     std::optional<th2::Display> display_;
     std::optional<th2::AvgChar> avg_char_;
+    // BackStruct and the AVG_ControlBack* chain.  Every background effect
+    // counts in whole frames here, and AVG_EffCnt is re-asked on each pass,
+    // which is what lets the skip key collapse one mid-flight.
+    std::optional<th2::AvgBack> avg_back_;
     th2::Display& display() { return *display_; }
     const th2::Display& display() const { return *display_; }
     th2::AvgChar& chars() { return *avg_char_; }
     const th2::AvgChar& chars() const { return *avg_char_; }
+    th2::AvgBack& avgback() { return *avg_back_; }
+    const th2::AvgBack& avgback() const { return *avg_back_; }
+    th2::BackStruct& back() { return avg_back_->back(); }
+    const th2::BackStruct& back() const { return avg_back_->back(); }
     void build_display();
     // AVG_ControlChar's view of BackStruct, and the calls it makes outward.
     th2::AvgChar::Hooks character_hooks();
+    th2::AvgBack::Hooks background_hooks();
+    // AVG_ControlChar runs at sixty frames a second in the original and
+    // counts in whole ones.  On a faster display the AVG_Control* pass has
+    // to be stepped by elapsed time instead, and this is the accumulator
+    // that does it for the whole chain rather than for characters alone.
+    int control_ticks_due();
+    // AVG_ControlBack, stepped the same number of sixtieths as the rest of
+    // the chain.
+    void update_avg_back(int steps);
     // Points BMP_BACK / BMP_BACK2 at the plates the game still owns, so a
     // character can bake into them before the background is a graph itself.
     // AVG_SetBackPos and the cases of AVG_ControlShake that transform
@@ -971,6 +989,13 @@ private:
     // The predicate itself: true while the instruction must stay put.
     bool opcode_waiting(WaitKind kind, const th2::Event& event) const;
     int effect_frames(int frames) const;
+    // AVG_EffCnt3: 30fps units, and the one that ignores the skip key.
+    int effect_frames3(int frames) const;
+    // GlobalCount / GlobalCount2: free-running frame counters the engine
+    // phases the laster wipe and the click indicator off.  Stepped once per
+    // sixtieth in the AVG_Control* pass, like everything else.
+    int global_count_ = 0;
+    int control_steps_ = 0;
     // AVG_EffCnt4: the same count in 30fps units, unscaled by the effect
     // speed, and nothing at all while skipping.
     int effect_frames4(int frames) const;
@@ -1051,7 +1076,7 @@ private:
     bool half_tone_copy_stale_ = false;
     double character_control_debt_ = 0.0;
     std::chrono::steady_clock::time_point character_control_time_{};
-    void update_character_animations();
+    void update_character_animations(int steps);
     void play_se(int channel, int sound, bool loop, int volume, int fade = 0,
                  bool wait_for_completion = false);
     void sync_game_flags();

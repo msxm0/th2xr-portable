@@ -679,27 +679,27 @@ void Game::draw_frame()
     // SHAKE_SIN_SET shares its case with SHAKE_SIN and so belongs here too -
     // it was in the character list but not this one, which left it moving
     // the characters while the background stood still.
-    const bool shake_background = shake_
-        && (shake_->type == 0 || shake_->type == 1
-            || shake_->type == 2 || shake_->type == 9
-            || shake_->type == 12 || shake_->type == 13
-            || shake_->type == 14 || shake_->type == 15);
+    const bool shake_background = back().sk_flag
+        && (back().sk_type == 0 || back().sk_type == 1
+            || back().sk_type == 2 || back().sk_type == 9
+            || back().sk_type == 12 || back().sk_type == 13
+            || back().sk_type == 14 || back().sk_type == 15);
     // GRP_WORK: the cases that slide or roll the background park a black
     // PRM_FLAT rectangle at layer 0, below LAY_BACK, so the strip the
     // transform uncovers comes out black instead of showing the frame
     // before it.  SHAKE_ZOOM, SHAKE_ROLL_SIN and SHAKE_ROLL_2TI do not -
     // those three genuinely keep the previous frame in the corners.
-    const bool shake_work_rect = shake_
-        && (shake_->type == 0 || shake_->type == 1
-            || shake_->type == 9 || shake_->type == 12
-            || shake_->type == 15);
+    const bool shake_work_rect = back().sk_flag
+        && (back().sk_type == 0 || back().sk_type == 1
+            || back().sk_type == 9 || back().sk_type == 12
+            || back().sk_type == 15);
     // SetCharPosShake(x, y, ON) - only the SIN cases call it - sets
     // cut_mode 2, taking the characters out of the bitmap and moving them
     // itself, while GRP_BACK swaps to BMP_BACK2, the plate without them.
     // Every other shake leaves them baked, so they travel with the
     // background's source offset for free and nothing needs saying.
-    const bool shake_characters = shake_
-        && (shake_->type == 0 || shake_->type == 15);
+    const bool shake_characters = back().sk_flag
+        && (back().sk_type == 0 || back().sk_type == 15);
     if (shake_characters) {
         chars().set_char_pos_shake(
             static_cast<int>(shake.x), static_cast<int>(shake.y), 1);
@@ -707,15 +707,12 @@ void Game::draw_frame()
     if (background_baked_dirty_) {
         rebuild_baked_background();
     }
-    const bool shake_art = shake_
-        && (shake_->type == 6 || shake_->type == 7
-            || shake_->type == 11 || shake_->type == 16);
-    if (shake_art) {
-        ensure_shake_target();
-        SDL_SetRenderTarget(renderer_, shake_target_.get());
-    } else {
-        SDL_SetRenderTarget(renderer_, art_target);
-    }
+    // SHAKE_ALL_* is DSP_SetGraphGlobalPos( x, y ) in AVG_ControlShake and
+    // nothing else: DSP_DrawGraph shifts every graph by the global offset
+    // and paints the four black bands it pulls away from.  AvgBack sets it,
+    // Display honours it, and the separate compositing target this used to
+    // need is gone with them.
+    SDL_SetRenderTarget(renderer_, art_target);
     // The engine never clears: DSP_DrawGraph composites straight over the
     // framebuffer it drew last time, and GetGraph only restores a saved
     // image when DSP_GetDispBmp has armed it.  So whatever a transform
@@ -816,7 +813,7 @@ void Game::draw_frame()
     // characters and overlays of the new moment draw over it rather than
     // fading in with it.
     display().draw(
-        shake_art ? shake_target_.get() : art_target,
+        art_target,
         [this](int layer) {
             // The wipes the display layer can express are already on screen
             // by now - the snapshot is a graph at LAY_BACK and the incoming
@@ -832,44 +829,6 @@ void Game::draw_frame()
     } else if (ui_mode_ == UiMode::save || ui_mode_ == UiMode::load) {
         draw_save_load();
     }
-    if (shake_art) {
-        SDL_SetRenderTarget(renderer_, art_target);
-        SDL_FRect destination{
-            shake.x + 400.0f * (1.0f - shake.scale),
-            shake.y + 300.0f * (1.0f - shake.scale),
-            800.0f * shake.scale, 600.0f * shake.scale};
-        SDL_RenderTextureRotated(
-            renderer_, shake_target_.get(), nullptr, &destination,
-            shake.angle, nullptr, SDL_FLIP_NONE);
-        // DSP_SetGraphGlobalPos shifts the whole composited screen, and
-        // DSP_DrawGraph fills the strip it pulls away from with four black
-        // rectangles - written with signed widths so the same four calls
-        // cover an offset in any direction, two of them collapsing to
-        // nothing each time:
-        //
-        //   (0, 0, x, DISP_Y)            (x, 0, DISP_X-x, y)
-        //   (DISP_X+x, y, -x, DISP_Y-y)  (x, DISP_Y+y, DISP_X-x, -y)
-        const float x = shake.x;
-        const float y = shake.y;
-        // DISP_X and DISP_Y, taken from the target rather than assumed.
-        float span_x = 800.0f;
-        float span_y = 600.0f;
-        SDL_GetTextureSize(art_target, &span_x, &span_y);
-        const std::array<SDL_FRect, 4> bands{{
-            {0.0f, 0.0f, x, span_y},
-            {x, 0.0f, span_x - x, y},
-            {span_x + x, y, -x, span_y - y},
-            {x, span_y + y, span_x - x, -y},
-        }};
-        SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
-        SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
-        for (const auto& band : bands) {
-            // A negative extent draws nothing, as it does in the original.
-            if (band.w > 0.0f && band.h > 0.0f) {
-                SDL_RenderFillRect(renderer_, &band);
-            }
-        }
-    }
     begin_overlay();
     if (clock_state_ || calendar_state_) {
         draw_clock_calendar();
@@ -878,7 +837,7 @@ void Game::draw_frame()
         present_frame();
         return;
     }
-    if (shake_ && (shake.text_only || shake.includes_text)) {
+    if (back().sk_flag && (shake.text_only || shake.includes_text)) {
         const SDL_Rect viewport{
             static_cast<int>(shake.x), static_cast<int>(shake.y),
             800, 600};

@@ -761,7 +761,7 @@ void Game::iterate()
             }
             continue;
         }
-        if (transition_ || background_fade_) {
+        if (transition_ || back().br_flag) {
             continue;
         }
 
@@ -992,14 +992,12 @@ void Game::iterate()
     update_playback_modes();
     update_title();
     if (soak_) {
-        update_transition();
-        update_background_fade();
+        control_steps_ = control_ticks_due();
+        update_avg_back(control_steps_);
         update_audio_decode();
         update_half_tone();
         update_screen_flash();
-        update_shake();
-        update_background_scroll();
-        update_character_animations();
+        update_character_animations(control_steps_);
         update_clock_calendar();
         update_sakura();
         retire_soak_gpu_work();
@@ -1060,14 +1058,15 @@ void Game::iterate()
         config_.font_size, framebuffer_scale);
     draw_config();
     draw_name_input();
-    update_transition();
-    update_background_fade();
+    // MAIN_GameControl: AVG_System's chain, in its order.  One tick count
+    // for the whole pass, so the background, the half tone and the
+    // characters all advance by the same number of sixtieths.
+    control_steps_ = control_ticks_due();
+    update_avg_back(control_steps_);
     update_audio_decode();
     update_half_tone();
     update_screen_flash();
-    update_shake();
-    update_background_scroll();
-    update_character_animations();
+    update_character_animations(control_steps_);
     update_clock_calendar();
     update_sakura();
     // main.cpp runs EXEC_ControlLang, then MAIN_GameControl - the AVG_

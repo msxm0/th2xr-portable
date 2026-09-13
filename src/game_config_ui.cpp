@@ -79,7 +79,7 @@ void Game::return_to_title()
     wake_time_.reset();
     audio_wait_.reset();
     transition_.reset();
-    background_fade_.reset();
+    back().br_flag = 0;
     bgm_.stop();
     for (auto& channel : transient_se_) channel.stop();
     for (auto& channel : se_channels_) channel.stop();

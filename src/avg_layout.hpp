@@ -63,5 +63,9 @@ inline constexpr int grp_save = grp_select + 10;            // 153
 inline constexpr int grp_weather = grp_save + 70;           // 223
 inline constexpr int grp_work = grp_weather + 200;          // 423
 inline constexpr int grp_script = grp_work + 100;           // 523
+// GRP_ENDING = GRP_SCRIPT + MAX_SCRIPT_OBJ.  AVG_ControlBackFade walks
+// GRP_SCRIPT..GRP_ENDING so the overlays darken with the background.
+inline constexpr int grp_ending = grp_script + max_script_obj;   // 555
+inline constexpr int grp_map = grp_ending + 20;                  // 575
 
 }  // namespace th2

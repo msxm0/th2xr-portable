@@ -135,7 +135,7 @@ void Game::reset_play_state()
     wake_time_.reset();
     audio_wait_.reset();
     transition_.reset();
-    background_fade_.reset();
+    back().br_flag = 0;
     screen_flash_.reset();
     shake_.reset();
     clock_state_.reset();

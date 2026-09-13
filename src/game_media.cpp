@@ -46,11 +46,17 @@ void Game::begin_background_scroll(
     background_scroll_ = BackgroundScroll{
         current_background_view(),
         {x, y, width, height},
-        std::max(1, effect_frames4(frames)),
+        frames,
         type % 3,
         type / 3 == 1,
         std::chrono::steady_clock::now(),
     };
+    // void AVG_SetBackScroll( x, y, w, h, frame, type ): sc_max keeps the
+    // raw frame count, so AVG_EffCnt4 is re-asked on every pass of
+    // AVG_ControlBackScroll and the skip key ends a pan already running.
+    avgback().set_back_scroll(
+        static_cast<int>(x), static_cast<int>(y),
+        static_cast<int>(width), static_cast<int>(height), frames, type);
 }
 
 void Game::reload_character_textures()
@@ -151,16 +157,14 @@ bool Game::character_animation_active() const
     return avg_char_ && chars().any_animating();
 }
 
-void Game::update_character_animations()
+int Game::control_ticks_due()
 {
-    // AVG_ControlChar, run between the script and the draw.  It advances
-    // every character's counters, bakes the settled ones into BMP_BACK, and
-    // closes and reopens the message window around an animation.
-    //
-    // The original calls it once a frame at sixty frames a second and counts
-    // in whole frames, so on a faster display it has to be stepped by
-    // elapsed time instead - otherwise every character animation runs at the
-    // refresh rate rather than at the speed the script asked for.
+    // MAIN_GameControl runs the AVG_Control* chain once a frame at sixty
+    // frames a second, and every counter in it - CharStruct.cnt,
+    // BackStruct.fd_cnt, HalfTone.tcount - is a whole number of those.  On a
+    // display that refreshes faster the chain has to be stepped by elapsed
+    // time instead, or every animation runs at the refresh rate rather than
+    // at the speed the script asked for.
     const auto now = std::chrono::steady_clock::now();
     if (character_control_time_ == std::chrono::steady_clock::time_point{}) {
         character_control_time_ = now;
@@ -172,6 +176,20 @@ void Game::update_character_animations()
     character_control_debt_ = std::min(character_control_debt_, 8.0);
     const int steps = static_cast<int>(character_control_debt_);
     character_control_debt_ -= steps;
+    global_count_ += steps;
+    return steps;
+}
+
+void Game::update_character_animations(int steps)
+{
+    // AVG_ControlChar, run between the script and the draw.  It advances
+    // every character's counters, bakes the settled ones into BMP_BACK, and
+    // closes and reopens the message window around an animation.
+    //
+    // The original calls it once a frame at sixty frames a second and counts
+    // in whole frames, so on a faster display it has to be stepped by
+    // elapsed time instead - otherwise every character animation runs at the
+    // refresh rate rather than at the speed the script asked for.
     const bool was_animating = character_animation_active();
     if (steps <= 0) {
         // No sixtieth has gone by, but the frame is about to be drawn and
