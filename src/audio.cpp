@@ -687,7 +687,7 @@ void AudioChannel::play(AudioClip clip, bool loop, float gain)
     if (!SDL_SetAudioStreamGain(stream_, std::clamp(gain, 0.0f, 1.0f))) {
         throw std::runtime_error(SDL_GetError());
     }
-    playback_end_ = std::chrono::steady_clock::now();
+    playback_end_ = now();
     queue();
     if (!SDL_ResumeAudioStreamDevice(stream_)) {
         throw std::runtime_error(SDL_GetError());
@@ -721,7 +721,7 @@ void AudioChannel::play_streaming(
     if (!SDL_SetAudioStreamGain(stream_, std::clamp(gain, 0.0f, 1.0f))) {
         throw std::runtime_error(SDL_GetError());
     }
-    playback_end_ = std::chrono::steady_clock::now();
+    playback_end_ = now();
     queue();
     if (!SDL_ResumeAudioStreamDevice(stream_)) {
         throw std::runtime_error(SDL_GetError());
@@ -821,12 +821,12 @@ void AudioChannel::pause(bool paused)
     if (paused) {
         SDL_PauseAudioStreamDevice(stream_);
         if (!paused_at_) {
-            paused_at_ = std::chrono::steady_clock::now();
+            paused_at_ = now();
         }
     } else {
         SDL_ResumeAudioStreamDevice(stream_);
         if (paused_at_) {
-            playback_end_ += std::chrono::steady_clock::now() - *paused_at_;
+            playback_end_ += now() - *paused_at_;
             paused_at_.reset();
         }
     }
@@ -840,6 +840,25 @@ void AudioChannel::set_gain(float gain)
     if (stream_) {
         SDL_SetAudioStreamGain(stream_, gain_);
     }
+}
+
+namespace {
+
+// Null until a trace run points it at the engine clock; see
+// AudioChannel::set_clock.
+std::function<std::chrono::steady_clock::time_point()> g_audio_clock;
+
+}  // namespace
+
+void AudioChannel::set_clock(
+    std::function<std::chrono::steady_clock::time_point()> clock)
+{
+    g_audio_clock = std::move(clock);
+}
+
+std::chrono::steady_clock::time_point AudioChannel::now()
+{
+    return g_audio_clock ? g_audio_clock() : std::chrono::steady_clock::now();
 }
 
 void AudioChannel::fade_to(
@@ -857,7 +876,7 @@ void AudioChannel::fade_to(
     fade_to_ = std::clamp(gain, 0.0f, 1.0f);
     fade_stop_ = stop_after;
     fade_duration_ = duration;
-    fade_started_ = std::chrono::steady_clock::now();
+    fade_started_ = now();
 }
 
 void AudioChannel::finish_fade()
@@ -879,7 +898,7 @@ void AudioChannel::finish_fade()
 void AudioChannel::update()
 {
     if (stream_ && fade_started_) {
-        const auto elapsed = std::chrono::steady_clock::now() - *fade_started_;
+        const auto elapsed = now() - *fade_started_;
         const float progress = std::clamp(
             std::chrono::duration<float>(elapsed).count()
                 / std::chrono::duration<float>(fade_duration_).count(),
@@ -906,7 +925,10 @@ void AudioChannel::update()
     if (source_ && !source_->done()) {
         return;
     }
-    if (std::chrono::steady_clock::now() < playback_end_) {
+    // now(), not the wall clock: playback_end_ is set from the same source,
+    // and comparing a time from one clock against a deadline from another is
+    // not a smaller error than either clock's - it is nonsense.
+    if (now() < playback_end_) {
         return;
     }
     if (loop_source_) {
@@ -949,8 +971,8 @@ void AudioChannel::advance_playback_end(std::size_t samples)
         ? std::chrono::duration<double>(
               static_cast<double>(frames) / clip.sample_rate)
         : std::chrono::duration<double>::zero();
-    const auto now = std::chrono::steady_clock::now();
-    const auto base = playback_end_ > now ? playback_end_ : now;
+    const auto at = now();
+    const auto base = playback_end_ > at ? playback_end_ : at;
     playback_end_ = base
         + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             duration);

@@ -20,16 +20,30 @@
 //     ordering without the glyphs going through here.
 //   - Sprites, movies, AVI and Dmoji, which already have their own paths.
 
+#include "gl_blend.hpp"
 #include "texture.hpp"
 
 #include <SDL3/SDL.h>
 
 #include <array>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 
 namespace th2 {
+
+// Set for a single tick (TH2_DEBUG_TICK=N) to have the draw paths report
+// themselves: which graph, which blend mode, where it landed, and whether
+// the exact-blend path took it.  Off otherwise and costs a branch.
+//
+// This is how you find out which code path owns a region of the screen.
+// Three separate fixes were aimed at tick 469 on the assumption that its
+// disagreement was a blend, and all three measured as exact no-ops; one run
+// of this said the tick is three opaque full-screen copies and the blend was
+// never involved.
+extern bool debug_draws;
 
 using th2app::Texture;
 
@@ -162,6 +176,14 @@ struct GraphGeometry {
     // same picture is added over itself by this much, which keeps the
     // object's own shape where a white rectangle would not.
     Uint8 brighten = 0;
+    // The same brightness before it is squeezed into a modulation, on the
+    // rasteriser's own scale where 128 is neutral and 255 is white.  That is
+    // what BrightTable is indexed by, so the exact-blend shader wants this
+    // rather than `red`/`brighten`, which are the two halves SDL needs to
+    // approximate it with.
+    int bright_r = bright_neutral;
+    int bright_g = bright_neutral;
+    int bright_b = bright_neutral;
     bool flip_x = false;
     bool flip_y = false;
 };
@@ -285,6 +307,24 @@ SDL_BlendMode blend_of(std::uint32_t param);
 class Display {
 public:
     explicit Display(SDL_Renderer* renderer) : renderer_(renderer) {}
+
+    // Composite with the engine's integer arithmetic rather than SDL's.
+    //
+    // Draw32.cpp truncates both halves of a blend at /256 through
+    // BlendTable; SDL's blend rounds at /255, which is never darker and so
+    // put every blended pixel up to two levels above the reference - a fade
+    // disagreed on the whole screen at once.  This loads a shader that takes
+    // the source half back into integer arithmetic.  Safe to call when the
+    // shader is missing: the exact path simply stays off.  Returns whether
+    // it is on.
+    bool enable_exact_blend(const std::filesystem::path& shader_dir);
+    bool exact_blend_active() const;
+    // The GLES blend, for callers that composite their own layers - the
+    // glyph masks in font.cpp.  Null when it is not available.
+    GlExactBlend* gl_exact_blend() const;
+    // DRW_DrawPOLY4_TT's per-line spans for a quad; see dsp.cpp.
+    std::vector<int> poly4_rows(const int corners[4][2],
+                                const int sources[4][2]) const;
 
     // Called for each text slot as its layer comes round in draw(), so the
     // overlay pass can reproduce the ordering without the glyphs being
@@ -429,6 +469,15 @@ private:
     Texture blend_target_;
     int capture_bno_ = -1;   // GetBackNo
     bool capture_ = false;   // GetBackFlag
+
+    // The engine's alpha arithmetic, as a fragment shader.  Null when the
+    // renderer is not the GPU one or the shader will not build, in which
+    // case every draw takes SDL's own straight-alpha blend as before.
+    struct ExactBlend;
+    std::shared_ptr<ExactBlend> exact_blend_;
+    // The GLES version of the same thing, which can also read the
+    // destination - see gl_blend.hpp.  Preferred when both are available.
+    std::shared_ptr<GlExactBlend> gl_exact_blend_;
 };
 
 }  // namespace th2

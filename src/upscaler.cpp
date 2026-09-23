@@ -1,5 +1,11 @@
 #include "upscaler.hpp"
 
+#include "gl_anime4k.hpp"
+
+#include <string_view>
+
+#include <cstdlib>
+
 #include "anime4k.hpp"
 
 #include <algorithm>
@@ -28,10 +34,18 @@ SDL_FRect letterbox_rect(int output_width, int output_height)
 
 class LinearUpscaler : public Upscaler {
 public:
-    explicit     LinearUpscaler(SDL_Renderer* renderer)
-        : renderer_(renderer)
+    LinearUpscaler(SDL_Renderer* renderer, bool want_anime4k)
+        : renderer_(renderer), want_anime4k_(want_anime4k)
     {
         create_targets();
+    }
+
+    // Whether the art layer is actually going through Anime4K.  Answered
+    // only once present() has had a chance to build the shader, because the
+    // GL context is not current before the first drawn frame.
+    bool anime4k_active() const
+    {
+        return want_anime4k_ && anime4k_ && anime4k_->available();
     }
 
     void reset() override
@@ -91,13 +105,24 @@ public:
             throw std::runtime_error(SDL_GetError());
         }
         const auto destination = letterbox_rect(output_width, output_height);
-
         SDL_SetRenderTarget(renderer_, nullptr);
         SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
         SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
         SDL_RenderClear(renderer_);
         SDL_SetTextureScaleMode(art_.get(), SDL_SCALEMODE_LINEAR);
-        SDL_RenderTexture(renderer_, art_.get(), nullptr, &destination);
+        // Built on the first drawn frame, once the renderer's context is
+        // current - the same reason GlPatternTransition is.
+        if (want_anime4k_ && !anime4k_) {
+            anime4k_ = std::make_unique<GlAnime4K>(renderer_);
+            SDL_Log("upscaler: %s", anime4k_->available()
+                        ? "Anime4K (GLES shader)" : "linear magnification");
+        }
+        // The art layer only, and only this draw: the shader magnifies, so
+        // it stands in for the blit rather than wrapping it.  A failure here
+        // is not fatal - the plain blit below runs instead.
+        if (!(anime4k_ && anime4k_->draw(renderer_, art_.get(), destination))) {
+            SDL_RenderTexture(renderer_, art_.get(), nullptr, &destination);
+        }
         SDL_RenderTexture(
             renderer_, authentic_text_.get(), nullptr, &destination);
         SDL_RenderTexture(renderer_, overlay_.get(), nullptr, &destination);
@@ -141,6 +166,8 @@ private:
     }
 
     SDL_Renderer* renderer_;
+    bool want_anime4k_ = false;
+    std::unique_ptr<GlAnime4K> anime4k_;
     Texture art_;
     Texture authentic_text_;
     Texture overlay_;
@@ -151,28 +178,54 @@ private:
 
 }  // namespace
 
+namespace {
+
+// The GL form needs SDL to be drawing through GLES; the shader itself is not
+// built until the first frame, so this is the question that can be answered
+// at construction time.
+bool renderer_can_run_gl_anime4k(SDL_Renderer* renderer)
+{
+    const char* name = SDL_GetRendererName(renderer);
+    if (!name) {
+        return false;
+    }
+    const std::string_view driver(name);
+    return driver == "opengl" || driver == "opengles2"
+        || driver == "opengles";
+}
+
+}  // namespace
+
 std::unique_ptr<Upscaler> create_upscaler(
     SDL_Renderer* renderer,
     const std::filesystem::path& shader_dir,
     bool use_anime4k,
     bool* anime4k_available)
 {
+    // The SDL_GPU implementation first, for a build still running that
+    // renderer.  On GLES - which is every build now - it cannot initialise,
+    // and the GL form inside LinearUpscaler takes over.
     try {
         auto anime4k = std::make_unique<Anime4K>(renderer, shader_dir);
-        const bool available = anime4k->available();
-        if (anime4k_available) {
-            *anime4k_available = available;
-        }
-        if (use_anime4k && available) {
-            return anime4k;
+        if (anime4k->available()) {
+            if (anime4k_available) {
+                *anime4k_available = true;
+            }
+            if (use_anime4k) {
+                return anime4k;
+            }
         }
     } catch (const std::exception& error) {
-        if (anime4k_available) {
-            *anime4k_available = false;
-        }
-        SDL_Log("Anime4K unavailable, falling back to linear upscaling: %s", error.what());
+        SDL_Log("Anime4K (SDL_GPU) unavailable: %s", error.what());
     }
-    return std::make_unique<LinearUpscaler>(renderer);
+    auto linear = std::make_unique<LinearUpscaler>(renderer, use_anime4k);
+    if (anime4k_available) {
+        // Reported as available whenever the renderer can carry the GL form;
+        // whether the shader built is only known after the first frame, and
+        // the answer here drives a settings toggle rather than a draw.
+        *anime4k_available = renderer_can_run_gl_anime4k(renderer);
+    }
+    return linear;
 }
 
 }  // namespace th2

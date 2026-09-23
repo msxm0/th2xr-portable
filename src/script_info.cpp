@@ -16,8 +16,12 @@ int main(int argc, char** argv)
         th2::ScriptRuntime runtime(archive);
         runtime.load(argv[2]);
         for (std::size_t count = 0; count < 10000; ++count) {
+            // Before the step, so the offset printed is the instruction's own
+            // - which is what a state trace's pc holds while it waits, and so
+            // what a stuck pc has to be looked up by.
+            const auto pc = runtime.vm_pc();
             const auto step = runtime.run();
-            std::cout << step.script_name << ": ";
+            std::cout << step.script_name << ":" << pc << ": ";
             if (step.reason == th2::VmYield::event) {
                 std::cout << step.event.instruction.name;
                 for (const auto& argument : step.event.arguments) {

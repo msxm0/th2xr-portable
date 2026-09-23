@@ -203,8 +203,16 @@ struct Anime4K::Impl {
         }
         const auto destination = letterbox_rect(output_width, output_height);
 
-        SDL_SetRenderScale(renderer, 1.0f, 1.0f);
+        // Target first, scale second.  SDL keeps the viewport, clip and
+        // scale per render target and restores them on the switch, so a
+        // reset written before the switch resets whichever target the pass
+        // happened to leave current while the window keeps the scale it had.
+        // present_frame() ends every frame by setting the window to the
+        // ImGui display scale, so on a HiDPI screen the composite ran at 2.0
+        // and the whole picture came out magnified to twice its letterbox
+        // and cropped to its top-left quarter - the oversized opening movie.
         SDL_SetRenderTarget(renderer, nullptr);
+        SDL_SetRenderScale(renderer, 1.0f, 1.0f);
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderClear(renderer);
         SDL_SetGPURenderState(renderer, states[0]);

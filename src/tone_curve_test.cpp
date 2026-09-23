@@ -32,8 +32,30 @@ int main()
         return 2;
     }
 
+    // BMP_SetTonecurve_BT does nothing without a curve file, vividness or
+    // not; _F and _T apply the vividness mix first either way.
     SDL_WriteSurfacePixel(surface, 0, 0, 100, 50, 20, 200);
     th2::apply_tone_curve(surface, {}, 0);
+    SDL_ReadSurfacePixel(
+        surface, 0, 0, &red, &green, &blue, &alpha);
+    if (red != 100 || green != 50 || blue != 20) {
+        SDL_DestroySurface(surface);
+        return 4;
+    }
+
+    // _T on a partial texel: unfold through BlendTable2[a], map, fold again.
+    // 100 at a=200: (100<<8)/201 = 127, curve 255-127 = 128, (200*128)>>8.
+    SDL_WriteSurfacePixel(surface, 0, 0, 100, 50, 20, 200);
+    th2::apply_tone_curve(surface, curve, 256, th2::ToneTarget::folded);
+    SDL_ReadSurfacePixel(
+        surface, 0, 0, &red, &green, &blue, &alpha);
+    if (red != 100 || alpha != 200) {
+        SDL_DestroySurface(surface);
+        return 5;
+    }
+
+    SDL_WriteSurfacePixel(surface, 0, 0, 100, 50, 20, 200);
+    th2::apply_tone_curve(surface, {}, 0, th2::ToneTarget::full);
     SDL_ReadSurfacePixel(
         surface, 0, 0, &red, &green, &blue, &alpha);
     const auto gray = static_cast<std::uint8_t>(

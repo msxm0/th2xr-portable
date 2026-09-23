@@ -1,5 +1,8 @@
 #include "font.hpp"
 
+#include "dsp.hpp"
+#include "texture.hpp"
+
 #include <SDL3_ttf/SDL_ttf.h>
 #ifdef TH2_USE_FONTCONFIG
 #include <fontconfig/fontconfig.h>
@@ -677,11 +680,36 @@ const std::vector<std::string>& GameFont::system_families()
 
 namespace {
 
+// The rasteriser's own arithmetic for a glyph pixel.
+//
+// FNT_Draw indexes BlendTable16[i][j] = i*j/15 with the 4 bit coverage and
+// TXT_DrawTextEx's alph2 (0..256), then composites through BlendTable, which
+// truncates at /256.  SDL's straight-alpha path instead rounds at /255 in
+// both places, which left every antialiased glyph edge a level or two bright
+// - and the drop shadow under it compounded that into the largest pixel
+// differences anywhere on the screen.
+//
+// Premultiplying here rather than in a shader because these are RenderPoint
+// calls with no texture to sample: the source half becomes exact on the CPU,
+// and the destination half is left to the blend unit, one level at worst.
+void set_glyph_colour(
+    SDL_Renderer* renderer, int coverage, int alpha_256,
+    int red, int green, int blue)
+{
+    const int eff = std::clamp(coverage * alpha_256 / 15, 0, 256);
+    SDL_SetRenderDrawColorFloat(
+        renderer,
+        static_cast<float>((red * eff) / 256) / 255.0f,
+        static_cast<float>((green * eff) / 256) / 255.0f,
+        static_cast<float>((blue * eff) / 256) / 255.0f,
+        static_cast<float>(eff) / 256.0f);
+}
+
 void draw_glyph(
     SDL_Renderer* renderer, float x, float y, int glyph_height,
     int glyph_width,
     const std::uint8_t* bitmap, std::uint8_t red, std::uint8_t green,
-    std::uint8_t blue, std::uint8_t alpha)
+    std::uint8_t blue, std::uint8_t alpha, int alpha_256)
 {
     for (int row = 0; row < glyph_height; ++row) {
         for (int column = 0; column < glyph_width; ++column) {
@@ -691,9 +719,14 @@ void draw_glyph(
             if (!coverage) {
                 continue;
             }
-            SDL_SetRenderDrawColor(
-                renderer, red, green, blue,
-                static_cast<std::uint8_t>(coverage * 17 * alpha / 255));
+            if (alpha_256 >= 0) {
+                set_glyph_colour(
+                    renderer, coverage, alpha_256, red, green, blue);
+            } else {
+                SDL_SetRenderDrawColor(
+                    renderer, red, green, blue,
+                    static_cast<std::uint8_t>(coverage * 17 * alpha / 255));
+            }
             SDL_RenderPoint(renderer, x + column, y + row);
         }
     }
@@ -701,7 +734,7 @@ void draw_glyph(
 
 void draw_shadow_mask(
     SDL_Renderer* renderer, float x, float y, int width, int height,
-    const std::uint8_t* bitmap, std::uint8_t alpha)
+    const std::uint8_t* bitmap, std::uint8_t alpha, int alpha_256)
 {
     const int stride = (width + 1) / 2;
     for (int row = 0; row < height; ++row) {
@@ -712,9 +745,13 @@ void draw_shadow_mask(
             if (!coverage) {
                 continue;
             }
-            SDL_SetRenderDrawColor(
-                renderer, 0, 0, 0,
-                static_cast<std::uint8_t>(coverage * 17 * alpha / 255));
+            if (alpha_256 >= 0) {
+                set_glyph_colour(renderer, coverage, alpha_256, 0, 0, 0);
+            } else {
+                SDL_SetRenderDrawColor(
+                    renderer, 0, 0, 0,
+                    static_cast<std::uint8_t>(coverage * 17 * alpha / 255));
+            }
             SDL_RenderPoint(renderer, x + column, y + row);
         }
     }
@@ -722,20 +759,135 @@ void draw_shadow_mask(
 
 }  // namespace
 
+
+// The glyph masks, as textures, and the blend that composites them.
+//
+// Keyed by the address of the glyph's bitmap plus its size: the bitmaps live
+// inside data_ / shadow_data_, which outlive the cache, so the address
+// identifies the glyph.  Alpha is NOT part of the key - alph2 is a uniform,
+// so one texture per glyph serves every step of the typewriter's reveal.
+struct GameFont::ExactGlyphs {
+    GlExactBlend* blend = nullptr;
+    mutable std::unordered_map<
+        std::string, std::unique_ptr<SDL_Texture, th2app::TextureDeleter>>
+        masks;
+
+    static std::string key(const std::uint8_t* bitmap, int w, int h)
+    {
+        char buffer[48];
+        std::snprintf(buffer, sizeof buffer, "%p/%d/%d",
+                      static_cast<const void*>(bitmap), w, h);
+        return buffer;
+    }
+
+    SDL_Texture* mask(SDL_Renderer* renderer, const std::uint8_t* bitmap,
+                      int width, int height) const
+    {
+        const auto name = key(bitmap, width, height);
+        if (const auto found = masks.find(name); found != masks.end()) {
+            return found->second.get();
+        }
+        SDL_Surface* face =
+            SDL_CreateSurface(width, height, SDL_PIXELFORMAT_RGBA32);
+        if (!face) {
+            return nullptr;
+        }
+        const int stride = (width + 1) / 2;
+        for (int row = 0; row < height; ++row) {
+            auto* out = static_cast<std::uint8_t*>(face->pixels)
+                + static_cast<std::size_t>(row) * face->pitch;
+            for (int column = 0; column < width; ++column) {
+                const auto packed = bitmap[row * stride + column / 2];
+                const int coverage =
+                    column % 2 == 0 ? (packed & 0x0f) : (packed >> 4);
+                // 17*c, so a 0..15 coverage survives an 8 bit channel
+                // exactly and the shader divides it back out.  The colour is
+                // the ink uniform's job; white here keeps any backend
+                // channel order harmless.
+                // In every channel, not just alpha: this backend hands GL
+                // its textures with the colour channels swizzled (see
+                // gl_blend.frag), and a mask that depends on picking the
+                // right one would be a silent solid block wherever the guess
+                // was wrong.  17*c so 0..15 survives 8 bits exactly.
+                const auto value = static_cast<std::uint8_t>(coverage * 17);
+                out[column * 4 + 0] = value;
+                out[column * 4 + 1] = value;
+                out[column * 4 + 2] = value;
+                out[column * 4 + 3] = value;
+            }
+        }
+        std::unique_ptr<SDL_Texture, th2app::TextureDeleter> texture(
+            SDL_CreateTextureFromSurface(renderer, face));
+        SDL_DestroySurface(face);
+        if (!texture) {
+            return nullptr;
+        }
+        SDL_SetTextureScaleMode(texture.get(), SDL_SCALEMODE_NEAREST);
+        SDL_SetTextureBlendMode(texture.get(), SDL_BLENDMODE_NONE);
+        auto* raw = texture.get();
+        masks.emplace(name, std::move(texture));
+        return raw;
+    }
+};
+
+void GameFont::set_exact_blend(GlExactBlend* blend)
+{
+    if (!blend) {
+        exact_.reset();
+        return;
+    }
+    if (!exact_) {
+        exact_ = std::make_unique<ExactGlyphs>();
+    }
+    exact_->blend = blend;
+}
+
+bool GameFont::draw_mask_exact(
+    SDL_Renderer* renderer, float x, float y, int width, int height,
+    const std::uint8_t* bitmap, int red, int green, int blue,
+    int alpha_256) const
+{
+    if (!exact_ || !exact_->blend || !exact_->blend->available()
+        || alpha_256 < 0 || width <= 0 || height <= 0) {
+        return false;
+    }
+    SDL_Texture* const texture =
+        exact_->mask(renderer, bitmap, width, height);
+    if (!texture) {
+        return false;
+    }
+    const SDL_FRect source{0.0f, 0.0f, static_cast<float>(width),
+                           static_cast<float>(height)};
+    const SDL_FRect destination{x, y, static_cast<float>(width),
+                                static_cast<float>(height)};
+    // A whole-target copy, deliberately.  Copying only the glyph's box is
+    // the obvious optimisation and it is wrong here in a way that is worth
+    // recording: with it the text composites to a solid block, because the
+    // fixed point of dst*(256-eff)/256 + ink*eff/256 is the ink and the
+    // shader was reading a destination that already held the glyph.  The
+    // full copy measured 400 of 400 ticks inside the gate where the sub-rect
+    // one failed 214.  Correct first; if this ever costs too much, the thing
+    // to fix is what the partial copy leaves stale, not this call.
+    return exact_->blend->capture_destination(renderer)
+        && exact_->blend->draw(renderer, texture, source, destination,
+                               false, false, 2, alpha_256, red, green, blue);
+}
+
 void GameFont::draw_bitmap(
     SDL_Renderer* renderer, float x, float y, std::string_view text,
     std::uint8_t red, std::uint8_t green, std::uint8_t blue,
-    std::uint8_t alpha) const
+    std::uint8_t alpha, int alpha_256) const
 {
     draw_bitmap_face(
-        renderer, data_, size, width, x, y, text, red, green, blue, alpha);
+        renderer, data_, size, width, x, y, text, red, green, blue, alpha,
+        alpha_256);
 }
 
 void GameFont::draw_bitmap_face(
     SDL_Renderer* renderer, const std::vector<std::uint8_t>& data,
     int font_size, int half_width, float x, float y, std::string_view text,
     std::uint8_t red, std::uint8_t green, std::uint8_t blue,
-    std::uint8_t alpha) const
+    std::uint8_t alpha, int alpha_256) const
 {
     const float start_x = x;
     const auto full_bytes =
@@ -745,7 +897,13 @@ void GameFont::draw_bitmap_face(
     const auto ascii = full_glyph_count * full_bytes;
     const float line_step =
         font_size == GameFont::size ? 31.0f : static_cast<float>(font_size + 4);
-    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+    // Premultiplied when the exact path is on: set_glyph_colour has already
+    // folded the alpha into the colour, so the blend unit must not do it
+    // again.
+    SDL_SetRenderDrawBlendMode(
+        renderer,
+        alpha_256 >= 0 ? SDL_BLENDMODE_BLEND_PREMULTIPLIED
+                       : SDL_BLENDMODE_BLEND);
 
     std::string cp932;
     try {
@@ -771,9 +929,15 @@ void GameFont::draw_bitmap_face(
             if (!bitmap) {
                 continue;
             }
-            draw_glyph(
-                renderer, x, y, font_size, half_width, bitmap,
-                red, green, blue, alpha);
+            // The shader form first; draw_glyph is the fallback when it
+            // is unavailable, which is every non-GLES build.
+            if (!draw_mask_exact(
+                    renderer, x, y, half_width, font_size, bitmap,
+                    red, green, blue, alpha_256)) {
+                draw_glyph(
+                    renderer, x, y, font_size, half_width, bitmap,
+                    red, green, blue, alpha, alpha_256);
+            }
             x += half_width;
         }
         return;
@@ -798,9 +962,15 @@ void GameFont::draw_bitmap_face(
             if (index >= 0) {
                 const auto* bitmap =
                     data.data() + static_cast<std::size_t>(index) * full_bytes;
-                draw_glyph(
-                    renderer, x, y, font_size, font_size, bitmap,
-                    red, green, blue, alpha);
+                // The shader form first; draw_glyph is the fallback when it
+                // is unavailable, which is every non-GLES build.
+                if (!draw_mask_exact(
+                        renderer, x, y, font_size, font_size, bitmap,
+                        red, green, blue, alpha_256)) {
+                    draw_glyph(
+                        renderer, x, y, font_size, font_size, bitmap,
+                        red, green, blue, alpha, alpha_256);
+                }
                 x += font_size;
             } else if (code == 0x8140) {
                 x += font_size;
@@ -817,9 +987,15 @@ void GameFont::draw_bitmap_face(
                 const auto* bitmap =
                     data.data() + ascii
                     + static_cast<std::size_t>(index) * half_bytes;
-                draw_glyph(
-                    renderer, x, y, font_size, half_width, bitmap,
-                    red, green, blue, alpha);
+                // The shader form first; draw_glyph is the fallback when it
+                // is unavailable, which is every non-GLES build.
+                if (!draw_mask_exact(
+                        renderer, x, y, half_width, font_size, bitmap,
+                        red, green, blue, alpha_256)) {
+                    draw_glyph(
+                        renderer, x, y, font_size, half_width, bitmap,
+                        red, green, blue, alpha, alpha_256);
+                }
                 x += half_width;
             }
             ++i;
@@ -832,10 +1008,10 @@ void GameFont::draw_bitmap_face(
 void GameFont::draw(
     SDL_Renderer* renderer, float x, float y, std::string_view text,
     std::uint8_t red, std::uint8_t green, std::uint8_t blue,
-    std::uint8_t alpha) const
+    std::uint8_t alpha, int alpha_256) const
 {
     if (authentic_ || text.empty()) {
-        draw_bitmap(renderer, x, y, text, red, green, blue, alpha);
+        draw_bitmap(renderer, x, y, text, red, green, blue, alpha, alpha_256);
         return;
     }
     if (text.find('\n') != std::string_view::npos) {
@@ -922,12 +1098,15 @@ void GameFont::draw_save_menu(
 
 void GameFont::draw_authentic_shadow(
     SDL_Renderer* renderer, float x, float y, std::string_view text,
-    std::uint8_t alpha) const
+    std::uint8_t alpha, int alpha_256) const
 {
     if (!authentic_ || shadow_width_ <= 0 || text.empty()) {
         return;
     }
-    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawBlendMode(
+        renderer,
+        alpha_256 >= 0 ? SDL_BLENDMODE_BLEND_PREMULTIPLIED
+                       : SDL_BLENDMODE_BLEND);
     const auto cp932 = utf8_to_cp932(text);
     for (std::size_t i = 0; i < cp932.size();) {
         const auto byte = static_cast<unsigned char>(cp932[i]);
@@ -940,15 +1119,19 @@ void GameFont::draw_authentic_shadow(
                 | static_cast<unsigned char>(cp932[i + 1]));
             const auto index = cp932_full_index(code);
             if (index >= 0) {
-                draw_shadow_mask(
-                    renderer,
-                    x - shadow_width_ + 1.0f,
-                    y - shadow_width_ + 1.0f,
-                    size + shadow_width_ * 2,
-                    size + shadow_width_ * 2,
-                    shadow_data_.data() + 4
+                if (!draw_mask_exact(
+                        renderer, x - shadow_width_ + 1.0f, y - shadow_width_ + 1.0f,
+                        size + shadow_width_ * 2, size + shadow_width_ * 2,
+                        shadow_data_.data() + 4
                         + index * shadow_full_bytes,
-                    alpha);
+                        0, 0, 0, alpha_256)) {
+                    draw_shadow_mask(
+                        renderer, x - shadow_width_ + 1.0f, y - shadow_width_ + 1.0f,
+                        size + shadow_width_ * 2, size + shadow_width_ * 2,
+                        shadow_data_.data() + 4
+                        + index * shadow_full_bytes,
+                        alpha, alpha_256);
+                }
                 x += size;
             } else if (code == 0x8140) {
                 x += size;
@@ -957,15 +1140,19 @@ void GameFont::draw_authentic_shadow(
         } else if (is_cp932_half(byte)) {
             const auto index = cp932_half_index(byte);
             if (index >= 0 && index < 157) {
-                draw_shadow_mask(
-                    renderer,
-                    x - shadow_width_ + 1.0f,
-                    y - shadow_width_ + 1.0f,
-                    width + shadow_width_ * 2,
-                    size + shadow_width_ * 2,
-                    shadow_data_.data() + shadow_ascii_offset
+                if (!draw_mask_exact(
+                        renderer, x - shadow_width_ + 1.0f, y - shadow_width_ + 1.0f,
+                        width + shadow_width_ * 2, size + shadow_width_ * 2,
+                        shadow_data_.data() + shadow_ascii_offset
                         + index * shadow_half_bytes,
-                    alpha);
+                        0, 0, 0, alpha_256)) {
+                    draw_shadow_mask(
+                        renderer, x - shadow_width_ + 1.0f, y - shadow_width_ + 1.0f,
+                        width + shadow_width_ * 2, size + shadow_width_ * 2,
+                        shadow_data_.data() + shadow_ascii_offset
+                        + index * shadow_half_bytes,
+                        alpha, alpha_256);
+                }
             }
             x += width;
             ++i;

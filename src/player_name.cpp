@@ -36,7 +36,25 @@ std::string indexed_value(std::string_view value, char index)
     return {};
 }
 
+std::string& h2_family()
+{
+    static std::string value = "Komaki";
+    return value;
+}
+
+std::string& h2_given()
+{
+    static std::string value = "Manaka";
+    return value;
+}
+
 }  // namespace
+
+void set_h2_character_name(std::string family, std::string given)
+{
+    h2_family() = std::move(family);
+    h2_given() = std::move(given);
+}
 
 PlayerName load_default_player_name(const std::filesystem::path& executable)
 {
@@ -110,7 +128,7 @@ std::string substitute_player_name(
     std::string result;
     for (std::size_t position = 0; position < source.size();) {
         if (source.substr(position).starts_with("*h2")) {
-            result += use_komaki_given_name ? "Manaka" : "Komaki";
+            result += use_komaki_given_name ? h2_given() : h2_family();
             position += 3;
             continue;
         }

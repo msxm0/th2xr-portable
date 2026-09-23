@@ -25,6 +25,10 @@ if(EMSCRIPTEN)
     # into the Emscripten sysroot, so the finds below need no extra hints.
 endif()
 
+# zlib: the trace dump is delta-coded and deflated, so a long comparison
+# window fits on the disk.  Both the engine (which writes frames) and
+# th2-trace-diff (which reads them) need it.
+find_package(ZLIB REQUIRED)
 find_package(SDL3 CONFIG REQUIRED)
 find_package(PkgConfig REQUIRED)
 if(ANDROID)
@@ -217,6 +221,11 @@ add_executable(th2-script-audit
 target_link_libraries(th2-script-audit PRIVATE
     th2_runtime)
 
+add_executable(th2-trace-diff
+    src/trace_diff.cpp
+)
+target_link_libraries(th2-trace-diff PRIVATE ZLIB::ZLIB)
+
 add_executable(th2-conformance-generator
     conformance/make_th2_conformance.cpp
 )
@@ -236,7 +245,10 @@ if(BUILD_TESTING AND NOT EMSCRIPTEN)
     add_executable(th2-dsp-test
         src/dsp_test.cpp
         src/dsp.cpp
+        src/gl_blend.cpp
+        src/gl_anime4k.cpp
         src/texture.cpp
+        src/image.cpp
     )
     target_link_libraries(th2-dsp-test PRIVATE SDL3::SDL3)
     add_test(NAME display-geometry COMMAND th2-dsp-test)
@@ -248,16 +260,24 @@ if(BUILD_TESTING AND NOT EMSCRIPTEN)
         src/avg_back.cpp
         src/avg_key.cpp
         src/text_count.cpp
+        src/trace.cpp
         src/dsp.cpp
+        src/gl_blend.cpp
+        src/gl_anime4k.cpp
         src/texture.cpp
+        src/image.cpp
     )
     target_link_libraries(th2-avg-char-test PRIVATE SDL3::SDL3)
+    target_link_libraries(th2-avg-char-test PRIVATE ZLIB::ZLIB)
     add_test(NAME character-machine COMMAND th2-avg-char-test)
 
     add_executable(th2-text-count-test
         src/text_count_test.cpp
         src/text_count.cpp
+        src/trace.cpp
     )
+
+    target_link_libraries(th2-text-count-test PRIVATE ZLIB::ZLIB)
     add_test(NAME text-count COMMAND th2-text-count-test)
 
     add_executable(th2-lzs-test
@@ -330,12 +350,15 @@ add_executable(th2-image-info
     src/image.cpp
 )
 target_link_libraries(th2-image-info PRIVATE SDL3::SDL3 th2_archive)
+    target_link_libraries(th2-image-info PRIVATE ZLIB::ZLIB)
 endif()
 
 if(ANDROID)
     add_library(toheart2 SHARED
         src/anime4k.cpp
         src/gl_transition.cpp
+        src/gl_blend.cpp
+        src/gl_anime4k.cpp
         src/font.cpp
         src/game.cpp
         src/game_backlog_touch.cpp
@@ -361,6 +384,7 @@ if(ANDROID)
         src/avg_back.cpp
         src/avg_key.cpp
         src/text_count.cpp
+        src/trace.cpp
         src/game_display.cpp
         src/script_wait.cpp
         src/game_title_draw.cpp
@@ -377,6 +401,8 @@ else()
     add_executable(toheart2
         src/anime4k.cpp
         src/gl_transition.cpp
+        src/gl_blend.cpp
+        src/gl_anime4k.cpp
         src/font.cpp
         src/game.cpp
         src/game_backlog_touch.cpp
@@ -402,6 +428,7 @@ else()
         src/avg_back.cpp
         src/avg_key.cpp
         src/text_count.cpp
+        src/trace.cpp
         src/game_display.cpp
         src/script_wait.cpp
         src/game_title_draw.cpp
@@ -415,6 +442,10 @@ else()
     )
 endif()
 set(ANIME4K_SHADER_DIR "shaders/anime4k")
+# Outside the platform guards, so TH2_BLEND_SHADER_DIR below is a real path
+# on every build rather than an empty string on the ones that skip the
+# compile step.
+set(BLEND_SHADER_DIR "shaders/blend")
 set(ANIME4K_SHADERS apply)
 if(NOT EMSCRIPTEN)
 foreach(SHADER IN LISTS ANIME4K_SHADERS)
@@ -453,6 +484,20 @@ foreach(SHADER IN LISTS ANIME4K_SHADERS)
         list(APPEND ANDROID_SHADER_ASSET_OUTPUTS "${ANDROID_SHADER_ASSET}")
     endif()
 endforeach()
+# The engine's integer blend (shaders/blend/premul256.frag).  SPIRV only:
+# there is no hand-written Metal translation, and Display::ExactBlend falls
+# back to SDL's blend rather than guess one.  Not built for the browser at
+# all: SDL_GPU has no WebGL backend, so there is nothing there to load it.
+add_custom_command(
+    OUTPUT "${BLEND_SHADER_DIR}/premul256.frag.spv"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${BLEND_SHADER_DIR}"
+    COMMAND "${GLSLANG_VALIDATOR}" -V
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/blend/premul256.frag"
+        -o "${BLEND_SHADER_DIR}/premul256.frag.spv"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/blend/premul256.frag"
+    VERBATIM)
+list(APPEND ANIME4K_SHADER_OUTPUTS "${BLEND_SHADER_DIR}/premul256.frag.spv")
+
 add_custom_target(anime4k-shaders DEPENDS ${ANIME4K_SHADER_OUTPUTS})
 add_dependencies(toheart2 anime4k-shaders)
 if(ANDROID)
@@ -460,8 +505,23 @@ if(ANDROID)
     add_dependencies(toheart2 anime4k-shaders-android)
 endif()
 endif()
+# GLES3 for the shader stack that can also run in the browser.  Optional:
+# without it gl_transition compiles to a stub and the CPU blend stands in,
+# exactly as it did before.
+if(NOT EMSCRIPTEN)
+    find_package(PkgConfig QUIET)
+    pkg_check_modules(GLESV2 IMPORTED_TARGET glesv2)
+    if(GLESV2_FOUND)
+        target_link_libraries(toheart2 PRIVATE PkgConfig::GLESV2)
+        target_compile_definitions(toheart2 PRIVATE TH2_HAVE_GLES3=1)
+        message(STATUS "GLES3 found: GL shader path enabled on desktop")
+    else()
+        message(STATUS "No GLES3: GL shader path is browser-only")
+    endif()
+endif()
 target_compile_definitions(toheart2 PRIVATE
     TH2_ANIME4K_SHADER_DIR="${ANIME4K_SHADER_DIR}"
+    TH2_BLEND_SHADER_DIR="${BLEND_SHADER_DIR}"
     TH2_VERSION="${TH2_VERSION}")
 if(ANDROID OR EMSCRIPTEN)
     # No fontconfig on these platforms; the fonts ship with the app.
@@ -496,7 +556,7 @@ else()
         SDL3::SDL3 PkgConfig::SDL3_TTF PkgConfig::FONTCONFIG th2_runtime th2_soak)
 endif()
 target_link_libraries(toheart2 PRIVATE th2_audio th2_character th2_config imgui)
-target_link_libraries(toheart2 PRIVATE PkgConfig::FFMPEG ZSTD::ZSTD)
+target_link_libraries(toheart2 PRIVATE PkgConfig::FFMPEG ZSTD::ZSTD ZLIB::ZLIB)
 
 if(EMSCRIPTEN)
     set_target_properties(toheart2 PROPERTIES SUFFIX ".html")

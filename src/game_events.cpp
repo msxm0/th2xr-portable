@@ -60,15 +60,39 @@ bool Game::handle(const th2::Event& event)
             if (unchanged_direct) {
                 return true;
             }
+            // void AVG_ResetBackHalfTone( int bak_no, int chg_type ):
+            //
+            //     if(BackStruct.flag && bak_no==BackStruct.bno
+            //        && chg_type==BAK_DIRECT) return;
+            //     AVG_ResetHalfTone();
+            //     AVG_SetNovelMessageDisp(OFF);
+            //     MainWindow.draw_flag = 1;
+            //
+            // Through AVG_SetNovelMessageDisp rather than setting our own
+            // visibility flag: that also clears NovelMessage.disp, which is
+            // the field the rest of the message machine reads, and resets
+            // GRP_KEYWAIT - so the click indicator does not sit on screen
+            // through a background change.
             reset_half_tone();
-            message_visible_ = false;
+            msg().set_novel_message_disp(false);
         }
         if (!split || opcode_phase_ == 2) {
             if (unchanged_direct) {
                 return true;
             }
+            // ESC_EOprB fills in what the script left at -1 before using
+            // any of it:
+            //     if(EscParam[3].num==-1) EscParam[3].num = -2;
+            //     if(EscParam[6].num==-1) EscParam[6].num = 128;
+            // Same trap as ESC_EOprV: -1 and -2 are not "unset" to
+            // AVG_EffCnt, they are fifteen frames and thirty, so passing the
+            // script's -1 straight through ran every defaulted B at half its
+            // length.  Measured at pc 52 of 020000100.sdt, where the engine
+            // holds the transition a frame longer than ours did.
             begin_transition(
-                number(event, 0), number(event, 3), number(event, 6), true);
+                number(event, 0),
+                number(event, 3) == -1 ? -2 : number(event, 3),
+                number(event, 6) == -1 ? 128 : number(event, 6), true);
             set_background(
                 event, name == "BC" || name == "BCT");
         }
@@ -86,42 +110,62 @@ bool Game::handle(const th2::Event& event)
                     return true;
                 }
                 reset_half_tone();
-                message_visible_ = false;
+                msg().set_novel_message_disp(false);
             }
             if (!split || opcode_phase_ == 2) {
                 if (unchanged_direct) {
                     return true;
                 }
+                // ESC_EOprH defaults the same way, with vague at index 7.
                 begin_transition(
-                    number(event, 0), number(event, 3), number(event, 7), true);
+                    number(event, 0),
+                    number(event, 3) == -1 ? -2 : number(event, 3),
+                    number(event, 7) == -1 ? 128 : number(event, 7), true);
                 set_cg(event, BackgroundKind::hcg, 'h');
             }
         }
     } else if (name == "V" || name == "VT") {
-        const int visual = number(event, 1) * 10
-            + std::max<std::int32_t>(0, number(event, 2));
+        // ESC_EOprV fills in the arguments the script left at -1 before it
+        // uses any of them:
+        //
+        //     bak_no = EscParam[1].num*10;
+        //     if(EscParam[2].num!=-1) bak_no += EscParam[2].num;
+        //     if(EscParam[3].num==-1) EscParam[3].num = -2;
+        //     if(EscParam[7].num==-1) EscParam[7].num = 128;
+        //
+        // -1 and -2 are not "unset" to AVG_EffCnt - they are fifteen frames
+        // and thirty - so passing the script's -1 straight through ran every
+        // defaulted V at half its length.  ESC_EOprVT does the same except
+        // that it never adds EscParam[2], so a VT ignores the sub-number.
+        const bool split = name == "V";
+        const int visual = split
+            ? number(event, 1) * 10
+                + (number(event, 2) != -1 ? number(event, 2) : 0)
+            : number(event, 1) * 10;
+        const int fade_frames =
+            number(event, 3) == -1 ? -2 : number(event, 3);
+        const int vague = number(event, 7) == -1 ? 128 : number(event, 7);
         const bool unchanged_direct =
             number(event, 0) == -1
             && has_background()
             && bg_scene_ == visual;
-        const bool split = name == "V";
         if (!split || opcode_phase_ == 1) {
             if (unchanged_direct) {
                 return true;
             }
             reset_half_tone();
-            message_visible_ = false;
+            msg().set_novel_message_disp(false);
         }
         if (!split || opcode_phase_ == 2) {
             if (unchanged_direct) {
                 return true;
             }
             begin_transition(
-                number(event, 0), number(event, 3), number(event, 7), true);
+                number(event, 0), fade_frames, vague, true);
             set_cg(event, BackgroundKind::visual, 'v');
         }
     } else if (name == "FB") {
-        message_visible_ = false;
+        msg().set_novel_message_disp(false);
         begin_background_fade(
             number(event, 0), number(event, 1), number(event, 2),
             number(event, 3));
@@ -141,7 +185,7 @@ bool Game::handle(const th2::Event& event)
             std::clamp(number(event, 1), 0, 255),
             std::clamp(number(event, 2), 0, 255),
             number(event, 3), number(event, 4),
-            std::chrono::steady_clock::now(),
+            engine_now(),
         };
     } else if (name == "Q" || name == "SetShake") {
         // AVG_SetShake(): SHAKE_SIN (0) and SHAKE_ALL_SIN (6) put the
@@ -162,7 +206,7 @@ bool Game::handle(const th2::Event& event)
         // neither hides anything.
         if ((number(event, 0) == 0 || number(event, 0) == 6)
             && number(event, 2) != 0) {
-            message_visible_ = false;
+            msg().set_novel_message_disp(false);
         }
         // BOOL AVG_SetShake( type, pich, speed, dir, swing ).  The speed
         // stays the raw number the script wrote; AVG_EffCnt4 is re-asked on
@@ -183,23 +227,29 @@ bool Game::handle(const th2::Event& event)
             number(event, 2), number(event, 3),
             number(event, 4), number(event, 5) + 3);
     } else if (name == "WaitFrame") {
-        // AVG_EffCnt4 counts these in 30fps units (cnt * Avg.frame / 30
-        // frames, i.e. cnt/30 seconds at any frame rate), unlike the effect
-        // durations, which are 60fps based.  The values in the scripts agree:
-        // 15, 30, 60, 90, 120 are half a second through five seconds.
-        // ...and AVG_EffCnt4 is zero while the message is being cut, so a
-        // skipped wait is no wait.
-        const int frames = effect_frames4(number(event, 0));
-        wake_time_ = std::chrono::steady_clock::now()
-            + std::chrono::milliseconds(frames * 1000 / 60);
+        // void AVG_SetWaitFrame( int type, int wait ), verbatim:
+        //
+        //     WaitStruct.flag  = 1;
+        //     WaitStruct.type  = type;
+        //     WaitStruct.count = 0;
+        //     WaitStruct.max   = wait;
+        //
+        // ESC_EOprWaitFrame passes -1 for the type, which is the
+        // AVG_EffCnt4 arm.  The count is compared against a maximum that is
+        // recomputed every frame, so a skip key taken mid-wait ends it on
+        // the next frame rather than on the one it was armed for.
+        wait_frame_.flag = 1;
+        wait_frame_.type = -1;
+        wait_frame_.count = 0;
+        wait_frame_.max = number(event, 0);
     } else if (name == "WaitTime") {
         const auto now = static_cast<std::uint32_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count());
+                engine_now().time_since_epoch()).count());
         const auto deadline = static_cast<std::uint32_t>(number(event, 0));
         const auto remaining = static_cast<std::int32_t>(deadline - now);
         if (remaining > 0) {
-            wake_time_ = std::chrono::steady_clock::now()
+            wake_time_ = engine_now()
                 + std::chrono::milliseconds(remaining);
         }
     } else if (name == "SetMovie") {
@@ -209,7 +259,24 @@ bool Game::handle(const th2::Event& event)
             ? 0 : number(event, 0);
         start_movie(1, ending, true);
     } else if (name == "SetTitle") {
-        return_to_title();
+        // void AVG_SetGotoTitle( void ):
+        //     GotoTitle = 1; Avg.demo = OFF; Avg.msg_cut = OFF;
+        //     Avg.msg_cut_mode = OFF; Avg.auto_flag = OFF;
+        //     AVG_StopBGM( 15 ); AVG_FadeSeAll( 15 );
+        //     MAIN_SetScriptFlag( OFF );
+        //     AVG_SetFade( 0, 0, 0, ON, -1 );
+        // The fade is what holds the instruction: -1 is AVG_EffCnt(-1), and
+        // with Avg.wait 2 at 60fps that is thirty frames.  Measured at pc
+        // 1648 of 500000000.sdt, where the reference sits from tick 841121
+        // and releases the script at 841153.
+        demo_mode_ = false;
+        auto_mode_ = false;
+        skip_mode_ = false;
+        skip_held_ = false;
+        stop_bgm(15);
+        stop_all_se(15);
+        avgback().set_fade(0, 0, 0, 1, -1);
+        goto_title_pending_ = true;
     } else if (name == "SetDemoFlag") {
         demo_mode_ = number(event, 0) != 0;
         demo_delay_frames_ = std::max(0, number(event, 1));
@@ -457,7 +524,16 @@ bool Game::handle(const th2::Event& event)
         // AVG_SetNovelMessage( EscParam[0].str, EscParam[1].num ).  It sets
         // MSG_DISP, takes the half tone and shows the text; everything after
         // that is AVG_ControlNovelMessage's, one frame at a time.
-        msg().set_novel_message(text(event, 0), number(event, 1));
+        // The substituted text, not the script's.  AVG_SetNovelMessage
+        // stores one string and TXT_GetTextCount walks that same string, so
+        // the name has to be in it before anything is counted: *nnk is four
+        // ASCII characters and the name it stands for is two full-width
+        // ones, which is two counts of difference in every message that
+        // mentions the player.
+        msg().set_novel_message(
+            th2::substitute_player_name(
+                text(event, 0), player_name_, runtime_.flag(213) != 0),
+            number(event, 1));
     } else if (name == "AddMessage2") {
         const auto reveal_start = message_.visible().size();
         message_.append(th2::substitute_player_name(
@@ -475,7 +551,10 @@ bool Game::handle(const th2::Event& event)
         message_ends_block_ = number(event, 1) == 2;
         static_cast<void>(reveal_start);
         // AVG_AddNovelMessage( EscParam[0].str, EscParam[1].num ).
-        msg().add_novel_message(text(event, 0), number(event, 1));
+        msg().add_novel_message(
+            th2::substitute_player_name(
+                text(event, 0), player_name_, runtime_.flag(213) != 0),
+            number(event, 1));
     } else if (name == "T") {
         // ESC_EOprT, verbatim:
         //
@@ -511,28 +590,25 @@ bool Game::handle(const th2::Event& event)
     } else if (name == "W") {
         // Explicit no-op in the original.
     } else if (name == "M") {
+        // ESC_EOprM defaults each parameter and then hands every case, the
+        // negative one included, to AVG_PlayBGM:
+        //     if(EscParam[1].num==-1) EscParam[1].num = 0;
+        //     if(EscParam[2].num==-1) EscParam[2].num = ON;
+        //     if(EscParam[3].num==-1) EscParam[3].num = 0xff;
+        //     AVG_PlayBGM( EscParam[0].num, fade, loop, vol, 0 );
         const int music = number(event, 0);
         const int fade = number(event, 1) < 0 ? 0 : number(event, 1);
-        if (music < 0) {
+        const int loop = number(event, 2) < 0 ? 1 : number(event, 2);
+        const int volume = number(event, 3) < 0 ? 255 : number(event, 3);
+        play_bgm(music, loop != 0, volume, fade);
+        if (music >= 0 && fade > 0) {
+            bgm_.set_gain(0.0f);
             bgm_.fade_to(
-                0.0f, audio_fade_duration(fade), true);
-            bgm_track_ = -1;
-        } else {
-            const int loop = number(event, 2) < 0 ? 1 : number(event, 2);
-            const int volume = number(event, 3) < 0 ? 255 : number(event, 3);
-            play_bgm(music, loop != 0, volume);
-            if (fade > 0) {
-                bgm_.set_gain(0.0f);
-                bgm_.fade_to(
-                    bgm_gain(volume),
-                    audio_fade_duration(fade));
-            }
+                bgm_gain(volume), audio_fade_duration(fade));
         }
     } else if (name == "MS") {
-        const int fade = number(event, 0) < 0 ? 0 : number(event, 0);
-        bgm_.fade_to(
-            0.0f, audio_fade_duration(fade), true);
-        bgm_track_ = -1;
+        // ESC_EOprMS: the same -1 default, then AVG_StopBGM( fade ).
+        stop_bgm(number(event, 0) < 0 ? 0 : number(event, 0));
     } else if (name == "MV") {
         bgm_volume_ = number(event, 0);
         const int fade = number(event, 1) < 0 ? 0 : number(event, 1);
@@ -540,7 +616,23 @@ bool Game::handle(const th2::Event& event)
             bgm_gain(bgm_volume_),
             audio_fade_duration(fade));
     } else if (name == "MW") {
-        if (bgm_.fading()) {
+        // AVG_WaitBGM (GM_Avg.cpp:2048):
+        //     return PlayMusic[DB_No].mode==MUSIC_STOP
+        //         || PlayMusic[DB_No].mode==MUSIC_PLAY;
+        // It is done when the music is stopped OR steadily playing, and
+        // waits only through an actual fade.  Nothing playing is MUSIC_STOP,
+        // so there is nothing to wait for - where ours reported a fade on a
+        // channel with no music in it and held the script an extra frame.
+        // Not in a trace, where the fade is ours alone.  The reference's
+        // music is stubbed (reference/shim, th2ref_pcm_status), so
+        // PlayMusic[].mode is only ever MUSIC_STOP or MUSIC_PLAY and
+        // AVG_WaitBGM is true the moment it is asked - the opcode asks it
+        // itself inside EXEC_ControlLang, so the reference spends no tick on
+        // MW at all.  Ours runs a real decoder on the injected clock, so it
+        // really is mid-fade here and parked for a tick the other side never
+        // spent: measured at pc 10191 of 010301100.sdt, the MW after MS 60,
+        // where the reference goes straight from 10184 to 10193.
+        if (!trace_mode_ && bgm_.fading() && bgm_.playing()) {
             audio_wait_ = AudioWait{AudioWaitKind::bgm, 0};
         }
     } else if (name == "SE") {
@@ -555,6 +647,7 @@ bool Game::handle(const th2::Event& event)
         const auto channel = number(event, 0);
         if (channel >= 0 && static_cast<std::size_t>(channel) < se_channels_.size()) {
             const int fade = number(event, 1) < 0 ? 0 : number(event, 1);
+            trace_note_audio("sestop", channel, -1, number(event, 1), 0);
             se_channels_[channel].fade_to(
                 0.0f, audio_fade_duration(fade), true);
             se_sound_[channel] = -1;
@@ -570,9 +663,19 @@ bool Game::handle(const th2::Event& event)
         }
     } else if (name == "SEW") {
         const auto channel = number(event, 0);
+        // In a trace the other side is not decoding anything: its effect
+        // "plays" for a fixed count of ticks (th2ref_pcm_status), and
+        // SeStruct[sno].flag is set for exactly that long.  Our decoder's
+        // own idea of whether it is still playing is a different question -
+        // it answered no at pc 4944 of 010302000.sdt, where the engine
+        // waited, so the script ran straight through a SEW the engine
+        // honoured.
         const bool wait_for_playback = channel >= 0
             && static_cast<std::size_t>(channel) < se_channels_.size()
-            && !se_loop_[channel] && se_channels_[channel].playing();
+            && !se_loop_[channel]
+            && (trace_mode_
+                    ? trace_se_playing(static_cast<std::size_t>(channel))
+                    : se_channels_[channel].playing());
         if (wait_for_playback) {
             audio_wait_ = AudioWait{
                 AudioWaitKind::sound_effect, static_cast<std::size_t>(channel)};
@@ -590,6 +693,7 @@ bool Game::handle(const th2::Event& event)
         const auto channel = number(event, 1) < 0 ? 0 : number(event, 1);
         if (channel >= 0 && static_cast<std::size_t>(channel) < voice_channels_.size()) {
             const int fade = number(event, 0) < 0 ? 0 : number(event, 0);
+            trace_note_audio("voicestop", channel, -1, -1, -1);
             voice_channels_[channel].fade_to(
                 0.0f, audio_fade_duration(fade), true);
             voice_sound_[channel] = -1;
@@ -613,7 +717,7 @@ bool Game::handle(const th2::Event& event)
         choice_result_register_ =
             std::get<th2::RegisterTarget>(event.arguments.at(0)).index;
         choosing_ = true;
-        choice_reveal_started_ = std::chrono::steady_clock::now();
+        choice_reveal_cnt_ = 0;
         choice_highlight_ = 0;
         choice_selected_ = -1;
     } else if (name == "SetMapEvent") {
@@ -775,8 +879,15 @@ void Game::pump_script()
     //     if( BusyFlg == SCCODE_WAIT_TWAIT ) EXEC_LangTWait();
     //     if( BusyFlg == SCCODE_WAIT_WAIT )  EXEC_LangWait();
     //     if( BusyFlg == SCCODE_RUN ) while( EXEC_CallOprControl( mode ) );
+    if (wake_frames_ > 0) {
+        wake_frames_ -= control_steps_;
+        if (wake_frames_ > 0) {
+            return;
+        }
+        wake_frames_ = 0;
+    }
     if (wake_time_) {
-        if (std::chrono::steady_clock::now() < *wake_time_) {
+        if (engine_now() < *wake_time_) {
             return;
         }
         wake_time_.reset();
@@ -791,13 +902,51 @@ void Game::pump_script()
 // instruction stays where it is; the polarity is the original's, which is not
 // uniform - AVG_WaitBack is true while busy, AVG_WaitNovelMessage is true when
 // the message is ready.
-bool Game::opcode_waiting(WaitKind kind, const th2::Event& event) const
+bool Game::avg_wait_frame()
 {
+    // BOOL AVG_WaitFrame( void ), the type -1 arm, verbatim:
+    //
+    //     wait_max = AVG_EffCnt4(WaitStruct.max);
+    //     WaitStruct.count++;
+    //     if( WaitStruct.count>=wait_max ){ WaitStruct.flag = 0; ret = TRUE; }
+    //
+    // A frame counter.  We had this as a wall-clock deadline of
+    // frames*1000/60 milliseconds, which is the same thing only while the
+    // loop happens to run at exactly sixty frames a second - and is off by
+    // the rounding even then: a WaitFrame 90 took 188 ticks against the
+    // engine's 180.
+    // Advanced by the frame's tick count rather than once per call: the
+    // engine asks this from EXEC_ControlLang, which runs exactly once per
+    // sixtieth, while our pump runs once per drawn frame.  At sixty frames a
+    // second - and in a trace run, where a tick is the frame - the two are
+    // the same thing and the count is identical.
+    for (int i = 0; i < control_steps_ && wait_frame_.flag; ++i) {
+        // Recomputed every frame, not cached at set-up: that is what lets a
+        // skip key taken mid-wait collapse AVG_EffCnt4 to zero and end it.
+        const int wait_max = effect_frames4(wait_frame_.max);
+        ++wait_frame_.count;
+        if (wait_frame_.count >= wait_max) {
+            wait_frame_.flag = 0;
+        }
+    }
+    return !wait_frame_.flag;
+}
+
+bool Game::opcode_waiting(WaitKind kind, const th2::Event& event)
+{
+
     switch (kind) {
     case WaitKind::none:
     case WaitKind::frame:
         // No predicate: one frame of ESC_WAIT and the machine moves on.
         return false;
+    case WaitKind::clock:
+        // A pure query.  update_clock_calendar does the stepping, before the
+        // script pass so that this sees the frame the animation is actually
+        // on.  AVG_ViewClock returns TRUE at once when the clock is already at
+        // the time asked for, and begin_clock leaves clock_state_ unset in
+        // exactly that case, so this is false and nothing waits.
+        return clock_state_.has_value() || calendar_state_.has_value();
     case WaitKind::character:
         // !AVG_WaitChar( EscParam[0].num ).  Its own character, and nothing
         // else - a background fade running at the same time cannot hold it.
@@ -811,6 +960,22 @@ bool Game::opcode_waiting(WaitKind kind, const th2::Event& event) const
     case WaitKind::back:
         // !AVG_WaitBack(): BackStruct.fd_flag, the background change.
         return avgback().wait_back();
+    case WaitKind::title:
+        // The screen fades out with the script switched off, and the script
+        // is let go on the frame *after* the fade lands - the reference sits
+        // on pc 1648 of 500000000.sdt for thirty-two ticks, which is the
+        // thirty frame fade plus the frame that starts it and the frame that
+        // releases it.  Ours let go one frame early and then showed End for
+        // a frame, which the reference never does: MAIN_SetScriptFlag(OFF)
+        // means End is never reached at all.
+        if (avgback().wait_fade()) {
+            return true;
+        }
+        if (!goto_title_released_) {
+            goto_title_released_ = true;
+            return true;
+        }
+        return false;
     case WaitKind::fade:
         // !AVG_WaitFade(): FadeStruct.flag, the screen flash.
         return avgback().wait_fade();
@@ -864,7 +1029,19 @@ bool Game::opcode_waiting(WaitKind kind, const th2::Event& event) const
         return audio_wait_.has_value();
     case WaitKind::movie:
         // !AVG_WaitMovie(): movPlayerFrm && !bEnd.
-        return movie_ != nullptr;
+        // trace_movie_live_ as well, and not as a nicety: a traced run never
+        // builds a VideoPlayer (see Game::start_movie), so movie_ is null from
+        // the start and this predicate said "not waiting" on the very first
+        // evaluation.  The script then walked straight past SetMovie no matter
+        // what the stub did, which is why giving the stub a length changed
+        // nothing at all.  The stub is the movie in a trace, so it is what the
+        // wait has to ask about.
+        return movie_ != nullptr || trace_movie_live_;
+    case WaitKind::wait_frame:
+        // !AVG_WaitFrame().  Asking is what advances it, so this must be
+        // reached exactly once a frame - which is what the latch above
+        // guarantees.
+        return !avg_wait_frame();
     case WaitKind::select:
         // AVG_WaitSelect() != -1: SelectWindow.res.
         return choosing_;
@@ -944,6 +1121,16 @@ void Game::exec_control_lang(bool skipping)
         }
         sync_game_flags();
         if (step.reason == th2::VmYield::ended) {
+            // Nothing is running until something else is loaded.  Cleared by
+            // load_script; a scheduled load clears it on the way through, and
+            // a map or calendar leaves it set, which is the engine's null
+            // EXEC_LangInfo.
+            script_ended_ = true;
+            if (goto_title_pending_) {
+                goto_title_pending_ = false;
+                return_to_title();
+                break;
+            }
             if (replay_mode_ || direct_scenario_) {
                 return_to_title();
                 break;
@@ -952,25 +1139,36 @@ void Game::exec_control_lang(bool skipping)
                 return_to_title();
                 break;
             }
-            if (ui_mode_ == UiMode::map || calendar_state_) {
-                break;
-            }
-            continue;
+            // The tick ends here, whatever was loaded.  A script arriving and
+            // its first instruction running are two different frames in the
+            // engine - which is what the LoadScript opcode's ESC_WAIT buys,
+            // and the scheduled load has to cost the same.  Running straight
+            // on made each of the four EV_0301* interval scripts one tick
+            // instead of two, so the day's scenario started four ticks early
+            // and everything after it was measured against the wrong frame.
+            break;
         }
         if (step.reason == th2::VmYield::wait_frames
             || step.reason == th2::VmYield::wait_time) {
             if (skipping) {
                 continue;
             }
-            const auto milliseconds = step.reason == th2::VmYield::wait_frames
-                ? step.wait_value * 1000 / 60
-                : step.wait_value;
-            wake_time_ = std::chrono::steady_clock::now()
-                + std::chrono::milliseconds(milliseconds);
+            if (step.reason == th2::VmYield::wait_frames) {
+                // Plus the frame it is issued on.  The decrement below runs
+                // at the top of pump_script, so a wait set during tick T is
+                // first counted at T+1 and would resume at T+N - one frame
+                // before the engine, which spends T itself waiting.  Measured
+                // at pc 148 of 070000200.sdt: N left us a tick ahead, N+1
+                // lands on it.
+                wake_frames_ = step.wait_value + 1;
+            } else {
+                wake_time_ = engine_now()
+                    + std::chrono::milliseconds(step.wait_value);
+            }
             break;
         }
         if (step.reason == th2::VmYield::frame) {
-            wake_time_ = std::chrono::steady_clock::now();
+            wake_time_ = engine_now();
             break;
         }
         if (step.reason == th2::VmYield::event) {
@@ -1031,6 +1229,21 @@ void Game::exec_control_lang(bool skipping)
             }
             if (latch >= phases && !opcode_waiting(kind, step.event)) {
                 latch = 0;            // EXEC_AddPC: run() already moved it
+                if (goto_title_pending_) {
+                    // The engine never runs the End after a SetTitle - the
+                    // script is off - so the machine stops here rather than
+                    // stepping onto it for a frame.
+                    goto_title_pending_ = false;
+                    goto_title_released_ = false;
+                    script_ended_ = true;
+                    // AVG_ControlGotoTitle, GOTILE_END:
+                    //     AVG_StopBGM( FADE_MUS );
+                    //     for(i=0;i<WAVE_SOUND_NUM;i++) AVG_StopSE2( i,0 );
+                    stop_bgm(60);
+                    stop_all_se(0);
+                    return_to_title();
+                    break;
+                }
             } else {
                 runtime_.vm_rewind_to(step.event.instruction.offset);
             }
@@ -1046,7 +1259,7 @@ void Game::exec_control_lang(bool skipping)
         just_advanced_past_block_end_ = false;
         if (config_.autosave_enabled && ui_mode_ == UiMode::game
             && !replay_mode_ && !demo_mode_) {
-            const auto now = std::chrono::steady_clock::now();
+            const auto now = engine_now();
             constexpr auto minimum_interval = std::chrono::minutes(2);
             if (last_save_time_.time_since_epoch().count() == 0
                 || now - last_save_time_ >= minimum_interval) {

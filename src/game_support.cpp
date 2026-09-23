@@ -136,7 +136,8 @@ std::optional<std::filesystem::path> pick_game_executable()
 }
 
 std::optional<std::filesystem::path> discover_game_data_path(
-    const std::filesystem::path& default_path, bool explicit_path)
+    const std::filesystem::path& default_path, bool explicit_path,
+    bool may_prompt)
 {
     if (valid_game_data_directory(default_path)) {
         if (explicit_path) {
@@ -158,6 +159,16 @@ std::optional<std::filesystem::path> discover_game_data_path(
             default_path.string().c_str());
         return std::nullopt;
 #else
+        if (!may_prompt) {
+            // Nobody is in front of this run - a trace or a soak - and the
+            // picker below is modal, so offering it would hang the run
+            // instead of rescuing it.  Fail with the path that was looked in.
+            SDL_LogError(
+                SDL_LOG_CATEGORY_APPLICATION,
+                "No game data at %s, and this run cannot ask for it.",
+                default_path.string().c_str());
+            return std::nullopt;
+        }
         const auto executable = pick_game_executable();
         if (!executable) {
             return std::nullopt;
@@ -245,6 +256,7 @@ Texture load_texture(SDL_Renderer* renderer, const th2::Archive& archive,
     }
     SDL_Surface* surface = th2::load_image(archive.read(*entry), entry->name);
     SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer, surface);
+    th2::carry_source_alpha(surface, texture);
     SDL_DestroySurface(surface);
     if (!texture) {
         throw std::runtime_error(SDL_GetError());
@@ -291,9 +303,24 @@ Texture load_toned_texture(
     Surface surface = predecoded
         ? std::move(predecoded)
         : decode_image(image_archive, image_name);
+    // DSP_LoadBmp, bmp_bit 3: the BlendTable[a] fold first, then
+    // BMP_SetTonecurve_T on the folded colour.  The curve does not commute
+    // with the fold - tone(fold(c)) and fold(tone(c)) part by a level - so a
+    // toned picture with an alpha channel is folded here, before its curves,
+    // and drawn without the shader's fold.  An untoned one keeps the fold in
+    // the shader, where it is the same arithmetic.
+    const bool fold = !curves.empty()
+        && th2::surface_has_source_alpha(surface.get());
+    if (fold) {
+        th2::fold_source_alpha(surface.get());
+    }
+    // Everything toned here was asked for in true colour - a background as
+    // BMP_FULL, a character as BMP_TRUE - so it is _F's arithmetic, or _T's.
+    const auto target = fold ? th2::ToneTarget::folded : th2::ToneTarget::full;
     for (const auto& curve : curves) {
         if (curve.name.empty()) {
-            th2::apply_tone_curve(surface.get(), {}, curve.vividness);
+            th2::apply_tone_curve(
+                surface.get(), {}, curve.vividness, target);
             continue;
         }
         const auto* entry = curve_archive.find(curve.name);
@@ -302,7 +329,8 @@ Texture load_toned_texture(
                 "tone curve not found: " + curve.name);
         }
         th2::apply_tone_curve(
-            surface.get(), curve_archive.read(*entry), curve.vividness);
+            surface.get(), curve_archive.read(*entry), curve.vividness,
+            target);
     }
     SDL_Surface* texture_surface = surface.get();
     if (pixels) {
@@ -315,8 +343,16 @@ Texture load_toned_texture(
     }
     SDL_Texture* texture =
         SDL_CreateTextureFromSurface(renderer, texture_surface);
+    // The conversion above, where there is one, makes a fresh surface that
+    // does not carry the original's properties, so the mark is taken from
+    // the decoded surface rather than from whatever is being uploaded.
+    th2::carry_source_alpha(surface.get(), texture);
     if (!texture) {
         throw std::runtime_error(SDL_GetError());
+    }
+    if (fold) {
+        SDL_SetBooleanProperty(SDL_GetTextureProperties(texture),
+                               th2::source_folded_property, true);
     }
     SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
     return Texture(texture);

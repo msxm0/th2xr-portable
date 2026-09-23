@@ -33,13 +33,17 @@ public:
 
     bool available() const;
 
-    // Draws mix(previous, next, ramp(mask)) over the current render target,
-    // matching the CPU blend:
+    // Draws the pattern blend over the current render target, in the CPU
+    // blend's own integer arithmetic:
     //     alpha = clamp((mask + offset - 256) * 256 / vague, 0, 255)
+    //     out   = (previous * (255 - alpha) + next * alpha) / 255
+    // `offset` is blnd2 - rate*(256+vague)/256 with both divisions
+    // truncating - and not a float progress, for the reason the caller's
+    // comment gives.
     // Returns false if it could not draw, in which case nothing was drawn and
     // the caller should fall back.
     bool draw(SDL_Renderer* renderer, SDL_Texture* previous, SDL_Texture* next,
-              SDL_Texture* mask, float offset, float vague);
+              SDL_Texture* mask, int offset, int vague);
 
 private:
     struct Impl;

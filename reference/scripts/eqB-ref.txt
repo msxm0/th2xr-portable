@@ -1,0 +1,3 @@
+150 move 400 403
+200 lclick 3
+265 every 30 lclick 3

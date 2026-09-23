@@ -16,6 +16,7 @@ void AvgMsg::init()
     message_ = {};
     half_tone_ = {};
     counted_ = {};
+    layout_ = {};
     raw_.clear();
     end_key_wait_ = false;
     auto_count_ = 0;
@@ -38,6 +39,7 @@ void AvgMsg::set_novel_message(const std::string& raw, int add_flag)
     // typewriter starts from the left.
     raw_ = raw;
     counted_ = txt_count_text(raw_);
+    layout_ = txt_count_text(raw_, message_text_box);
     end_key_wait_ = txt_get_text_end_key_wait(raw_);
 
     message_ = {};
@@ -46,6 +48,10 @@ void AvgMsg::set_novel_message(const std::string& raw, int add_flag)
     message_.disp = 1;
     message_.step1 = msg_disp;
     message_.max = text_count(message_.kstep) + 8;
+    //     DSP_SetTextCount( TXT_WINDOW, NovelMessage.count );
+    //     DSP_SetTextStep(  TXT_WINDOW, NovelMessage.kstep );
+    text_cnt_ = message_.count;
+    text_step_ = message_.kstep;
 
     set_half_tone();
     set_novel_message_disp(true);
@@ -73,6 +79,7 @@ void AvgMsg::add_novel_message(const std::string& raw, int cr)
     raw_ += "\\k";
     raw_ += raw;
     counted_ = txt_count_text(raw_);
+    layout_ = txt_count_text(raw_, message_text_box);
     end_key_wait_ = txt_get_text_end_key_wait(raw_);
 
     message_.flag = 1;
@@ -83,6 +90,8 @@ void AvgMsg::add_novel_message(const std::string& raw, int cr)
     message_.kstep++;
     message_.count = message_.max;
     message_.max = text_count(message_.kstep) + 8;
+    text_step_ = message_.kstep;
+    text_cnt_ = message_.count;
 
     set_half_tone();
     set_novel_message_disp(true);
@@ -188,6 +197,8 @@ void AvgMsg::advance_step()
             hooks_.reveal_step(message_.kstep);
         }
         message_.max = text_count(message_.kstep) + 8;
+        text_step_ = message_.kstep;
+        text_cnt_ = message_.count;
     } else {
         message_.step1 = msg_next;
         message_.kstep++;
@@ -273,27 +284,34 @@ void AvgMsg::control_novel_message(const GameKey& key)
                 case 1:
                     if (end_key_wait_ && !page) {
                         message_.step1 = msg_stop;
+                        text_cnt_ = -1;
                     } else if (page) {
                         if ((hooks_.wait_voice && hooks_.wait_voice())
                             || hit || cut) {
                             message_.step1 = msg_next;
+                            text_cnt_ = -1;
                         } else {
                             message_.step1 = msg_disp;
+                            text_cnt_ = -1;
                         }
                     } else {
                         // No keywait at the end: the instruction retires
                         // immediately and an AddMessage2 follows without the
                         // reader having to click.
                         message_.step1 = msg_next;
+                        text_cnt_ = -1;
                     }
                     break;
                 case 3:
                     message_.step1 = msg_stop;
+                    text_cnt_ = -1;
                     break;
                 default:
                 case 2:
                     message_.step1 = msg_stop;
                     message_.kstep = -1;
+                    text_cnt_ = -1;
+                    text_step_ = -1;
                     break;
                 }
             } else if (page) {
@@ -303,10 +321,16 @@ void AvgMsg::control_novel_message(const GameKey& key)
                 }
                 if (hooks_.reveal_step) hooks_.reveal_step(message_.kstep);
                 message_.max = text_count(message_.kstep) + 8;
+                text_step_ = message_.kstep;
+                text_cnt_ = message_.count;
             } else {
                 // A \k in the middle: hold here until the reader clicks.
+                // The text object goes to -1, so everything up to the \k is
+                // drawn solid while the reader is waited on - the stop at
+                // the \k itself is text_step_, which stays where it was.
                 message_.step1 = msg_wait;
                 message_.count = text_count(message_.kstep);
+                text_cnt_ = -1;
             }
         } else {
             //     if( Avg.demo ) NovelMessage.count+=(short)(2*30/Avg.frame);
@@ -318,6 +342,9 @@ void AvgMsg::control_novel_message(const GameKey& key)
             } else {
                 message_.count += hooks_.msg_cnt ? hooks_.msg_cnt() : 1;
             }
+            //     DSP_SetTextCount( TXT_WINDOW, NovelMessage.count );
+            // The typing path is the one place the two are kept in step.
+            text_cnt_ = message_.count;
         }
         break;
     }
@@ -472,26 +499,78 @@ std::size_t AvgMsg::visible_glyphs() const
     if (message_.step1 == msg_nodisp) {
         return 0;
     }
-    // DSP_SetTextCount( TXT_WINDOW, -1 ) draws the lot; otherwise it draws
-    // up to NovelMessage.count.
-    if (message_.step1 != msg_disp) {
-        return counted_.glyph_count.size();
+    // Everything here reads the text object, not NovelMessage: ts->cnt and
+    // ts->step are what TXT_DrawTextEx is actually handed.
+    auto shown = txt_visible_glyphs(counted_, text_cnt_);
+
+    // TXT_DrawTextEx stops the draw outright at the current \k:
+    //
+    //     case 'k':
+    //         if(step>=step_cnt && step_cnt!=-1){ end_flag=1; }
+    //         step++;
+    //
+    // NovelMessage.max is the count at the \k *plus eight*, so the count
+    // deliberately runs past the end of the segment and this stop is the
+    // only thing holding the reveal at the boundary.  Without it the tail
+    // kept revealing into the next segment - eight characters of the
+    // following sentence before the reader had clicked.
+    if (text_step_ >= 0) {
+        const auto limit = static_cast<std::size_t>(
+            std::ranges::upper_bound(counted_.glyph_step, text_step_)
+            - counted_.glyph_step.begin());
+        shown = std::min(shown, limit);
     }
-    return txt_visible_glyphs(counted_, message_.count);
+    // ...and at what the window had room for, but only with the original
+    // bitmap font.  TXT_DrawTextEx stops the walk dead when the text
+    // overflows the box height, so vanilla silently loses the tail of a long
+    // message.  Our own font is a different size and our window scrolls
+    // instead, which is the better behaviour and the reason the outline font
+    // exists - so the vanilla clip applies only where we are trying to be
+    // vanilla.
+    if (vanilla_layout_) {
+        shown = std::min(shown, layout_.glyph_x.size());
+    }
+    return shown;
 }
 
 int AvgMsg::glyph_alpha(std::size_t index) const
 {
-    // alph2 = LIM( text_cnt - cnt2, 0, 16 ) * 16, so a character fades in
-    // over the sixteen counts after its own.
-    if (message_.step1 != msg_disp) {
-        return 256;
-    }
+    // TXT_DrawTextEx, both lines of it:
+    //
+    //     if(text_cnt==-1){ alph2 = 256; }
+    //     else            { alph2 = LIM(text_cnt-cnt2, 0, 16)*16; }
+    //     if( step < step_cnt ){ alph2 = 256; }
+    //
+    // The step guard is the one that matters at a \k.  NovelMessage.count
+    // stops at the end of the step, so every character near that boundary
+    // has text_cnt - cnt2 close to zero - and when the reader clicks on and
+    // the next step starts revealing, the characters they just finished
+    // reading fade out again.  The guard pins anything from an earlier step
+    // at fully opaque, which is why the original never does that.
     if (index >= counted_.glyph_count.size()) {
         return 0;
     }
-    const int delta = message_.count - counted_.glyph_count[index];
+    if (text_cnt_ < 0) {
+        return 256;
+    }
+    if (index < counted_.glyph_step.size()
+        && counted_.glyph_step[index] < text_step_) {
+        return 256;
+    }
+    const int delta = text_cnt_ - counted_.glyph_count[index];
     return std::clamp(delta, 0, 16) * 16;
+}
+
+void AvgMsg::restore_raw(std::string raw)
+{
+    raw_ = std::move(raw);
+    // Both tables, as set_text/add_text build them - not just counted_.
+    // layout_ is what the vanilla clip in visible_glyphs measures against,
+    // so restoring the raw text without it left every glyph clamped to zero
+    // the moment vanilla_layout_ was itself restored: a resumed run showed
+    // no text at all while every counter agreed with the reference.
+    counted_ = txt_count_text(raw_);
+    layout_ = txt_count_text(raw_, message_text_box);
 }
 
 }  // namespace th2

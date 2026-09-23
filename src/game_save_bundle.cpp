@@ -92,6 +92,8 @@ void Game::reset_play_state()
     vi_event_voice_no_ = -1;
     vi_event_voice_no_all_ = -1;
     movie_.reset();
+    trace_movie_live_ = false;
+    movie_bgm_stop_pending_ = false;
     movie_bytes_.clear();
     movie_resume_script_ = false;
     movie_mode_ = -1;
@@ -99,7 +101,7 @@ void Game::reset_play_state()
     display().release_bmp(th2::bmp_back);
     display().release_bmp(th2::bmp_back2);
     background_baked_dirty_ = true;
-    bg_scene_ = -1;
+    set_bg_scene(-1);
     background_kind_ = BackgroundKind::background;
     background_view_ = {0.0f, 0.0f, 800.0f, 600.0f};
     background_scroll_.reset();
@@ -158,10 +160,7 @@ void Game::initialize_scenario_flags()
     runtime_.set_flag(2, 0);
     runtime_.set_flag(3, -1);
     runtime_.set_flag(4, 0);
-    runtime_.set_flag(
-        5, th2::uses_default_voice_name(
-               player_name_, default_player_name_)
-            ? 1 : 0);
+    runtime_.set_flag(5, default_char_name_);
     runtime_.set_flag(6, 0);
     runtime_.set_flag(7, 0);
 }

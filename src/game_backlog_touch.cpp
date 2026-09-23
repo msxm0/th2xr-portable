@@ -489,144 +489,189 @@ void Game::draw_system_menu()
     }
 }
 
-void Game::draw_map_layer(
-    int field, float x, float alpha,
-    bool draw_field, bool draw_events)
+// AVG_ControlMapEvent's graphs, drawn as the rasteriser draws them: by layer
+// (the frame at LAY_MAP, fields +1, markers +2, characters +3, arrows +4),
+// through the integer blend, at the levels and source offsets its steps set.
+//
+//   step 2 (fading in, map_enter_ticks_): DRW_BLD(scnt*16) on the frame,
+//          field 1 and the arrows only - no markers or characters yet.
+//   step 3: everything DRW_NML.  Not rolling, the arrows' and markers'
+//          source offsets are reset and set again from `select` each frame;
+//          rolling, they are left alone, so a pressed arrow stays pressed.
+//          The markers do not travel with the field - they cross-fade in
+//          place at DRW_BLD(cnt*32).
+//   step 4 (map_fade_ticks_): DSP_SetGraphFade(128 - scnt*8), a brightness.
+namespace {
+struct MapLevels {
+    int frame = 0;          // GRP_MAP, the fields, the arrows
+    int bright = 128;       // step 4
+    bool markers = false;   // step 3 onward
+};
+}
+
+int Game::map_marker_level(int field) const
 {
-    if (field < 0 || field >= 5 || !map_fields_[field]) {
-        return;
+    if (map_slide_ticks_ == 0) {
+        return field == map_field_ ? 256 : 0;
     }
-    if (draw_field) {
-        SDL_SetTextureAlphaModFloat(map_fields_[field].get(), alpha);
-        const SDL_FRect field_dst{x + 80.0f, 76.0f, 640.0f, 480.0f};
-        SDL_RenderTexture(
-            renderer_, map_fields_[field].get(), nullptr, &field_dst);
-        SDL_SetTextureAlphaModFloat(map_fields_[field].get(), 1.0f);
-    }
-    if (!draw_events) {
-        return;
-    }
-
-    std::array<int, 10> overlaps{};
-    for (std::size_t i = 0; i < map_events_.size(); ++i) {
-        const auto& event = map_events_[i];
-        if (event.position < 0
-            || event.position >= static_cast<int>(map_positions_.size())) {
-            continue;
-        }
-        const auto& position = map_positions_[event.position];
-        const int overlap = ++overlaps[position.overlap];
-        int cx = position.x;
-        int cy = position.y;
-        if (overlap == 2) cx -= 200;
-        else if (overlap == 3) cx += 200;
-        else if (overlap == 4) { cx -= 100; cy += 160; }
-        if (position.field != field) {
-            continue;
-        }
-
-        if (map_markers_) {
-            int state = static_cast<int>(i) == map_hover_ ? 1 : 0;
-            if (static_cast<int>(i) == map_selected_) state = 2;
-            const SDL_FRect src{
-                static_cast<float>(state * 130),
-                static_cast<float>(event.position * 118),
-                130.0f, 118.0f};
-            const SDL_FRect dst{
-                x + cx + 20.0f, static_cast<float>(cy - 118),
-                130.0f, 118.0f};
-            SDL_SetTextureAlphaModFloat(map_markers_.get(), alpha);
-            SDL_RenderTexture(
-                renderer_, map_markers_.get(), &src, &dst);
-            SDL_SetTextureAlphaModFloat(map_markers_.get(), 1.0f);
-        }
-        if (i < map_characters_.size()
-            && map_characters_[i].texture) {
-            const auto& character = map_characters_[i];
-            const auto elapsed_ticks =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - map_started_)
-                    .count() * 60 / 1000;
-            int cycle_ticks = 0;
-            for (const auto& step : character.steps) {
-                cycle_ticks += step.ticks;
-            }
-            int tick = cycle_ticks > 0
-                ? static_cast<int>(elapsed_ticks % cycle_ticks) : 0;
-            int frame = character.steps.front().frame;
-            for (const auto& step : character.steps) {
-                if (tick < step.ticks) {
-                    frame = step.frame;
-                    break;
-                }
-                tick -= step.ticks;
-            }
-            if (frame < 0
-                || frame >= static_cast<int>(character.frames.size())) {
-                continue;
-            }
-            SDL_SetTextureAlphaModFloat(
-                character.texture.get(), alpha);
-            for (const auto& part : character.frames[frame]) {
-                const SDL_FRect destination{
-                    x + cx + part.x, cy + part.y,
-                    part.source.w, part.source.h};
-                SDL_RenderTexture(
-                    renderer_, character.texture.get(),
-                    &part.source, &destination);
-            }
-            SDL_SetTextureAlphaModFloat(
-                character.texture.get(), 1.0f);
-        }
-    }
+    const int roll = std::abs(map_slide_ticks_);
+    const int cnt = field == map_field_ ? 8 - roll
+        : field == map_previous_field_ ? roll - 8 : -1;
+    return std::clamp(cnt * 32, 0, 256);   // DRW_BLD clamps to 0..256
 }
 
 void Game::draw_map(bool ui)
 {
-    const float fade = map_fade_ticks_ > 0
-        ? map_fade_ticks_ / 16.0f
-        : std::min(1.0f,
-                std::chrono::duration<float>(
-                std::chrono::steady_clock::now() - map_started_).count()
-                * 60.0f / 16.0f);
-    if (!ui && map_frame_) {
-        SDL_SetTextureAlphaModFloat(map_frame_.get(), fade);
-        SDL_RenderTexture(renderer_, map_frame_.get(), nullptr, nullptr);
-        SDL_SetTextureAlphaModFloat(map_frame_.get(), 1.0f);
-    }
-
-    if (map_slide_ticks_ == 0) {
-        draw_map_layer(map_field_, 0.0f, fade, !ui, ui);
+    MapLevels levels;
+    if (map_enter_ticks_ > 0 || map_enter_finished_this_frame_) {
+        // k = frames into step 2: scnt is read before it is incremented, so
+        // the first frame is BLD(0) and the sixteenth has already been set
+        // back to DRW_NML.  Frame 0 is the clock's last, with nothing up.
+        const int k = 16 - map_enter_ticks_;
+        levels.frame = k <= 0 ? 0 : k >= 16 ? 256 : (k - 1) * 16;
     } else {
-        const int ticks = std::abs(map_slide_ticks_);
-        const float square = static_cast<float>(ticks * ticks);
-        const float direction = map_slide_ticks_ > 0 ? 1.0f : -1.0f;
-        const float next_x = direction * 800.0f * square / 256.0f;
-        const float previous_x =
-            direction * 800.0f * (square - 256.0f) / 256.0f;
-        draw_map_layer(map_field_, next_x, fade, !ui, ui);
-        draw_map_layer(
-            map_previous_field_, previous_x, fade, !ui, ui);
+        levels.frame = 256;
+        levels.markers = true;
+    }
+    if (map_fade_ticks_ > 0 || map_finish_pending_) {
+        // The click lands after the frame's update, so the click frame
+        // draws with map_fade_ticks_ still 16: scnt 0, as the engine's
+        // click frame is still step 3's.  Then 1..16, the last at 0.
+        const int scnt = map_finish_pending_ ? 16 : 16 - map_fade_ticks_;
+        levels.bright = std::max(0, 128 - scnt * 8);
     }
 
-    if (ui && map_arrows_) {
-        const int left_state = map_hover_ == -2 ? 1 : 0;
-        const int right_state = map_hover_ == -3 ? 1 : 0;
-        const SDL_FRect left_src{
-            static_cast<float>(left_state * 112), 0.0f, 56.0f, 122.0f};
-        const SDL_FRect right_src{
-            static_cast<float>(right_state * 112 + 56), 0.0f,
-            56.0f, 122.0f};
-        const SDL_FRect left_dst{24.0f, 239.0f, 56.0f, 122.0f};
-        const SDL_FRect right_dst{720.0f, 239.0f, 56.0f, 122.0f};
-        SDL_SetTextureAlphaModFloat(map_arrows_.get(), fade);
-        SDL_RenderTexture(
-            renderer_, map_arrows_.get(), &left_src, &left_dst);
-        SDL_RenderTexture(
-            renderer_, map_arrows_.get(), &right_src, &right_dst);
-        SDL_SetTextureAlphaModFloat(map_arrows_.get(), 1.0f);
+    if (!ui) {
+        if (map_frame_) {
+            draw_engine_blit(map_frame_.get(), SDL_FRect{0, 0, 800, 600},
+                             SDL_FRect{0, 0, 800, 600}, levels.frame, 0,
+                             levels.bright);
+        }
+        // Fields, in graph order GRP_MAP+1+i.  Step 2 shows field 1 only.
+        for (int field = 0; field < 5; ++field) {
+            if (!map_fields_[field]) {
+                continue;
+            }
+            int x = 0;
+            bool shown = field == map_field_;
+            if (map_slide_ticks_ != 0) {
+                // cnt = R*R; x1 = +-800*cnt/256; x2 = +-800*(cnt-256)/256
+                const int roll = std::abs(map_slide_ticks_);
+                const int sign = map_slide_ticks_ > 0 ? 1 : -1;
+                const int cnt = roll * roll;
+                if (field == map_field_) {
+                    x = sign * 800 * cnt / 256;
+                } else if (field == map_previous_field_) {
+                    x = sign * 800 * (cnt - 256) / 256;
+                    shown = true;
+                }
+            }
+            if (!levels.markers) {
+                shown = field == 1;
+            }
+            if (!shown) {
+                continue;
+            }
+            float w = 0.0f;
+            float h = 0.0f;
+            SDL_GetTextureSize(map_fields_[field].get(), &w, &h);
+            draw_engine_blit(
+                map_fields_[field].get(), SDL_FRect{0, 0, w, h},
+                SDL_FRect{static_cast<float>(80 + x), 76.0f, w, h},
+                levels.frame, 6, levels.bright);
+        }
+        return;
+    }
+
+    // Marker and character positions: MapEventCharPos, pushed apart where
+    // several share a spot (EventFieldKaburi).
+    std::vector<std::pair<int, int>> spots(map_events_.size(), {0, 0});
+    std::vector<int> fields(map_events_.size(), -1);
+    {
+        std::array<int, 10> overlaps{};
+        for (std::size_t i = 0; i < map_events_.size(); ++i) {
+            const auto& event = map_events_[i];
+            if (event.position < 0
+                || event.position
+                    >= static_cast<int>(map_positions_.size())) {
+                continue;
+            }
+            const auto& position = map_positions_[event.position];
+            const int overlap = ++overlaps[position.overlap];
+            int cx = position.x;
+            int cy = position.y;
+            if (overlap == 2) cx -= 200;
+            else if (overlap == 3) cx += 200;
+            else if (overlap == 4) { cx -= 100; cy += 160; }
+            spots[i] = {cx, cy};
+            fields[i] = position.field;
+        }
+    }
+    if (levels.markers && map_markers_) {
+        for (std::size_t i = 0; i < map_events_.size(); ++i) {
+            if (fields[i] < 0) continue;
+            const int level = map_marker_level(fields[i]);
+            // 0 normal, 130 under the pointer, 260 clicked - as the last
+            // frame that was not rolling left it.
+            int state = static_cast<int>(i) == map_select_back_ ? 1 : 0;
+            if (static_cast<int>(i) == map_selected_) state = 2;
+            draw_engine_blit(
+                map_markers_.get(),
+                SDL_FRect{static_cast<float>(state * 130),
+                          static_cast<float>(map_events_[i].position * 118),
+                          130.0f, 118.0f},
+                SDL_FRect{static_cast<float>(spots[i].first + 20),
+                          static_cast<float>(spots[i].second - 118),
+                          130.0f, 118.0f},
+                level, 0, levels.bright);
+        }
+        for (std::size_t i = 0; i < map_events_.size(); ++i) {
+            if (fields[i] < 0 || i >= map_characters_.size()
+                || !map_characters_[i].texture) {
+                continue;
+            }
+            const auto& character = map_characters_[i];
+            // DSP_SetSprite runs in case 1, on the frame AVG_ViewClock( 19 )
+            // reports the clock done - it is in the same block as the map's
+            // BGM and mouse rects, not in case 0 - and SPR_RenewSprite at the
+            // top of every frame after that.  Measured on the reference with
+            // AnimeControl logged: fresh on the BGM frame, one count behind
+            // every frame from the next.
+            const int frame = sprite_frame_after(
+                character, map_sprite_start_ < 0
+                    ? 0 : map_anim_frames_ - map_sprite_start_);
+            if (frame < 0
+                || frame >= static_cast<int>(character.frames.size())) {
+                continue;
+            }
+            const int level = map_marker_level(fields[i]);
+            for (const auto& part : character.frames[frame]) {
+                draw_engine_blit(
+                    character.texture.get(), part.source,
+                    SDL_FRect{spots[i].first + part.x,
+                              spots[i].second + part.y,
+                              part.source.w, part.source.h},
+                    level, sprite_blend_mode(character.texture.get()),
+                    levels.bright);
+            }
+        }
+    }
+    if (map_arrows_) {
+        // GRP_MAP+6 (left) and +7 (right): 112*state, +56 for the right.
+        const auto state_of = [&](int arrow) {
+            if (!levels.markers) return 0;   // SetGraphPos's own offset
+            if (map_arrow_pressed_ == arrow) return 2;
+            return map_select_back_ == arrow ? 1 : 0;
+        };
+        draw_engine_blit(
+            map_arrows_.get(),
+            SDL_FRect{static_cast<float>(state_of(-2) * 112), 0, 56, 122},
+            SDL_FRect{24, 239, 56, 122}, levels.frame, 0, levels.bright);
+        draw_engine_blit(
+            map_arrows_.get(),
+            SDL_FRect{static_cast<float>(state_of(-3) * 112 + 56), 0, 56, 122},
+            SDL_FRect{720, 239, 56, 122}, levels.frame, 0, levels.bright);
     }
 }
-
 
 }  // namespace th2app

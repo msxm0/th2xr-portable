@@ -1,5 +1,6 @@
 #include "game.hpp"
 
+#include "gl_blend.hpp"
 #include "icon.hpp"
 #include "image.hpp"
 
@@ -512,17 +513,27 @@ void Game::change_map_field(int direction)
     play_se(-1, 9015, false, 255);
 }
 
+// The engine's default: case - a destination is only taken, or lit, when
+// it is on the page shown, whatever MUS_GetMouseNo answered.
+bool Game::map_hover_on_page() const
+{
+    if (map_hover_ < 0
+        || static_cast<std::size_t>(map_hover_) >= map_events_.size()) {
+        return false;
+    }
+    const int position = map_events_[map_hover_].position;
+    return position >= 0
+        && position < static_cast<int>(map_positions_.size())
+        && map_positions_[position].field == map_field_;
+}
+
 void Game::update_map_hover(float x, float y)
 {
+    // MUS_RenewMouse: the first flagged rect under the cursor, in slot
+    // order - the destinations 0..15, then the arrows 16 and 17.  The
+    // destination rects are the page's only once step 3 has narrowed them;
+    // until then every destination on every page answers.
     map_hover_ = -1;
-    if (x >= 24.0f && x < 80.0f && y >= 239.0f && y < 361.0f) {
-        map_hover_ = -2;
-        return;
-    }
-    if (x >= 720.0f && x < 776.0f && y >= 239.0f && y < 361.0f) {
-        map_hover_ = -3;
-        return;
-    }
     std::array<int, 10> overlaps{};
     for (std::size_t i = 0; i < map_events_.size(); ++i) {
         const auto& event = map_events_[i];
@@ -537,31 +548,44 @@ void Game::update_map_hover(float x, float y)
         if (overlap == 2) cx -= 200;
         else if (overlap == 3) cx += 200;
         else if (overlap == 4) { cx -= 100; cy += 160; }
-        if (position.field == map_field_
+        if (i < map_rect_on_.size() && map_rect_on_[i]
             && x >= cx + 20 && x < cx + 150
             && y >= cy - 118 && y < cy) {
             map_hover_ = static_cast<int>(i);
             return;
         }
     }
+    if (x >= 24.0f && x < 80.0f && y >= 239.0f && y < 361.0f) {
+        map_hover_ = -2;
+        return;
+    }
+    if (x >= 720.0f && x < 776.0f && y >= 239.0f && y < 361.0f) {
+        map_hover_ = -3;
+        return;
+    }
 }
 
 void Game::handle_map_input(const SDL_Event& event)
 {
-    if (map_slide_ticks_ != 0 || map_fade_ticks_ != 0) {
+    if (clock_state_ || map_enter_ticks_ != 0
+        || map_enter_finished_this_frame_
+        || map_slide_ticks_ != 0 || map_fade_ticks_ != 0) {
         return;
     }
     const int previous = map_hover_;
     if (event.type == SDL_EVENT_MOUSE_MOTION) {
+        map_pointer_x_ = event.motion.x;
+        map_pointer_y_ = event.motion.y;
         update_map_hover(event.motion.x, event.motion.y);
     } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN
                && event.button.button == SDL_BUTTON_LEFT) {
         update_map_hover(event.button.x, event.button.y);
-        if (map_hover_ == -2) {
-            change_map_field(1);
-        } else if (map_hover_ == -3) {
-            change_map_field(-1);
-        } else if (map_hover_ >= 0) {
+        if (map_hover_ == -2 || map_hover_ == -3) {
+            // The arrow's own AVG_PlaySE3( 9015 ), then the page turn's.
+            play_se(-1, 9015, false, 255);
+            map_arrow_pressed_ = map_hover_;
+            change_map_field(map_hover_ == -2 ? 1 : -1);
+        } else if (map_hover_ >= 0 && map_hover_on_page()) {
             finish_map_selection(map_hover_);
         }
     } else if (event.type == SDL_EVENT_KEY_DOWN) {
@@ -571,13 +595,12 @@ void Game::handle_map_input(const SDL_Event& event)
         } else if (event.key.key == SDLK_PAGEDOWN
                    || event.key.key == SDLK_LEFT) {
             change_map_field(-1);
-        } else if (is_confirm_key(event.key.key) && map_hover_ >= 0) {
+        } else if (is_confirm_key(event.key.key) && map_hover_ >= 0
+                   && map_hover_on_page()) {
             finish_map_selection(map_hover_);
         }
     }
-    if (map_hover_ != previous && map_hover_ != -1) {
-        play_se(-1, 9108, false, 255);
-    }
+    (void)previous;
 }
 
 void Game::update_map()
@@ -585,20 +608,89 @@ void Game::update_map()
     if (ui_mode_ != UiMode::map) {
         return;
     }
-    const auto now = std::chrono::steady_clock::now();
-    constexpr auto tick = std::chrono::microseconds(1'000'000 / 60);
-    while (now - map_tick_ >= tick) {
-        map_tick_ += tick;
+    map_enter_finished_this_frame_ = false;
+    // Frames, not elapsed time.  The slide and the fade were counted off
+    // steady_clock, so their length in *ticks* depended on how fast the
+    // engine happened to be running: at a trace's ~400 ticks a second one
+    // sixtieth of a second is nearly seven ticks, and a sixteen frame
+    // animation became a hundred and seven.  The map ate 263 of the 313
+    // ticks it was open, where the engine spends 103 on the whole screen.
+    // Fourth time this has turned up - after the audio fades, the choice
+    // reveal and the clock - so: nothing a trace can see counts in seconds.
+    for (int step = 0; step < control_steps_; ++step) {
+        // The characters' sprites were set up in case 0 and animate from
+        // there, through the clock and the fade-in, not from step 3.
+        ++map_anim_frames_;
+        // Step 1 before step 2, and stepped here rather than in
+        // update_clock_calendar: AVG_ControlMapEvent calls AVG_ViewClock
+        // itself, from after EXEC_ControlLang, where update_clock_calendar
+        // runs before the script pass.  A frame's difference in when the
+        // clock finishes is a frame's difference in when the map appears.
+        if (clock_state_) {
+            clock_state_->frame += 1;
+            if (clock_state_->frame >= 32 + clock_state_->travel_frames) {
+                runtime_.set_flag(7, clock_state_->target);
+                clock_state_.reset();
+                // if( AVG_ViewClock( 19 ) ){ ... AVG_PlayBGM( 10, 30, ON,
+                // 255, 0 ); ... } - the map's music comes in with the map,
+                // on a 30 fade, not when the clock starts counting.
+                map_sprite_start_ = map_anim_frames_;
+                play_bgm(10, true, 255, 30);
+                bgm_.set_gain(0.0f);
+                bgm_.fade_to(bgm_gain(255), audio_fade_duration(30));
+            }
+            break;
+        }
+        if (map_enter_ticks_ > 0) {
+            --map_enter_ticks_;
+            if (map_enter_ticks_ == 0) {
+                map_enter_finished_this_frame_ = true;
+            }
+            continue;
+        }
+        // Step 3, not rolling: select = MUS_GetMouseNo(-1) every frame, and
+        //     if(select!=-1 && select != select_back ) AVG_PlaySE3( 9108 );
+        //     ...
+        //     select_back=select;
+        // Asked of where the pointer IS, each frame - not only when it moves:
+        // a pointer already resting on something when the map finishes
+        // fading in is a change of select all the same.  select_back is a
+        // function static in the engine, so it carries over between maps.
+        if (map_slide_ticks_ == 0 && map_fade_ticks_ == 0
+            && !map_finish_pending_) {
+            // The non-roll branch resets every graph's source offset before
+            // setting them from select: the pressed arrow is released here.
+            map_arrow_pressed_ = 0;
+            update_map_hover(map_pointer_x_, map_pointer_y_);
+            if (map_hover_ != -1 && map_hover_ != map_select_back_) {
+                play_se(-1, 9108, false, 255);
+            }
+            map_select_back_ = map_hover_;
+            for (std::size_t i = 0; i < map_events_.size()
+                 && i < map_rect_on_.size(); ++i) {
+                const int position = map_events_[i].position;
+                map_rect_on_[i] = position >= 0
+                    && position < static_cast<int>(map_positions_.size())
+                    && map_positions_[position].field == map_field_;
+            }
+        }
         if (map_slide_ticks_ > 0) {
             --map_slide_ticks_;
         } else if (map_slide_ticks_ < 0) {
             ++map_slide_ticks_;
         }
+        if (map_finish_pending_) {
+            map_finish_pending_ = false;
+            complete_map_selection();
+            return;
+        }
         if (map_fade_ticks_ > 0) {
             --map_fade_ticks_;
             if (map_fade_ticks_ == 0) {
-                complete_map_selection();
-                return;
+                // Not this frame: the engine spends step 4 fading and step 5
+                // releasing the map and loading the choice, so the load lands
+                // one frame after the fade ends.
+                map_finish_pending_ = true;
             }
         }
     }
@@ -760,33 +852,55 @@ float opacity_handle_y(int half_tone)
 }
 }  // namespace
 
+// NovelBuf.bmax.  SetNovelMessageHistory runs inside AVG_SetNovelMessage, so
+// the engine's log gains its entry the moment a line is set and the line on
+// screen is always already counted; AVG_AddNovelMessage appends to that same
+// entry rather than making a new one.  Ours pushes the finished text instead,
+// on the way into the *next* SetMessage2, so the line being read is the one
+// entry the vector does not hold yet.
+int Game::novel_log_depth() const
+{
+    return static_cast<int>(backlog_.size()) + (message_.empty() ? 0 : 1);
+}
+
 void Game::draw_sidebar()
 {
     if (!ui_sidebar_track_ || !ui_sidebar_btns_) return;
 
+    // AVG_ControlHistorySystem's fade, on DRW_BLD's 0..256 scale rather than
+    // SDL's 0..255 - the whole bar is composited through the rasteriser's
+    // blend table below, and that table is indexed by the engine's number.
+    //
+    //     case 0: if( MUS_GetMousePosX()<DISP_X-24 && step1!=MSG_DRAG )
+    //                 fade = LIM(fade-24,64,256);
+    //             else    fade = LIM(fade+24,64,256);
+    //
     // Fade by elapsed time rather than by frame, the same way the sakura
     // petals step: the browser build renders at the display refresh rate,
     // which is often not 60 Hz.  A stall is clamped so the fade cannot jump.
-    const auto now = std::chrono::steady_clock::now();
+    const auto now = engine_now();
     const float steps = std::clamp(
         static_cast<float>(
             std::chrono::duration<double>(now - sidebar_alpha_updated_).count()
             * 60.0),
         0.0f, 8.0f);
     sidebar_alpha_updated_ = now;
+    // MSG_DRAG holds the bar up while the log handle is being pulled, which
+    // is the one way the pointer can be over it and still want it opaque.
+    const bool rising = sidebar_mouse_near_ || backlog_handle_dragging_;
     switch (config_.sidebar_mode) {
     case 0:
         sidebar_alpha_ = std::clamp(
-            sidebar_alpha_ + steps * (sidebar_mouse_near_ ? 24.0f : -24.0f),
-            64.0f, 255.0f);
+            sidebar_alpha_ + steps * (rising ? 24.0f : -24.0f),
+            64.0f, 256.0f);
         break;
     case 1:
-        sidebar_alpha_ = 255.0f;
+        sidebar_alpha_ = 256.0f;
         break;
     case 2:
         sidebar_alpha_ = std::clamp(
-            sidebar_alpha_ + steps * (sidebar_mouse_near_ ? 32.0f : -32.0f),
-            0.0f, 255.0f);
+            sidebar_alpha_ + steps * (rising ? 32.0f : -32.0f),
+            0.0f, 256.0f);
         break;
     default:
         sidebar_alpha_ = 0.0f;
@@ -795,30 +909,65 @@ void Game::draw_sidebar()
     if (sidebar_alpha_ <= 0.0f) {
         return;
     }
-    const auto alpha = static_cast<std::uint8_t>(sidebar_alpha_);
-    SDL_SetTextureAlphaMod(ui_sidebar_track_.get(), alpha);
-    SDL_SetTextureAlphaMod(ui_sidebar_btns_.get(), alpha);
+    const int fade = static_cast<int>(sidebar_alpha_);
+
+    // Every one of the eleven GRP_HISTORY planes carries DRW_BLD(fade), so
+    // the bar is composited the way the click indicator is: through Draw32's
+    // blend table, which truncates at /256, and not through SDL's blend,
+    // which rounds at /255.  Over a 30x600 strip that difference was a level
+    // or two on every pixel of it.
+    auto blit = [&](SDL_Texture* texture, const SDL_FRect& src,
+                    const SDL_FRect& dst) {
+        auto* const exact = display_->gl_exact_blend();
+        if (exact && exact->available()
+            // The whole target, as DSP's own graph path captures it: the
+            // region form's rows are indexed for a bottom-up framebuffer and
+            // the shader reads the scratch at gl_FragCoord, so a band-limited
+            // capture left every button blending against an empty scratch -
+            // visibly, each one composited over black instead of the track.
+            && exact->capture_destination(renderer_)
+            && exact->draw(renderer_, texture, src, dst, false, false, 3,
+                           fade, th2::bright_neutral, th2::bright_neutral,
+                           th2::bright_neutral)) {
+            return;
+        }
+        SDL_SetTextureAlphaMod(
+            texture, static_cast<std::uint8_t>(std::min(fade, 255)));
+        SDL_RenderTexture(renderer_, texture, &src, &dst);
+        SDL_SetTextureAlphaMod(texture, 255);
+    };
 
     // sys0000.tga is the complete 30x600 sidebar backing.
     const SDL_FRect sidebar_dst{770.0f, 0.0f, 30.0f, 600.0f};
-    SDL_RenderTexture(renderer_, ui_sidebar_track_.get(), nullptr,
-                      &sidebar_dst);
+    blit(ui_sidebar_track_.get(), SDL_FRect{0.0f, 0.0f, 30.0f, 600.0f},
+         sidebar_dst);
 
     // sys0001.tga stores disabled, normal, hover and pressed states
     // in four 22-pixel-wide columns.
     {
-        const float ratio = backlog_.empty() ? 1.0f
-            : 1.0f - static_cast<float>(backlog_depth_)
-                / static_cast<float>(backlog_.size());
-        const float handle_y = 10.0f + ratio * (255.0f - 31.0f);
+        // AVG_ControlHistorySystem's DragBarY, integer division and all:
+        //
+        //     if(NovelBuf.bmax>=2)
+        //         DragBarY = RectY[0]
+        //                  + (bmax-1-bcount)*(RectH[0]-(SrcH[0]+1))/(bmax-1);
+        //     else
+        //         DragBarY = RectY[0]+RectH[0]-(SrcH[0]+1);
+        //
+        // The handle sits at the *bottom* on the newest line and climbs as
+        // the log is paged back, so the numerator counts down from bmax-1.
+        const int depth = backlog_depth_;
+        const int bmax = novel_log_depth();
+        const int handle_y = bmax >= 2
+            ? 10 + (bmax - 1 - depth) * 224 / (bmax - 1)
+            : 10 + 224;
         const float handle_state = backlog_handle_dragging_ ? 3.0f
-            : backlog_handle_hover_ ? 2.0f
-            : backlog_.size() > 1 ? 1.0f : 0.0f;
+            : (backlog_handle_hover_ && bmax > 1) ? 2.0f
+            : bmax > 1 ? 1.0f : 0.0f;
         const SDL_FRect hdl_src{
             handle_state * 22.0f, 0.0f, 22.0f, 30.0f};
-        const SDL_FRect hdl_dst{776.0f, handle_y, 22.0f, 30.0f};
-        SDL_RenderTexture(renderer_, ui_sidebar_btns_.get(),
-                          &hdl_src, &hdl_dst);
+        const SDL_FRect hdl_dst{
+            776.0f, static_cast<float>(handle_y), 22.0f, 30.0f};
+        blit(ui_sidebar_btns_.get(), hdl_src, hdl_dst);
     }
 
     {
@@ -830,7 +979,7 @@ void Game::draw_sidebar()
         const SDL_FRect dst{
             776.0f, opacity_handle_y(config_.message_half_tone),
             22.0f, opacity_handle_height};
-        SDL_RenderTexture(renderer_, ui_sidebar_btns_.get(), &src, &dst);
+        blit(ui_sidebar_btns_.get(), src, dst);
     }
 
     struct SBBtn { int y; int source_y; int h; };
@@ -845,9 +994,27 @@ void Game::draw_sidebar()
         {468, 233, 20},  // QuickSave
     };
 
+    // Which column each button shows, from AVG_ControlHistorySystem.  Only
+    // PageUp and PageDown are lit unconditionally; everything below them is
+    // dead unless the message machine is parked (MSG_WAIT / MSG_STOP /
+    // MSG_DISP / MSG_NEXT), because that is the only time a click on them
+    // would be answered.  Getting this wrong is invisible at a glance - the
+    // disabled column is the same icon in a duller ink - and it was a 20-odd
+    // level difference over two buttons in the pixel harness.
+    const int step1 = msg().state().step1;
+    const bool parked = step1 == th2::msg_wait || step1 == th2::msg_stop
+        || step1 == th2::msg_disp || step1 == th2::msg_next;
+    // AVG_GetMesCut's own gate, minus the key and the toggle: with "skip
+    // unread" off, skipping is only offered on a line already read.
+    const bool cut_offered = config_.skip_unread || current_text_is_read();
+    const int bmax = novel_log_depth();
     for (int i = 0; i < static_cast<int>(std::size(btns)); ++i) {
         const auto& button = btns[i];
-        const bool disabled = replay_mode_ && (i == 2 || i == 3);
+        const bool disabled =
+            i == 0 ? bmax - 1 <= backlog_depth_     // nothing older to show
+            : i == 1 ? backlog_depth_ <= 0          // already at the newest
+            : !parked || (replay_mode_ && (i == 2 || i == 3))
+                || (i == 5 && !cut_offered);
         const bool active =
             (i == 4 && auto_mode_) || (i == 5 && skip_mode_);
         const float state_x = disabled ? 0.0f : active ? 66.0f
@@ -858,11 +1025,8 @@ void Game::draw_sidebar()
         const SDL_FRect dst{
             776.0f, static_cast<float>(button.y),
             22.0f, static_cast<float>(button.h)};
-        SDL_RenderTexture(renderer_, ui_sidebar_btns_.get(),
-                          &src, &dst);
+        blit(ui_sidebar_btns_.get(), src, dst);
     }
-    SDL_SetTextureAlphaMod(ui_sidebar_track_.get(), 255);
-    SDL_SetTextureAlphaMod(ui_sidebar_btns_.get(), 255);
 }
 
 void Game::update_sidebar_hover(float x, float y)

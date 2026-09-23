@@ -1,0 +1,10 @@
+# Reference lead-in: title screen click.
+150 move 400 403
+200 lclick 3
+# Scenario ticks, shifted by 235.
+265 every 30 lclick 3
+265 every 1 num1
+# The map screen after day one: destination pos=6 sits at
+# MapEventCharPos[6] = {map 4, cx 490, cy 294}, and the rect is
+# (cx+20, cy-118, 130, 118) = (510,176,130,118).  Park on its centre.
+35235 move 575 235

@@ -1,3 +1,4 @@
+#include <zlib.h>
 #include <functional>
 #include "game.hpp"
 
@@ -203,6 +204,47 @@ bool Game::handle_backlog_scroll_press(float x, float y)
     return true;
 }
 
+
+// The click indicator, composited the way the engine composites GRP_KEYWAIT:
+// as an ordinary graph through Draw32's BlendTable, not through SDL's
+// rounding blend.  It is a 40x40 sakura petal with soft alpha edges sitting
+// directly on the message plate, so every one of those edge pixels was a
+// level or two bright - and because it lands just past the end of the text
+// it looked for a long time like a glyph problem.
+bool Game::draw_keywait_sprite(
+    SDL_Texture* texture, const SDL_FRect& source, const SDL_FRect& destination)
+{
+    auto* const exact = display_->gl_exact_blend();
+    if (exact && exact->available()
+        && exact->capture_destination(renderer_)
+        && exact->draw(renderer_, texture, source, destination, false, false,
+                       0, 256, th2::bright_neutral, th2::bright_neutral,
+                       th2::bright_neutral)) {
+        return true;
+    }
+    SDL_RenderTexture(renderer_, texture, &source, &destination);
+    return true;
+}
+
+int Game::keywait_frame() const
+{
+    //     DSP_SetGraphSPos( GRP_KEYWAIT, KEYWAIT_SIZE*(GlobalCount/2%30), ...
+    //
+    // Thirty frames of a spinning petal, stepped every second tick - but the
+    // count it reads is the one from *before* this tick.  MAIN_Loop runs
+    //
+    //     MAIN_SystemControl();   // AVG_ControlNovelMessage picks the frame
+    //     GlobalCount++;
+    //     MAIN_DrawControl();     // and only then draws it
+    //
+    // while ours takes the tick at the top of the frame, so at the moment
+    // the frame is chosen we are one ahead.  Both engines agree on
+    // GlobalCount itself - the state trace says so - and disagreed only on
+    // which value the sprite was allowed to see.
+    const int count = global_count_ > 0 ? global_count_ - 1 : 0;
+    return (count / 2) % 30;
+}
+
 void Game::draw_click_indicator()
 {
     // GRP_KEYWAIT.  AVG_ControlNovelMessage puts it up in MSG_WAIT and
@@ -214,6 +256,31 @@ void Game::draw_click_indicator()
     const bool end_of_block = keywait_page_end_;
     auto& tex = end_of_block ? ui_keywait_ : ui_pageend_;
     if (!tex) return;
+
+    if (msg().vanilla_layout()) {
+        //     DSP_GetTextDispPos( TXT_WINDOW, &px, &py );
+        //     DSP_SetGraphMove( GRP_KEYWAIT, px-2, py-2 );
+        //
+        // px/py are TXT_DrawTextEx's cursor after the revealed text, so the
+        // mark sits in the cell the next character would have taken.  At
+        // KEYWAIT_SIZE, undersized and placed from our own font metrics it
+        // drifted away from the text.
+        const auto& layout = msg().layout();
+        const auto shown = std::min(msg().visible_glyphs(),
+                                    layout.glyph_x.size());
+        int cx = 0, cy = 0;
+        if (!th2::txt_cursor_after(
+                layout, th2::message_text_box, shown, &cx, &cy)) {
+            return;
+        }
+        const auto px = static_cast<float>(cx);
+        const auto py = static_cast<float>(cy);
+        const int frame = keywait_frame();
+        const SDL_FRect src{frame * 40.0f, 0.0f, 40.0f, 40.0f};
+        const SDL_FRect dst{px - 2.0f, py - 2.0f, 40.0f, 40.0f};
+        draw_keywait_sprite(tex.get(), src, dst);
+        return;
+    }
 
     // DSP_GetTextDispPos( TXT_WINDOW, &px, &py ): where the *next* character
     // would be drawn, which is the end of what has actually been revealed -
@@ -245,17 +312,34 @@ void Game::draw_click_indicator()
         ? row_top + ascent - 5.0f - size / 2.0f
         : row_top - 2.0f;
 
-    // Time-based 30fps animation matching original GlobalCount/2%30 (1s cycle)
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    const int frame = (ms / 33) % 30;
+    //     DSP_SetGraphSPos( GRP_KEYWAIT,
+    //                       KEYWAIT_SIZE*(GlobalCount/2%30), 0,
+    //                       KEYWAIT_SIZE, KEYWAIT_SIZE );
+    //
+    // Thirty frames off a sprite sheet, stepped every second tick.  This was
+    // a wall clock reading - the last one left in the drawing path - which
+    // runs the petal at whatever rate the machine happens to manage rather
+    // than at the engine's, and in a trace run made it land on a different
+    // frame every time.
+    const int frame = keywait_frame();
     const SDL_FRect src{frame * 40.0f, 0.0f, 40.0f, 40.0f};
     const SDL_FRect dst{x, y, size, size};
-    SDL_RenderTexture(renderer_, tex.get(), &src, &dst);
+    draw_keywait_sprite(tex.get(), src, dst);
 }
 
 void Game::select_overlay()
 {
+    // In a trace run the overlay *is* the art layer.  The engine composites
+    // its text into the same 800x600 buffer it draws the picture in, and the
+    // whole point of a pixel comparison is to see what it drew - so ours has
+    // to land in the same buffer at the same resolution, with the bitmap
+    // font enable_trace() turns on.  Keeping it on its own high-resolution
+    // layer is what made the harness blind to every text bug there is.
+    if (trace_mode_) {
+        SDL_SetRenderTarget(renderer_, upscaler_->art_target());
+        SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
+        return;
+    }
     auto* overlay = upscaler_->overlay_target();
     SDL_SetRenderTarget(renderer_, overlay);
     float width = 0.0f;
@@ -267,6 +351,12 @@ void Game::select_overlay()
 void Game::begin_overlay()
 {
     select_overlay();
+    if (trace_mode_) {
+        // No clear: the target already holds this frame's picture, and the
+        // text goes on top of it exactly as DSP_DrawGraph puts it there.
+        SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
+        return;
+    }
     SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
     SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 0);
     SDL_RenderClear(renderer_);
@@ -275,6 +365,16 @@ void Game::begin_overlay()
 
 void Game::select_sidebar()
 {
+    // Same reasoning as select_overlay: in a trace the system bar belongs in
+    // the art buffer, because that is where the engine draws it and that is
+    // the buffer being compared.  On its own layer it was invisible to the
+    // pixel harness - a 30x600 strip of difference at x 770 that looked like
+    // a rendering bug and was only the comparison missing a layer.
+    if (trace_mode_) {
+        SDL_SetRenderTarget(renderer_, upscaler_->art_target());
+        SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
+        return;
+    }
     auto* sidebar = upscaler_->sidebar_target();
     SDL_SetRenderTarget(renderer_, sidebar);
     float width = 0.0f;
@@ -304,8 +404,34 @@ void Game::clear_authentic_text()
 
 void Game::begin_authentic_text()
 {
+    // In a trace run the bitmap text goes into the art layer with everything
+    // else, because that is where the engine puts it and the comparison is
+    // of that buffer.  Its own target exists so the upscaler can treat crisp
+    // bitmap glyphs differently from the upscaled picture, which is a choice
+    // about presentation and not about what was drawn.
+    if (trace_mode_) {
+        SDL_SetRenderTarget(renderer_, upscaler_->art_target());
+        SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
+        apply_text_shake();
+        return;
+    }
     SDL_SetRenderTarget(renderer_, upscaler_->authentic_text_target());
     SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
+    apply_text_shake();
+}
+
+// DSP_SetTextMove( TXT_WINDOW, ShakeDx+x, ShakeDy+y ): the text shakes carry
+// the message with them.  Kept as a member, not only as the viewport,
+// because changing render target resets the viewport - and the message goes
+// through begin_authentic_text, which changes target, so the offset was set
+// and then thrown away before a single glyph was drawn.
+void Game::apply_text_shake()
+{
+    if (text_shake_.x == 0 && text_shake_.y == 0) {
+        return;
+    }
+    const SDL_Rect viewport{text_shake_.x, text_shake_.y, 800, 600};
+    SDL_SetRenderViewport(renderer_, &viewport);
 }
 
 float Game::half_tone_factor() const
@@ -370,6 +496,93 @@ float Game::imgui_display_scale() const
     return std::clamp(SDL_GetWindowDisplayScale(window_), 1.0f, 2.5f);
 }
 
+void Game::trace_dump_frame()
+{
+    // Temporary: TH2_DEBUG_TICK=N makes the draw paths report themselves for
+    // that one tick, which is how you find out which of them owns a region
+    // of the screen instead of guessing.
+    if (const char* at = SDL_getenv("TH2_DEBUG_TICK")) {
+        // A short range, not one tick: what a frame shows is often built
+        // several ticks earlier, so the draw that is wrong is rarely in the
+        // tick that displays it.
+        const auto first = std::strtoull(at, nullptr, 10);
+        const char* dash = std::strchr(at, '-');
+        const auto last = dash ? std::strtoull(dash + 1, nullptr, 10) : first;
+        th2::debug_draws = trace_tick_ >= first && trace_tick_ <= last;
+        if (th2::debug_draws) {
+            SDL_Log("-- tick %llu",
+                    static_cast<unsigned long long>(trace_tick_));
+        }
+    }
+    SDL_Texture* art = upscaler_->art_target();
+    // trace_resume_pending_: the ticks a resumed run spends getting the
+    // engine as far as the scenario are bookkeeping, not part of the run,
+    // and they carry tick numbers from the title screen.
+    if (!art || trace_dir_.empty() || trace_resume_pending_) {
+        return;
+    }
+    // One CRC per frame, a picture only inside --trace-from's range.  Storing
+    // every frame of a route is well over a hundred gigabytes a side; a
+    // checksum is eight bytes, so the whole run can be compared and only the
+    // neighbourhood of a mismatch needs real images.  The reference does the
+    // same in th2ref_dump_frame, over the same tightly packed BGR24.
+    static const long frame_step = [] {
+        const char* v = SDL_getenv("TH2_FRAME_STEP");
+        const long n = v ? std::strtol(v, nullptr, 10) : 1;
+        return n < 1 ? 1 : n;
+    }();
+    // Sampled: the readback below is a GPU stall, so it happens only on the
+    // ticks that are actually compared.  Both the picture and the checksum
+    // come from the same sample, and the reference samples identically.
+    if ((static_cast<long>(trace_tick_) % frame_step) != 0) {
+        return;
+    }
+    const bool store_frame = trace_tick_ >= trace_first_tick_;
+    const char* hash_path = SDL_getenv("TH2_FRAME_HASH");
+    if (!store_frame && !hash_path) {
+        return;
+    }
+    SDL_SetRenderTarget(renderer_, art);
+    const SDL_Rect rect{0, 0, 800, 600};
+    Surface pixels(SDL_RenderReadPixels(renderer_, &rect));
+    SDL_SetRenderTarget(renderer_, nullptr);
+    if (!pixels) {
+        return;
+    }
+    Surface bgr(SDL_ConvertSurface(pixels.get(), SDL_PIXELFORMAT_BGR24));
+    if (!bgr) {
+        return;
+    }
+    // SDL pads rows to its own pitch; the dump is tightly packed.
+    std::vector<std::uint8_t> packed(
+        static_cast<std::size_t>(800) * 600 * 3);
+    const auto* src = static_cast<const std::uint8_t*>(bgr->pixels);
+    for (int y = 0; y < 600; ++y) {
+        std::memcpy(packed.data() + static_cast<std::size_t>(y) * 800 * 3,
+                    src + static_cast<std::size_t>(y) * bgr->pitch,
+                    static_cast<std::size_t>(800) * 3);
+    }
+    if (hash_path) {
+        static std::FILE* hash_file = std::fopen(hash_path, "a");
+        if (hash_file) {
+            const auto sum = crc32(
+                crc32(0L, Z_NULL, 0), packed.data(),
+                static_cast<uInt>(packed.size()));
+            std::fprintf(hash_file, "%llu %08lx 800 600\n",
+                         static_cast<unsigned long long>(trace_tick_),
+                         static_cast<unsigned long>(sum));
+            std::fflush(hash_file);
+        }
+    }
+    if (store_frame) {
+        char name[32];
+        std::snprintf(name, sizeof name, "f%06llu.binz",
+                      static_cast<unsigned long long>(trace_tick_));
+        write_trace_frame(
+            trace_dir_ / name, trace_tick_, packed.data(), 800, 600);
+    }
+}
+
 void Game::present_frame()
 {
     // Kept every frame, not only during a shake: the first frame of one has
@@ -381,6 +594,25 @@ void Game::present_frame()
     // resolution layer, and the uncovered region is at the screen edges
     // where the text is redrawn in place every frame regardless.
     capture_previous_frame(upscaler_->art_target());
+
+    // The art layer is 800x600, which is exactly what the reference build
+    // dumps out of MAIN_DrawGraph - so the two are directly comparable with
+    // no scaling in between.  Text is deliberately left out: ours renders at
+    // monitor resolution and theirs inside the plate, and the typewriter's
+    // correctness is carried by NovelMessage.count rather than by glyphs.
+    if (trace_mode_) {
+        trace_dump_frame();
+        // and then fall through and present like any other frame.
+        //
+        // Returning here instead looked free - nothing watches the window in
+        // a trace run, and it saved about forty percent of a tick.  What it
+        // actually did was stop SDL's GPU renderer ever flushing: without
+        // the present there is no submit, command buffers and their staging
+        // allocations pile up, and a long replay dies somewhere past a
+        // thousand ticks with `execbuf ioctl keeps returning ENOMEM` and a
+        // lost device.  Seconds saved per run against a ceiling on how far a
+        // run can go is not a trade worth making.
+    }
 
     upscaler_->present();
 
@@ -589,6 +821,27 @@ void Game::rebuild_baked_background()
     if (half_tone_armed_ && display().bmp_flag(th2::bmp_backhalf)) {
         build_half_tone_background();
     }
+    // Loaded with the wash up.  HalfTone comes back from the save but its
+    // bitmap does not - BMP_BACKHALF is a copy of a plate that has only just
+    // been rebuilt - so the step said "shown" with nothing to show, GRP_BACK
+    // stayed hidden in its favour, and the screen went black under the text.
+    // Taken now, from the plate with its characters in, as AVG_SetHalfTone
+    // takes it; the graphs as that function leaves them for the step.
+    const int tone_step = msg().check_half_tone_step();
+    if ((tone_step == th2::tone_disp || tone_step == th2::tone_fadeout)
+        && !display().bmp_flag(th2::bmp_backhalf)) {
+        build_half_tone_background();
+        if (display().bmp_flag(th2::bmp_backhalf)) {
+            const bool shown = tone_step == th2::tone_disp;
+            display().set_graph(
+                th2::grp_back + 1, th2::bmp_backhalf, th2::lay_back + 2,
+                shown, th2::check_none);
+            display().set_graph_pos(
+                th2::grp_back + 1, 0, 0, back().x, back().y,
+                th2::display_width, th2::display_height);
+            display().set_graph_disp(th2::grp_back, !shown);
+        }
+    }
 }
 
 void Game::draw_frame()
@@ -599,7 +852,6 @@ void Game::draw_frame()
     // returning to the title, or during a movie or a gallery.
     clear_authentic_text();
     clear_sidebar();
-    SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
     SDL_Texture* art_target = upscaler_->art_target();
     const auto shake = shake_sample();
     // The types whose case in AVG_ControlShake transforms GRP_BACK itself,
@@ -641,6 +893,10 @@ void Game::draw_frame()
     // Display honours it, and the separate compositing target this used to
     // need is gone with them.
     SDL_SetRenderTarget(renderer_, art_target);
+    // After the switch, never before it: the scale is per-target state that
+    // SDL restores here, so a reset written above would land on whichever
+    // target clear_sidebar() left current and leave this one as it was.
+    SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
     // The engine never clears: DSP_DrawGraph composites straight over the
     // framebuffer it drew last time, and GetGraph only restores a saved
     // image when DSP_GetDispBmp has armed it.  So whatever a transform
@@ -699,7 +955,13 @@ void Game::draw_frame()
         present_frame();
         return;
     }
-    if (ui_mode_ == UiMode::map) {
+    // The map's step 1 is AVG_ViewClock( 19 ), and until it reports done
+    // nothing of the map is up and the scene is not yet reset - that is
+    // step 2's AVG_ResetBack( 0 ).  So the clock goes over the scene, by the
+    // ordinary path below.  Drawn over the map's empty frame instead, each
+    // frame's DRW_BLD landed on the last one's clock and the fade-out never
+    // faded.
+    if (ui_mode_ == UiMode::map && !clock_state_) {
         draw_map(false);
         begin_overlay();
         draw_map(true);
@@ -765,14 +1027,17 @@ void Game::draw_frame()
         present_frame();
         return;
     }
+    text_shake_ = {};
     if (back().sk_flag && (shake.text_only || shake.includes_text)) {
-        const SDL_Rect viewport{
-            static_cast<int>(shake.x), static_cast<int>(shake.y),
-            800, 600};
-        SDL_SetRenderViewport(renderer_, &viewport);
+        text_shake_ = {static_cast<int>(shake.x), static_cast<int>(shake.y)};
+        apply_text_shake();
     }
     if (ui_mode_ == UiMode::game
         && message_visible_ && !message_.empty()) {
+        // The engine's layout goes with the engine's font: the box, the
+        // wrap and the overflow clip are all in units of SYS_FONT, so they
+        // only mean anything at that size.
+        msg().set_vanilla_layout(font_.authentic());
         if (font_.authentic()) {
             begin_authentic_text();
         }
@@ -785,6 +1050,69 @@ void Game::draw_frame()
         // AvgMsg::glyph_alpha is that line; nothing here measures a clock.
         const auto visible = message_.visible();
         const std::size_t shown = msg().visible_glyphs();
+
+        // With the original bitmap font, the engine's own layout: every
+        // character goes in the cell TXT_DrawTextEx put it in, wrapped where
+        // the engine wraps and dropped where the engine drops it.  Our
+        // wrapping and the scrolling window are for the outline font, which
+        // is a different size and deliberately does better than vanilla.
+        if (msg().vanilla_layout()) {
+            const auto& layout = msg().layout();
+            const auto limit = std::min(shown, layout.glyph_x.size());
+            // Two passes, because TXT_DrawText is two calls:
+            //
+            //     TXT_DrawTextEx( ..., kage, ... );   // every shadow
+            //     TXT_DrawTextEx( ..., 0,    ... );   // every glyph
+            //
+            // Every shadow in the line goes down before any glyph does.
+            // Interleaved, a glyph's shadow darkens the *previous* glyph's
+            // antialiased edge where the two cells meet - one column per
+            // character, which is where the last of the text difference was.
+            for (int pass = 0; pass < 2; ++pass) {
+            for (std::size_t i = 0; i < limit; ++i) {
+                const auto alpha_256 = msg().glyph_alpha(i);
+                if (alpha_256 <= 0) {
+                    continue;
+                }
+                const auto alpha = static_cast<std::uint8_t>(
+                    std::min(255, alpha_256 * 255 / 256));
+                // From the string the layout actually walked, at the offset
+                // it recorded - not the i'th character of message_.visible(),
+                // which is a different rendering of the same source and
+                // drops a character wherever the two disagree about escapes.
+                const std::string_view source = msg().raw();
+                if (i >= layout.glyph_off.size()) {
+                    break;
+                }
+                const auto begin =
+                    static_cast<std::size_t>(layout.glyph_off[i]);
+                if (begin >= source.size()) {
+                    break;
+                }
+                const auto bytes = utf8_prefix_bytes(
+                    source.substr(begin), 1);
+                const auto glyph = source.substr(begin, bytes);
+                const auto gx = static_cast<float>(layout.glyph_x[i]);
+                const auto gy = static_cast<float>(layout.glyph_y[i]);
+                // alpha_256 is TXT_DrawTextEx's alph2 itself, not the
+                // 0..255 squeeze of it: handing the font the engine's own
+                // number is what lets it reproduce BlendTable16 exactly.
+                if (pass == 0) {
+                    font_.draw_authentic_shadow(
+                        renderer_, gx, gy, glyph, alpha, alpha_256);
+                } else {
+                    font_.draw(
+                        renderer_, gx, gy, glyph, 255, 255, 255, alpha,
+                        alpha_256);
+                }
+            }
+            }
+            // Back to the overlay, as the outline path does at its end;
+            // no scrollbar, because vanilla has nothing to scroll - it drops
+            // the overflow instead.
+            select_overlay();
+        } else {
+
         const float x = message_text_x();
         float y = message_text_y();
         std::size_t source_cursor = 0;
@@ -809,6 +1137,13 @@ void Game::draw_frame()
             }
             std::size_t glyph_offset = 0;
             float authentic_x = x;
+            struct AuthenticGlyph {
+                float x;
+                float y;
+                std::string text;
+                std::uint8_t alpha;
+            };
+            std::vector<AuthenticGlyph> authentic_glyphs;
             // Measured once for the line and reused for every glyph in it,
             // instead of asking for the width of a growing prefix twice per
             // glyph per frame.
@@ -832,11 +1167,11 @@ void Game::draw_frame()
                     const auto alpha = static_cast<std::uint8_t>(
                         glyph_alpha * 255.0f);
                     if (font_.authentic()) {
-                        font_.draw_authentic_shadow(
-                            renderer_, authentic_x, y, glyph, alpha);
-                        font_.draw(
-                            renderer_, authentic_x, y, glyph,
-                            255, 255, 255, alpha);
+                        // Held back and drawn after the line's shadows, the
+                        // way TXT_DrawText's two passes do it - see the
+                        // vanilla branch above.
+                        authentic_glyphs.push_back(
+                            {authentic_x, y, std::string(glyph), alpha});
                         authentic_x += font_.text_width(glyph);
                         glyph_offset += glyph_bytes;
                         ++glyph_index_in_line;
@@ -871,6 +1206,18 @@ void Game::draw_frame()
                 glyph_offset += glyph_bytes;
                 ++glyph_index_in_line;
             }
+            // Every shadow in the line, then every glyph - TXT_DrawText's
+            // two calls.  A glyph drawn before the next one's shadow keeps
+            // its edge; one drawn after loses a level of it.
+            for (const auto& held : authentic_glyphs) {
+                font_.draw_authentic_shadow(
+                    renderer_, held.x, held.y, held.text, held.alpha);
+            }
+            for (const auto& held : authentic_glyphs) {
+                font_.draw(
+                    renderer_, held.x, held.y, held.text,
+                    255, 255, 255, held.alpha);
+            }
             source_cursor = line_start + line.size();
             y += text_line_height();
             if (y > message_bottom_y) {
@@ -882,11 +1229,65 @@ void Game::draw_frame()
         }
         draw_scrollbar(
             lines.size(), message_scroll_, message_scroll_dragging_);
+        }
     }
     if (ui_mode_ == UiMode::game
         && message_visible_ && choosing_ && !choices_.empty()) {
         float y = choice_y_start();
-        for (int i = 0; i < static_cast<int>(choices_.size()); ++i) {
+        const bool typed = choice_reveal_finished();
+        for (int i = 0; font_.authentic()
+             && i < static_cast<int>(choices_.size()); ++i) {
+            // TXT_SELECT+i as AVG_ControlSelectWindow sets it: SYS_FONT,
+            // DSP_SetTextKage 2, FCT_GLAY (192) - FCT_NORMAL (255) only for
+            // the option under the pointer, and only once cond 0 asks - and
+            // while typing, DSP_SetTextAlph -1 with
+            // DSP_SetTextCount( cnt - j*4 ), which TXT_DrawTextEx turns into
+            //     alph2 = LIM( text_cnt - cnt2, 0, 16 ) * 16
+            // per character.  Then its two passes: every shadow of the
+            // object, then every glyph.
+            const int count = typed
+                ? -1 : std::clamp(choice_reveal_count(i), 0, 1024);
+            const std::uint8_t shade =
+                typed && i == choice_highlight_ ? 255 : 192;
+            struct Held {
+                float x;
+                float y;
+                std::string text;
+                int alpha;
+            };
+            std::vector<Held> held;
+            const auto counted = choice_layout(i);
+            const std::string text = choice_engine_text(i);
+            for (std::size_t k = 0; k < counted.glyph_x.size()
+                 && k < counted.glyph_off.size(); ++k) {
+                const int alpha = count < 0 ? 256
+                    : std::clamp(count - counted.glyph_count[k], 0, 16) * 16;
+                if (alpha <= 0) {
+                    continue;
+                }
+                const auto begin =
+                    static_cast<std::size_t>(counted.glyph_off[k]);
+                const auto bytes = utf8_prefix_bytes(
+                    std::string_view(text).substr(begin), 1);
+                held.push_back({static_cast<float>(counted.glyph_x[k]),
+                                static_cast<float>(counted.glyph_y[k]),
+                                text.substr(begin, bytes), alpha});
+            }
+            for (const auto& g : held) {
+                font_.draw_authentic_shadow(
+                    renderer_, g.x, g.y, g.text,
+                    static_cast<std::uint8_t>(std::min(255, g.alpha * 255 / 256)),
+                    g.alpha);
+            }
+            for (const auto& g : held) {
+                font_.draw(
+                    renderer_, g.x, g.y, g.text, shade, shade, shade,
+                    static_cast<std::uint8_t>(std::min(255, g.alpha * 255 / 256)),
+                    g.alpha);
+            }
+        }
+        for (int i = 0; !font_.authentic()
+             && i < static_cast<int>(choices_.size()); ++i) {
             const auto highlighted = i == choice_highlight_;
             int budget = choice_reveal_count(i);
             for (const auto& line : choice_lines(choices_[i], i)) {
@@ -913,6 +1314,7 @@ void Game::draw_frame()
             }
         }
     }
+    text_shake_ = {};
     SDL_SetRenderViewport(renderer_, nullptr);
     if (ui_mode_ == UiMode::game) {
         draw_click_indicator();
@@ -921,7 +1323,10 @@ void Game::draw_frame()
         draw_backlog();
     }
     select_sidebar();
-    if ((ui_mode_ == UiMode::game || ui_mode_ == UiMode::backlog) && message_visible_) {
+    // ControlHistorySystem: if( NovelMessage.disp && !Avg.demo ) - the bar
+    // is not put up while a demo (SetDemoFlag) is running the scene.
+    if ((ui_mode_ == UiMode::game || ui_mode_ == UiMode::backlog)
+        && message_visible_ && !demo_mode_) {
         draw_sidebar();
     }
     select_overlay();

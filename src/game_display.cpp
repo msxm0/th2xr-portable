@@ -11,6 +11,17 @@ namespace th2app {
 void Game::build_display()
 {
     display_.emplace(renderer_);
+    // The engine's integer blend, if the renderer and the shader allow it.
+    // Not fatal when they do not - SDL's own blend stands in, one or two
+    // levels brighter on anything composited, which is what the comparison
+    // harness measures as the remaining difference.
+    // enable_exact_blend reports which path it took; there are three and a
+    // single line here could only describe two of them.
+    display_->enable_exact_blend(blend_shader_dir());
+    // Glyph masks through the same shader rather than a RenderPoint per
+    // covered pixel: it is what makes the destination half of a glyph's
+    // blend truncate the way FNT_Draw does, and it is far cheaper besides.
+    font_.set_exact_blend(display_->gl_exact_blend());
     avg_char_.emplace(*display_, character_hooks());
     avg_back_.emplace(*display_, background_hooks());
     avg_msg_.emplace(*display_, avg_back_->back(), message_hooks());
@@ -104,15 +115,72 @@ void Game::setup_background_graphs(
     // leave them.  The only one left here is the wipe, whose outgoing
     // snapshot is a texture of ours rather than a bitmap the engine made.
     const bool wiping = transition_drives_graphs();
+    // AVG_ControlBackChange's BAK_SLIDE_* write DSP_SetGraphMove on GRP_BACK
+    // and GRP_BACK+1 every frame, and this pass - which runs after it -
+    // re-seats both graphs, which puts them back at 0,0.  The slide ran in
+    // the engine's state and never reached the screen: the outgoing picture
+    // sat still until the wipe ended and then vanished.  The moves are the
+    // control pass's, so they are carried across and put back at the end.
+    const bool sliding = wiping && back().fd_type >= th2::bak_slide_up
+        && back().fd_type <= th2::bak_slide_le;
+    const int slide_dx0 = display().graph(th2::grp_back).dx;
+    const int slide_dy0 = display().graph(th2::grp_back).dy;
+    const int slide_dx1 = display().graph(th2::grp_back + 1).dx;
+    const int slide_dy1 = display().graph(th2::grp_back + 1).dy;
+    // And, with Avg.level on, DRW_BLD(rate) on both - which set_graph below
+    // resets on GRP_BACK+1.  Opaque, the outgoing snapshot covered the frame
+    // before it; blended, it lets the previous frame through, which is where
+    // the engine's trail of the picture's bottom rows comes from.
+    const auto slide_param0 = display().graph(th2::grp_back).param;
+    const auto slide_param1 = display().graph(th2::grp_back + 1).param;
+    // BAK_CFZOOM1..4 are the same story with DSP_SetGraphZoom2 in place of
+    // the moves: CFZOOM2 zooms the outgoing snapshot on GRP_BACK+1, and the
+    // re-seat below turned it back into a plain rectangle, so the old
+    // picture sat still under the incoming one instead of rushing forward.
+    const bool cfzooming = wiping && back().fd_type >= th2::bak_cfzoom1
+        && back().fd_type <= th2::bak_cfzoom4;
+    const auto zoom0 = display().graph(th2::grp_back);
+    const auto zoom1 = display().graph(th2::grp_back + 1);
     if (wiping) {
-        display().set_graph(
-            th2::grp_back, back_bmp, th2::lay_back + 1, true, th2::check_none);
-        display().borrow_bmp(
-            th2::bmp_back + 1, transition_->previous.get(),
-            th2::display_width, th2::display_height, false);
-        display().set_graph(
-            th2::grp_back + 1, th2::bmp_back + 1, th2::lay_back, true,
-            th2::check_none);
+        // Only when it is not already set up that way.  DSP_SetGraph resets
+        // the graph, and that includes its draw parameter - the DRW_BLD(rate)
+        // AVG_ControlBackChange had just written.  This pass runs after the
+        // control pass, so re-asserting the graph every frame quietly threw
+        // the blend away and the incoming background composited opaque: a
+        // two hundred and forty tick cross fade that was over on its first
+        // frame.  The branch below has always been guarded this way.
+        if (display().graph(th2::grp_back).bno != back_bmp
+            || display().graph(th2::grp_back).layer != th2::lay_back + 1) {
+            // On the frame the wipe starts this has to run, and it still
+            // clears the parameter - so put it back.  AVG_ControlBackChange
+            // has already advanced fd_cnt and written DRW_BLD(rate) for this
+            // frame by the time the display pass gets here; dropping it cost
+            // the fade its first frame, which for a cross fade is the one
+            // where the outgoing picture is supposed to be untouched.
+            const auto param = display().graph(th2::grp_back).param;
+            display().set_graph(
+                th2::grp_back, back_bmp, th2::lay_back + 1, true,
+                th2::check_none);
+            display().set_graph_param(th2::grp_back, param);
+        }
+        // BAK_CFZOOM1 and BAK_CFZOOM4 take no snapshot - AVG_SetBack's
+        // switch has nothing for them - and draw GRP_BACK alone at a partial
+        // DRW_BLD over whatever the last frame left, so the new picture
+        // accumulates into the old one frame by frame.  With the snapshot
+        // under it every frame the mix could never get past the blend level
+        // and the zoom sat half faded until it ended.
+        const bool no_snapshot = back().fd_type == th2::bak_cfzoom1
+            || back().fd_type == th2::bak_cfzoom4;
+        if (no_snapshot) {
+            display().reset_graph(th2::grp_back + 1);
+        } else {
+            display().borrow_bmp(
+                th2::bmp_back + 1, transition_->previous.get(),
+                th2::display_width, th2::display_height, false);
+            display().set_graph(
+                th2::grp_back + 1, th2::bmp_back + 1, th2::lay_back, true,
+                th2::check_none);
+        }
     } else {
         // Not wiping.  GRP_BACK+1 is shared between the wipe's outgoing
         // snapshot and the half tone's darkened plate - AVG_SetBack parks
@@ -146,7 +214,7 @@ void Game::setup_background_graphs(
     }
 
     const auto view = current_background_view();
-    if (wiping) {
+    if (wiping && display().graph(th2::grp_back + 1).bno == th2::bmp_back + 1) {
         // The snapshot is a picture of the whole screen, so it goes back
         // one to one rather than through BackStruct's window.
         display().set_graph_pos(
@@ -172,6 +240,73 @@ void Game::setup_background_graphs(
                 static_cast<int>(view.y), th2::display_width,
                 th2::display_height);
         }
+    }
+
+    // AVG_ControlBackScroll's zoom (sc_type 3..5) leaves the source alone -
+    // the whole bitmap - and moves and sizes the *destination*:
+    //     x = -( sx*DISP_X/sw*cnt + x*DISP_X/w*(max-cnt) )/max;  ...
+    //     w =  ( bw*DISP_X/sw*cnt + bw*DISP_X/w*(max-cnt) )/max; ...
+    //     DSP_SetGraphPosZoom( GRP_BACK, x, y, w, h, 0, 0, bw, bh );
+    // Framing it as a source window stretched over the screen asks for the
+    // same picture but walks the rasteriser's DDA the other way round, and
+    // every column and row of the zoom sampled a different texel.
+    {
+        const auto& bk = back();
+        if (bk.sc_flag && bk.sc_type / 3 == 1 && bk.sw > 0 && bk.sh > 0
+            && bk.w > 0 && bk.h > 0) {
+            int bw = 0;
+            int bh = 0;
+            display().get_graph_bmp_size(th2::grp_back, &bw, &bh);
+            int max = std::max(1, effect_frames4(bk.sc_max));
+            int cnt = bk.sc_cnt;
+            switch (bk.sc_type) {
+            case 4:
+                cnt = cnt * cnt;
+                max = max * max;
+                break;
+            case 5:
+                cnt = max - cnt;
+                cnt = cnt * cnt;
+                max = max * max;
+                cnt = max - cnt;
+                break;
+            default:
+                break;
+            }
+            const int dw = th2::display_width;
+            const int dh = th2::display_height;
+            const int x = -(bk.sx * dw / bk.sw * cnt
+                            + bk.x * dw / bk.w * (max - cnt)) / max;
+            const int y = -(bk.sy * dh / bk.sh * cnt
+                            + bk.y * dh / bk.h * (max - cnt)) / max;
+            const int w = (bw * dw / bk.sw * cnt
+                           + bw * dw / bk.w * (max - cnt)) / max;
+            const int h = (bh * dh / bk.sh * cnt
+                           + bh * dh / bk.h * (max - cnt)) / max;
+            display().set_graph_pos_zoom(
+                th2::grp_back, x, y, w, h, 0, 0, bw, bh);
+        }
+    }
+
+    if (cfzooming) {
+        for (const auto& [gno, saved] :
+             {std::pair{th2::grp_back, zoom0},
+              std::pair{th2::grp_back + 1, zoom1}}) {
+            if (display().graph(gno).bno != saved.bno) {
+                continue;
+            }
+            if (saved.poly == th2::Poly::zoom) {
+                display().set_graph_zoom2(gno, saved.cx, saved.cy, saved.zoom);
+            }
+            display().set_graph_param(gno, saved.param);
+        }
+    }
+
+    if (sliding) {
+        display().set_graph_move(th2::grp_back, slide_dx0, slide_dy0);
+        display().set_graph_move(th2::grp_back + 1, slide_dx1, slide_dy1);
+        display().set_graph_param(th2::grp_back, slide_param0);
+        display().set_graph_param(th2::grp_back + 1, slide_param1);
     }
 
     if (shake_background) {
@@ -264,7 +399,19 @@ th2::AvgChar::Hooks Game::character_hooks()
     // the baked one.  A bake cannot be undone in place, so this is how a
     // character comes out of the background.
     hooks.copy_back = [this] {
-        background_baked_dirty_ = true;
+        // AVG_CopyBack( OFF ) is DSP_CopyBmp( BMP_BACK, BMP_BACK2 ) and
+        // nothing else - the clean plate back, with nobody composited into
+        // it.  AVG_ControlChar restores it exactly when it is about to reset
+        // every cut_mode to 0 and let its own per-character pass decide who
+        // goes back in; the ones it has just flagged `disp` stay out, because
+        // they are being drawn as layers over an animating neighbour.
+        //
+        // Marking the plate dirty here instead ran rebuild_baked_background,
+        // whose AVG_SetBackChar bakes every settled character with no regard
+        // for that flag - so the one being drawn live went into the plate as
+        // well and was composited twice.  Over an opaque texel that is
+        // idempotent and invisible; over an antialiased one it is not, which
+        // is why only the outline drifted, and further with every restore.
         copy_back_plate();
     };
     // BMP_BACKHALF is a copy of BMP_BACK, so a bake makes it out of date.

@@ -98,13 +98,24 @@ void test_accumulation()
 
 // DSP_SetTextCount( n ) draws every character whose count has been reached,
 // and alph2 = LIM( text_cnt - cnt2, 0, 16 ) * 16 fades in the last sixteen.
+//
+// The counts include one more character than you would expect, always at
+// alpha zero.  TXT_DrawTextEx's loop is
+//
+//     while( cnt2 < text_cnt || text_cnt==-1 || (cnt2==text_cnt && !amari) )
+//
+// so the character sitting exactly on the count is entered and drawn with
+// LIM(text_cnt-cnt2,0,16)*16 == 0 - invisible, but counted.  These two
+// expectations used to be one lower, which is what the implementation did
+// rather than what the engine does: the reference's own per-glyph trace
+// emits "10" at count 1, two characters, the second of them blank.
 void test_visible_prefix()
 {
     const auto counted = th2::txt_count_text("abcdef");
-    check_equal(static_cast<int>(th2::txt_visible_glyphs(counted, 0)), 0,
-                "nothing is shown at count zero");
-    check_equal(static_cast<int>(th2::txt_visible_glyphs(counted, 3)), 3,
-                "three characters at count three");
+    check_equal(static_cast<int>(th2::txt_visible_glyphs(counted, 0)), 1,
+                "the character on the count is entered, at alpha zero");
+    check_equal(static_cast<int>(th2::txt_visible_glyphs(counted, 3)), 4,
+                "three characters at count three, plus the blank one");
     check_equal(static_cast<int>(th2::txt_visible_glyphs(counted, 99)), 6,
                 "everything once the count is past the end");
     check_equal(static_cast<int>(th2::txt_visible_glyphs(counted, -1)), 6,

@@ -1,5 +1,7 @@
 #include "avg_char.hpp"
 
+#include <SDL3/SDL.h>
+
 #include <algorithm>
 
 namespace th2 {

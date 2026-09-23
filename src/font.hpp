@@ -2,6 +2,8 @@
 
 #include "archive.hpp"
 
+#include "gl_blend.hpp"
+
 #include <SDL3/SDL.h>
 
 #include <cstdint>
@@ -46,10 +48,16 @@ public:
     // Distance from the top of a line to the text baseline, in logical
     // units; 0 for the bitmap font, which has no metrics to ask.
     float ascent() const;
+    // `alpha_256` is the rasteriser's own alph2, 0..256, and when it is
+    // given the glyph is composited with the engine's integer arithmetic
+    // instead of SDL's - see set_glyph_colour in font.cpp.  -1 keeps the
+    // straight-alpha path, which is what every caller outside the vanilla
+    // message layout wants.
     void draw(
         SDL_Renderer* renderer, float x, float y, std::string_view text,
         std::uint8_t red = 255, std::uint8_t green = 255,
-        std::uint8_t blue = 255, std::uint8_t alpha = 255) const;
+        std::uint8_t blue = 255, std::uint8_t alpha = 255,
+        int alpha_256 = -1) const;
     void draw_original(
         SDL_Renderer* renderer, float x, float y, std::string_view text,
         std::uint8_t red = 255, std::uint8_t green = 255,
@@ -60,10 +68,31 @@ public:
         std::uint8_t blue = 255, std::uint8_t alpha = 255) const;
     void draw_authentic_shadow(
         SDL_Renderer* renderer, float x, float y, std::string_view text,
-        std::uint8_t alpha = 255) const;
+        std::uint8_t alpha = 255, int alpha_256 = -1) const;
+
+    // Composite glyphs through the engine's own arithmetic instead of
+    // plotting them point by point.
+    //
+    // A point draw leaves the destination half of the blend to the blend
+    // unit, which rounds where FNT_Draw truncates, and a glyph over its own
+    // shadow stacks two of those - the last pixels in the port that were
+    // more than a level off the reference.  Handing the mask to the shader
+    // fixes that and is far cheaper besides: one composite per glyph instead
+    // of a RenderPoint per covered pixel.
+    //
+    // Null disables it and the point path stands in unchanged.
+    void set_exact_blend(GlExactBlend* blend);
 
 private:
     struct Modern;
+    struct ExactGlyphs;
+    std::unique_ptr<ExactGlyphs> exact_;
+    // Returns false when the mask could not be composited, in which case the
+    // caller plots it.
+    bool draw_mask_exact(
+        SDL_Renderer* renderer, float x, float y, int width, int height,
+        const std::uint8_t* bitmap, int red, int green, int blue,
+        int alpha_256) const;
     static constexpr int size = 24;
     static constexpr int width = 12;
     std::vector<std::uint8_t> data_;
@@ -82,12 +111,12 @@ private:
     void draw_bitmap(
         SDL_Renderer* renderer, float x, float y, std::string_view text,
         std::uint8_t red, std::uint8_t green, std::uint8_t blue,
-        std::uint8_t alpha) const;
+        std::uint8_t alpha, int alpha_256 = -1) const;
     void draw_bitmap_face(
         SDL_Renderer* renderer, const std::vector<std::uint8_t>& data,
         int font_size, int half_width, float x, float y,
         std::string_view text, std::uint8_t red, std::uint8_t green,
-        std::uint8_t blue, std::uint8_t alpha) const;
+        std::uint8_t blue, std::uint8_t alpha, int alpha_256 = -1) const;
 };
 
 }  // namespace th2

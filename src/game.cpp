@@ -1,4 +1,5 @@
 #include "game.hpp"
+#include "engine_rand.hpp"
 
 #include "data_source.hpp"
 
@@ -19,6 +20,8 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstdio>
 #include <chrono>
 #include <exception>
 #include <filesystem>
@@ -29,6 +32,19 @@ extern "C" {
 
 namespace th2app {
 
+// The shader pattern wipe, by default: it avoids a readback per wipe frame,
+// which is the difference between a wipe costing nothing and costing a
+// pipeline sync twice a frame - and in the browser that matters most.
+//
+// It earns the default by being exact.  It was not, for a long time, and the
+// cause was not arithmetic: the mask was read upside down.  The normalised
+// lookup flipped it (v_mask_uv = 1.0 - clip.y) on the assumption that GL's y
+// runs opposite to SDL's, which is not true of a render target - SDL's
+// projection already lines them up.  Reading row 599-y of the mask instead
+// of row y put the wipe front a step out wherever the mask is a gradient.
+//
+// --cpu-transitions still forces the CPU blend, which is also exact and is
+// what the shader was checked against.
 bool force_cpu_transitions = false;
 bool trace_prefetch = false;
 
@@ -128,9 +144,20 @@ Game::Game(
 #endif
     if (window_) {
         SDL_PropertiesID renderer_properties = SDL_CreateProperties();
+        // GLES, everywhere.  SDL_GPU has no WebGL backend, so anything built
+        // on it is desktop-only by construction and the browser gets a
+        // different renderer with a different set of features - two shader
+        // stacks, each platform missing half of them.  GLES is the one that
+        // runs in both places, and with the exact-blend shader it now
+        // measures identically to what SDL_GPU achieved: 343 of 2000 ticks
+        // over a two-level gate, the same first tick, the same worst pixel.
+        //
+        // TH2_RENDERER still overrides it, which is how the two were
+        // compared on one machine.
+        const char* wanted = SDL_getenv("TH2_RENDERER");
         SDL_SetStringProperty(
             renderer_properties, SDL_PROP_RENDERER_CREATE_NAME_STRING,
-            SDL_GPU_RENDERER);
+            (wanted && *wanted) ? wanted : "opengles2");
         SDL_SetPointerProperty(
             renderer_properties, SDL_PROP_RENDERER_CREATE_WINDOW_POINTER,
             window_);
@@ -151,6 +178,10 @@ Game::Game(
         }
     }
     renderer_holder_.reset(renderer_);
+    if (renderer_) {
+        const char* got = SDL_GetRendererName(renderer_);
+        SDL_Log("Renderer backend: %s", got ? got : "?");
+    }
     if (!window_ || !renderer_) {
         throw std::runtime_error(SDL_GetError());
     }
@@ -282,6 +313,9 @@ Game::Game(
 
 Game::~Game()
 {
+    // The trace clock captures `this`, and it lives in a static, so it has
+    // to go before this object does.
+    th2::AudioChannel::set_clock(nullptr);
     // All SDL resources are owned by members declared after
     // window_holder_/renderer_holder_, so they are destroyed before the
     // renderer/window and before SDL_Quit().  Only the config needs an
@@ -300,6 +334,23 @@ int Game::run()
         }
         throw;
     }
+}
+
+// Which option a key names, 0..9, or -1 for a key that is not a digit.  The
+// engine folds the keypad onto the number row (KeyCond.trg.kJ || .nJ), so
+// both spell the same option.
+int Game::choice_number_key(SDL_Keycode key)
+{
+    if (key >= SDLK_0 && key <= SDLK_9) {
+        return static_cast<int>(key - SDLK_0);
+    }
+    if (key >= SDLK_KP_1 && key <= SDLK_KP_9) {
+        return static_cast<int>(key - SDLK_KP_1) + 1;
+    }
+    if (key == SDLK_KP_0) {
+        return 0;
+    }
+    return -1;
 }
 
 bool Game::is_confirm_key(SDL_Keycode key)
@@ -558,6 +609,37 @@ void Game::sync_web_canvas_buffer()
 
 void Game::iterate()
 {
+    if (trace_mode_) {
+        // A trace run starts in the scenario rather than at the title: the
+        // two title screens are not the same program and never will be, so
+        // aligning them would be aligning the wrong thing.
+        if (trace_tick_ == 0 && ui_mode_ != UiMode::game) {
+            movie_.reset();
+            start_new_game();
+        }
+        {
+            // TH2_RAND_LOG: engine_rand() calls made during each tick, the
+            // port's side of the reference's TH2REF_RAND_LOG.
+            static std::FILE* rand_log = [] {
+                const char* path = std::getenv("TH2_RAND_LOG");
+                return path && *path ? std::fopen(path, "w") : nullptr;
+            }();
+            static std::uint64_t rand_seen = th2::engine_rand_calls;
+            if (rand_log && th2::engine_rand_calls != rand_seen) {
+                std::fprintf(rand_log, "%llu %llu\n",
+                             static_cast<unsigned long long>(trace_tick_),
+                             static_cast<unsigned long long>(
+                                 th2::engine_rand_calls - rand_seen));
+                std::fflush(rand_log);
+                rand_seen = th2::engine_rand_calls;
+            }
+        }
+        ++trace_tick_;
+        if (trace_last_tick_ && trace_tick_ > trace_last_tick_) {
+            running_ = false;
+            return;
+        }
+    }
     // An ESC_WAIT opcode parks the virtual machine for the rest of the frame
     // it ran in.  That frame is over, so the park is retired before the
     // player's input is looked at rather than after - a click arriving on
@@ -704,15 +786,10 @@ void Game::iterate()
             const bool dismiss =
                 event.type == SDL_EVENT_MOUSE_BUTTON_DOWN
                 || event.type == SDL_EVENT_KEY_DOWN;
-            const float frame = static_cast<float>(
-                std::chrono::duration<double>(
-                    std::chrono::steady_clock::now()
-                    - calendar_state_->started).count() * 60.0);
             if (dismiss && !calendar_state_->dismissing
-                && frame >= 16.0f) {
+                && calendar_state_->frame >= 16) {
                 calendar_state_->dismissing = true;
-                calendar_state_->started =
-                    std::chrono::steady_clock::now();
+                calendar_state_->frame = 0;
             }
             continue;
         }
@@ -812,9 +889,17 @@ void Game::iterate()
             if (event.key.key == SDLK_PAGEUP) {
                 open_backlog();
             } else if (choosing_) {
-                if (is_confirm_key(event.key.key)) {
-                    choice_selected_ = choice_highlight_;
-                    manual_advance();
+                // The number row answers a choice outright, which is what
+                // AVG_ControlSelectWindow does with GameKey.num[]: "1" is the
+                // first option.  num[0] resolves to select -1 there and is
+                // thrown away by the `select>=0` guard, so "0" does nothing
+                // here either.
+                const int digit = choice_number_key(event.key.key);
+                if (digit > 0
+                    && digit <= static_cast<int>(choices_.size())) {
+                    answer_choice(digit - 1);
+                } else if (is_confirm_key(event.key.key)) {
+                    answer_choice(choice_highlight_);
                 } else if (event.key.key == SDLK_UP) {
                     if (choice_highlight_ > 0) {
                         --choice_highlight_;
@@ -878,17 +963,14 @@ void Game::iterate()
                 }
                 if (choosing_) {
                     const float mouse_y = event.button.y;
-                    float y = choice_y_start();
                     for (int i = 0;
                          i < static_cast<int>(choices_.size()); ++i) {
-                        const float height =
-                            choice_height(choices_[i]);
-                        if (mouse_y >= y && mouse_y < y + height) {
-                            choice_selected_ = i;
-                            manual_advance();
+                        const float y = choice_row_y(i);
+                        if (mouse_y >= y
+                            && mouse_y < y + choice_row_height(i)) {
+                            answer_choice(i);
                             break;
                         }
-                        y += choice_height(choices_[i]);
                     }
                 } else {
                     manual_advance();
@@ -918,16 +1000,14 @@ void Game::iterate()
             update_sidebar_hover(event.motion.x, event.motion.y);
             if (choosing_) {
                 const float mouse_y = event.motion.y;
-                float y = choice_y_start();
                 for (int i = 0;
                      i < static_cast<int>(choices_.size()); ++i) {
-                    const float height =
-                        choice_height(choices_[i]);
-                    if (mouse_y >= y && mouse_y < y + height) {
+                    const float y = choice_row_y(i);
+                    if (mouse_y >= y
+                        && mouse_y < y + choice_row_height(i)) {
                         choice_highlight_ = i;
                         break;
                     }
-                    y += height;
                 }
             }
         } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP
@@ -986,6 +1066,23 @@ void Game::iterate()
     // character on screen before AVG_ControlChar had given it its first
     // DRW_BLD, and raised the half tone after AVG_ControlHalfTone had
     // already run for the frame, which is text over an undarkened plate.
+    //
+    // One tick count for the whole frame, and taken here rather than inside
+    // the control pass below, because the script pass needs it too:
+    // AVG_WaitFrame counts a frame from inside EXEC_ControlLang, and our
+    // pump runs once per drawn frame rather than once per sixtieth, so on a
+    // 144Hz display it would otherwise count more than twice as fast as the
+    // engine does.  control_ticks_due() spends the accumulator, so it may
+    // only be asked once a frame - the two control passes below read this
+    // instead of asking again.
+    control_steps_ = control_ticks_due();
+    // Before the script runs, not after: an ESC_WAIT re-asks its predicate
+    // as part of the script pass.  See Game::refresh_audio_wait.
+    refresh_audio_wait(true);
+    // Before the script pass: the clock and the calendar are waits the script
+    // asks about, so stepping them afterwards left it reading last tick's
+    // frame and leaving one tick late.
+    update_clock_calendar();
     pump_script();
     if (soak_) {
         soak_->step();
@@ -996,7 +1093,6 @@ void Game::iterate()
     update_playback_modes();
     update_title();
     if (soak_) {
-        control_steps_ = control_ticks_due();
         if (control_steps_ > 0) {
             get_game_key();
         } else {
@@ -1012,8 +1108,7 @@ void Game::iterate()
         update_half_tone();
         update_screen_flash();
         update_character_animations(control_steps_);
-        update_clock_calendar();
-        update_sakura();
+            update_sakura(control_steps_);
         retire_soak_gpu_work();
         next_frame_ = std::chrono::steady_clock::now();
         return;
@@ -1074,8 +1169,8 @@ void Game::iterate()
     draw_name_input();
     // MAIN_GameControl: AVG_System's chain, in its order.  One tick count
     // for the whole pass, so the background, the half tone and the
-    // characters all advance by the same number of sixtieths.
-    control_steps_ = control_ticks_due();
+    // characters all advance by the same number of sixtieths.  Counted at
+    // the top of the frame, next to the script pass.
     if (control_steps_ > 0) {
         get_game_key();
     } else {
@@ -1090,6 +1185,11 @@ void Game::iterate()
     //     AVG_ControlText();
     //     AVG_ControlBack();
     //     AVG_ControlChar();
+    // Before the control chain, which is after everything is drawn: this is
+    // the frame as the screen saw it.  See Game::trace_glyph_drawn_.
+    if (trace_mode_) {
+        trace_glyph_drawn_ = trace_glyph_alpha();
+    }
     control_system2();
     for (int i = 0; i < control_steps_; ++i) {
         msg().control_novel_message(game_key_);
@@ -1100,8 +1200,10 @@ void Game::iterate()
     update_half_tone();
     update_screen_flash();
     update_character_animations(control_steps_);
-    update_clock_calendar();
-    update_sakura();
+    update_sakura(control_steps_);
+    // AVG_System runs AVG_ControlSelectWindow late, after AVG_ControlChar and
+    // the weather and warp passes rather than with the message control.
+    control_select_window();
     // main.cpp runs EXEC_ControlLang, then MAIN_GameControl - the AVG_
     // Control* chain - and only then MAIN_DrawGraph.  Drawing before the
     // control pass meant anything the script had just set up was put on
@@ -1109,20 +1211,50 @@ void Game::iterate()
     // arriving showed at full opacity for a frame before AVG_ControlChar
     // gave it DRW_BLD(0) and started the fade.
     draw();
+    // After the whole tick, not before it - which is where the reference
+    // writes its line, at the end of MAIN_Loop's tick body.  Taken at the
+    // top instead, our line for tick N described the state after tick N-1
+    // while the reference's described the state after tick N, and the half
+    // frame of skew between them turned up as a phantom one-tick lag in
+    // whichever field happened to change that frame.  A comparison cannot
+    // tell an off-by-one in the engine from an off-by-one in its own
+    // instrument, so the instrument has to be pinned first.
+    if (trace_mode_) {
+        // Resume before the line, save after it: the first line a resumed
+        // run writes has to describe the loaded state, and the checkpoint
+        // has to describe the same instant as the last line before it.
+        trace_checkpoint_resume();
+        trace_dump_state();
+        trace_checkpoint_save();
+        if (trace_hold_tick_ && trace_tick_ == trace_hold_tick_) {
+            SDL_Log("trace: holding at tick %llu for %d s",
+                    static_cast<unsigned long long>(trace_tick_),
+                    trace_hold_seconds_);
+            std::this_thread::sleep_for(
+                std::chrono::seconds(trace_hold_seconds_));
+        }
+    }
 #ifdef __EMSCRIPTEN__
     // run_loop() paces the browser build with requestAnimationFrame; there is
     // no thread to sleep on.  All animation is wall-clock driven, so a display
     // refresh above 60 Hz simply renders more often.
     next_frame_ = std::chrono::steady_clock::now();
 #else
-    constexpr auto frame_duration = std::chrono::nanoseconds(
-        1'000'000'000 / 60);
-    next_frame_ += frame_duration;
-    const auto now = std::chrono::steady_clock::now();
-    if (next_frame_ > now) {
-        std::this_thread::sleep_until(next_frame_);
-    } else if (now - next_frame_ > frame_duration * 4) {
-        next_frame_ = now;
+    // A trace tick is a unit of engine progress, not of time: nothing in the
+    // run reads a clock, so there is nothing for it to be in step with.
+    // Sleeping here would pace the replay at sixty ticks a second, which is
+    // the whole cost of getting to a divergence - the engine itself computes
+    // a tick in well under a millisecond.
+    if (!trace_mode_) {
+        constexpr auto frame_duration = std::chrono::nanoseconds(
+            1'000'000'000 / 60);
+        next_frame_ += frame_duration;
+        const auto now = std::chrono::steady_clock::now();
+        if (next_frame_ > now) {
+            std::this_thread::sleep_until(next_frame_);
+        } else if (now - next_frame_ > frame_duration * 4) {
+            next_frame_ = now;
+        }
     }
 #endif
 }
@@ -1153,6 +1285,17 @@ int main(int argc, char** argv)
         std::optional<std::filesystem::path> scenario;
         std::optional<std::filesystem::path> soak_directory;
         std::size_t soak_runs = 1;
+        std::optional<std::filesystem::path> trace_directory;
+        std::optional<std::filesystem::path> trace_input;
+        std::uint64_t trace_ticks = 0;
+        std::uint64_t trace_first = 0;
+        std::uint64_t trace_lead = 0;
+        std::uint64_t trace_hold = 0;
+        int trace_hold_seconds = 20;
+        std::filesystem::path trace_save_file;
+        std::uint64_t trace_save_at = 0;
+        std::filesystem::path trace_resume_file;
+        std::uint64_t trace_resume_trigger = 0;
         bool data_set = false;
         for (int index = 1; index < argc; ++index) {
             const std::string_view argument = argv[index];
@@ -1161,6 +1304,64 @@ int main(int argc, char** argv)
                     throw std::runtime_error("--scenario requires an SDT path");
                 }
                 scenario = argv[index];
+            } else if (argument == "--trace") {
+                if (++index >= argc) {
+                    throw std::runtime_error("--trace requires a directory");
+                }
+                trace_directory = argv[index];
+            } else if (argument == "--trace-input") {
+                if (++index >= argc) {
+                    throw std::runtime_error("--trace-input requires a path");
+                }
+                trace_input = argv[index];
+            } else if (argument == "--trace-ticks") {
+                if (++index >= argc) {
+                    throw std::runtime_error("--trace-ticks requires a count");
+                }
+                trace_ticks = std::stoull(argv[index]);
+            } else if (argument == "--trace-hold") {
+                if (++index >= argc) {
+                    throw std::runtime_error("--trace-hold requires a tick");
+                }
+                trace_hold = std::stoull(argv[index]);
+            } else if (argument == "--trace-hold-seconds") {
+                if (++index >= argc) {
+                    throw std::runtime_error("--trace-hold-seconds needs a count");
+                }
+                trace_hold_seconds = std::stoi(argv[index]);
+            } else if (argument == "--trace-lead") {
+                if (++index >= argc) {
+                    throw std::runtime_error("--trace-lead requires a tick");
+                }
+                trace_lead = std::stoull(argv[index]);
+            } else if (argument == "--trace-save-file") {
+                if (++index >= argc) {
+                    throw std::runtime_error(
+                        "--trace-save-file requires a path");
+                }
+                trace_save_file = argv[index];
+            } else if (argument == "--trace-save-at") {
+                if (++index >= argc) {
+                    throw std::runtime_error("--trace-save-at requires a tick");
+                }
+                trace_save_at = std::stoull(argv[index]);
+            } else if (argument == "--trace-resume-file") {
+                if (++index >= argc) {
+                    throw std::runtime_error(
+                        "--trace-resume-file requires a path");
+                }
+                trace_resume_file = argv[index];
+            } else if (argument == "--trace-resume-trigger") {
+                if (++index >= argc) {
+                    throw std::runtime_error(
+                        "--trace-resume-trigger requires a tick");
+                }
+                trace_resume_trigger = std::stoull(argv[index]);
+            } else if (argument == "--trace-from") {
+                if (++index >= argc) {
+                    throw std::runtime_error("--trace-from requires a tick");
+                }
+                trace_first = std::stoull(argv[index]);
             } else if (argument == "--cpu-transitions") {
                 th2app::force_cpu_transitions = true;
             } else if (argument == "--trace-prefetch") {
@@ -1216,7 +1417,8 @@ int main(int argc, char** argv)
         SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
 #endif
         av_log_set_level(AV_LOG_ERROR);   // suppress warnings, keep errors
-        auto discovered_data = discover_game_data_path(data, data_set);
+        auto discovered_data = discover_game_data_path(
+            data, data_set, !trace_directory && !soak_directory);
         if (!discovered_data) {
             SDL_LogError(
                 SDL_LOG_CATEGORY_APPLICATION,
@@ -1241,7 +1443,16 @@ int main(int argc, char** argv)
             th2::data_prefetch_chunk(data / archive, 0, 1 << 20);
         }
 
-        return Game(data, scenario, soak_directory, soak_runs).run();
+        Game game(data, scenario, soak_directory, soak_runs);
+        if (trace_directory) {
+            game.enable_trace(
+                *trace_directory, trace_input, trace_ticks, trace_first,
+                trace_lead);
+            game.set_trace_hold(trace_hold, trace_hold_seconds);
+            game.set_trace_checkpoint(trace_save_file, trace_save_at,
+                                      trace_resume_file, trace_resume_trigger);
+        }
+        return game.run();
     } catch (const std::exception& error) {
         SDL_LogError(
             SDL_LOG_CATEGORY_APPLICATION, "Fatal error: %s", error.what());

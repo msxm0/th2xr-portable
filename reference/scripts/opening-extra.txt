@@ -1,0 +1,9 @@
+# Map screens.  A map is answered by the pointer standing on a destination
+# when a click lands; num1 does nothing there, because AVG_ControlMapEvent
+# reads the cursor's rect and GameKey.click and has no number-key path the way
+# AVG_ControlSelectWindow does.  The rects are per scene and only the ones on
+# the displayed page are enabled, so instead of a coordinate per map, ask the
+# engine every tick: stand on the first enabled destination, or on the
+# page-forward arrow when this page has none.  Inert outside the map, which
+# owns mouse layer 10.
+30 every 1 mappick

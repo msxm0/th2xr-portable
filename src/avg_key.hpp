@@ -15,8 +15,8 @@
 
 namespace th2 {
 
-// GAME_KEY.  The fields the retail game actually reads; u/d/l/r and num[10]
-// are the map screen's, which reads SDL events directly.
+// GAME_KEY.  The fields the retail game actually reads; u/d/l/r are the map
+// screen's, which reads SDL events directly.
 struct GameKey {
     int click = 0;          // enter or left button, on the edge
     int cansel = 0;         // escape, backspace or right button, on the edge
@@ -27,6 +27,15 @@ struct GameKey {
     int home = 0;
     int pup = 0;
     int pdown = 0;
+    // GAME_KEY.num[10].  This was left out as "the map screen's", which is
+    // where it is most visible but not where it matters:
+    // AVG_ControlSelectWindow answers a choice out of it -
+    //     for(j=0;j<SelectWindow.mnum+1;j++)
+    //         if(GameKey.num[j]){ select = j-1; click = 1; }
+    // - so the number row picks an option outright, without hit-testing where
+    // that option's text happened to land.  Without it a traced run could not
+    // answer a choice at all, and stopped at the first one in the game.
+    int num[10] = {};
 };
 
 // The raw device state AVG_GetGameKey folds into a GameKey.  KeyCond in the
@@ -44,6 +53,9 @@ struct KeyCond {
     bool trg_end = false;
     bool btrg_pup = false;
     bool btrg_pdown = false;
+    // KeyCond.trg.k0..k9 || KeyCond.trg.n0..n9, already folded: the engine
+    // treats the keypad and the number row as one key per digit.
+    bool trg_num[10] = {};
 
     bool btn_enter = false;
     bool btn_bs = false;

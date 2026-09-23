@@ -165,6 +165,13 @@ int Game::control_ticks_due()
     // display that refreshes faster the chain has to be stepped by elapsed
     // time instead, or every animation runs at the refresh rate rather than
     // at the speed the script asked for.
+    if (trace_mode_) {
+        // A tick is the frame.  No accumulator, no clamp, no clock - so a
+        // frame that takes four hundred milliseconds to decode a background
+        // still advances the engine by exactly one sixtieth.
+        ++global_count_;
+        return 1;
+    }
     const auto now = std::chrono::steady_clock::now();
     if (character_control_time_ == std::chrono::steady_clock::time_point{}) {
         character_control_time_ = now;
@@ -423,6 +430,8 @@ void Game::play_se(int channel, int sound, bool loop, int volume, int fade,
 {
     const auto name = std::format("SE_{:04d}.WAV", sound);
     if (channel >= 0 && static_cast<std::size_t>(channel) < se_channels_.size()) {
+        trace_note_audio("se2", channel, sound, loop ? 1 : 0, volume);
+        note_sound_started(static_cast<std::size_t>(channel));
         se_channels_[channel].play_streaming(
             ready_audio_decoder(se_archive_, name), loop,
             fade > 0 ? 0.0f : se_gain(volume));
@@ -445,6 +454,8 @@ void Game::play_se(int channel, int sound, bool loop, int volume, int fade,
     const auto index = static_cast<std::size_t>(
         std::distance(transient_se_.begin(), found));
     transient_se_volume_[index] = volume;
+    trace_note_audio("se", -1, sound, loop ? 1 : 0, volume);
+    note_sound_started(se_channels_.size() + index);
     found->play_streaming(
         ready_audio_decoder(se_archive_, name), false, se_gain(volume));
     if (wait_for_completion) {
@@ -463,8 +474,46 @@ void Game::sync_game_flags()
     persistent_state_.save_game_flags(persistent_game_flags_);
 }
 
-void Game::play_bgm(int music, bool loop, int volume)
+void Game::stop_bgm(int fade)
 {
+    trace_note_audio("bgmstop", -1, -1, fade, 0);
+    if (fade <= 0) {
+        bgm_.stop();
+    } else {
+        bgm_.fade_to(0.0f, audio_fade_duration(fade), true);
+    }
+    bgm_track_ = -1;
+}
+
+// for(i=0;i<WAVE_SOUND_NUM;i++) AVG_StopSE2( i, fade ) - AVG_FadeSeAll and
+// the title return's loop.  WAVE_SOUND_NUM is 12; ours keeps more channels,
+// and the ones past it are not the engine's to stop.
+void Game::stop_all_se(int fade)
+{
+    constexpr int wave_sound_num = 12;
+    for (int channel = 0; channel < wave_sound_num
+         && static_cast<std::size_t>(channel) < se_channels_.size(); ++channel) {
+        trace_note_audio("sestop", channel, -1, fade, 0);
+        se_channels_[channel].fade_to(
+            0.0f, audio_fade_duration(std::max(0, fade)), true);
+        se_sound_[channel] = -1;
+    }
+}
+
+void Game::play_bgm(int music, bool loop, int volume, int fade, bool change)
+{
+    trace_note_audio("bgm", -1, music, loop ? 1 : 0, volume);
+    // AVG_PlayBGMEx opens with the negative case and the unchanged case:
+    //     if( mus_no<0 ){ AVG_StopBGM( fade ); return; }
+    //     if( !change ){ if( PlayMusicNo==mus_no ) return; }
+    // `change` is what lets AVG_SetMovie restart a track already playing.
+    if (music < 0) {
+        stop_bgm(fade);
+        return;
+    }
+    if (!change && bgm_track_ == music) {
+        return;
+    }
     static constexpr std::array music_room_tracks{
         0, 10, 29, 11, 12, 13, 14, 30, 27, 1,
         2, 4, 3, 5, 6, 8, 7, 9, 18, 37,
@@ -479,9 +528,6 @@ void Game::play_bgm(int music, bool loop, int volume)
                 std::distance(music_room_tracks.begin(), music_slot)),
             1);
         sync_game_flags();
-    }
-    if (bgm_track_ == music) {
-        return;
     }
     bgm_track_ = music;
     bgm_loop_ = loop;
@@ -510,16 +556,22 @@ void Game::play_bgm(int music, bool loop, int volume)
 
 void Game::play_voice(const th2::Event& event)
 {
-    int character = number(event, 0);
-    if (character >= 10 && character != 28) {
-        character = 99;
-    }
+    const int script_character = number(event, 0);
     const int volume = number(event, 1) < 0
         ? (event.instruction.name == "VV" ? 256 : 255)
         : number(event, 1);
     const bool loop = number(event, 2) > 0;
     const int voice = number(event, 3);
     const int channel = number(event, 4) < 0 ? 0 : number(event, 4);
+    // Where the reference's probe sits: first thing in AVG_PlayVoice, with
+    // the arguments as they arrived - before the cno>=10 -> 99 remap and
+    // before any of the ways the voice turns out not to play.
+    trace_note_audio("voice", channel, script_character,
+                     scenario_number(runtime_.script_name()), voice);
+    int character = script_character;
+    if (character >= 10 && character != 28) {
+        character = 99;
+    }
     if (channel < 0
         || static_cast<std::size_t>(channel) >= voice_channels_.size()) {
         return;
@@ -556,6 +608,7 @@ void Game::play_voice(const th2::Event& event)
         voice_loop_[channel] = false;
         return;
     }
+    trace_note_audio("voicefile", 0, loop ? 1 : 0, volume, 0, name.c_str());
     voice_channel.play_streaming(
         ready_audio_decoder(voice_archive_, voice_entry->name), loop,
         voice_gain(volume, character));
@@ -581,6 +634,7 @@ void Game::replay_backlog_voice(const Game::BacklogVoice& voice)
         return;
     }
     voice_channels_[0].stop();
+    note_sound_started(se_channels_.size() + transient_se_.size());
     voice_channels_[0].play_streaming(
         ready_audio_decoder(voice_archive_, name), false,
         voice_gain(voice.volume, voice.character));
@@ -603,13 +657,121 @@ void Game::update_audio()
     for (auto& channel : voice_channels_) {
         channel.update();
     }
+    // After the script pass: the SE and voice waits.  See
+    // Game::refresh_audio_wait for why the BGM wait is not among them.
+    refresh_audio_wait(false);
+}
+
+// Re-ask whether the sound being waited on has finished.
+//
+// Split out and called immediately before the script pass, because that is
+// when the engine asks.  MW and its siblings are ESC_WAIT opcodes: they park
+// on the instruction and re-evaluate their own predicate inside
+// EXEC_ControlLang every frame, so the frame the sound ends is the frame the
+// script moves on.  Ours used to clear the wait in update_audio(), which
+// runs after pump_script(), so the script did not see it until the frame
+// after - one tick late on every single MW in the game.  It cost exactly one
+// tick at pc 4041 of 010301000.sdt, which is how it was found.
+void Game::refresh_audio_wait(bool before_script)
+{
+    // Which waits clear before the script runs and which after is not a
+    // detail - the two differ by a frame, and the engine is not consistent
+    // about it:
+    //
+    //   SEW  -> AVG_WaitSe (GM_Avg.cpp:2272), which does not look at the
+    //           sound at all: it goes through SeStruct[sno], and the script
+    //           sees the wait a frame late.  Where exactly the flag is
+    //           dropped is NOT identified - SeStruct[].flag is set in
+    //           AVG_PlaySE2 and never cleared anywhere in GM_Avg.cpp - so
+    //           the one-frame lag is measured, not traced to a line.
+    //   MW   -> AVG_WaitBGM (GM_Avg.cpp:2048), asked by the opcode itself
+    //           inside EXEC_ControlLang (main.cpp:267), so it clears the
+    //           same frame.
+    //
+    // Treating both the same way is wrong whichever way you pick: one costs
+    // a tick at pc 4041 of 010301000.sdt, the other gains one at pc 547.
+    if (audio_wait_
+        && (audio_wait_->kind == AudioWaitKind::bgm) != before_script) {
+        return;
+    }
     if (audio_wait_) {
-        const auto& channel = waited_audio_channel();
-        const bool complete = audio_wait_->kind == AudioWaitKind::bgm
-            ? !channel.fading()
-            : !channel.playing();
-        if (complete) {
-            audio_wait_.reset();
+        if (trace_mode_) {
+            // From the tick the sound started, which is what
+            // th2ref_pcm_play records on the other side - not from the tick
+            // something began waiting for it.
+            const auto found = trace_sound_started_.find(audio_wait_->channel);
+            // Nothing recorded means nothing ever started on that channel, and
+            // the reference agrees loudly: th2ref_pcm_status answers PCM_STOP
+            // for a handle it has never seen, so the wait clears at once.
+            // Dating it from `trace_tick_` instead made `started` today's tick
+            // every time it was asked, so the difference below was forever
+            // zero and the wait never cleared - an infinite hang written as an
+            // expression, waiting for the first script to wait on a channel
+            // nothing had played.
+            const bool ever_started = found != trace_sound_started_.end();
+            if (!ever_started
+                || trace_tick_ - found->second >= trace_sound_ticks) {
+                const auto started = ever_started ? found->second : trace_tick_;
+                if (SDL_getenv("TH2_AUDIO_LOG")) {
+                    SDL_Log("audio: wait ch=%zu started %llu cleared at %llu",
+                            audio_wait_->channel,
+                            static_cast<unsigned long long>(started),
+                            static_cast<unsigned long long>(trace_tick_));
+                }
+                audio_wait_.reset();
+            }
+        } else {
+            const auto& channel = waited_audio_channel();
+            const bool complete = audio_wait_->kind == AudioWaitKind::bgm
+                ? !channel.fading()
+                : !channel.playing();
+            if (complete) {
+                audio_wait_.reset();
+            }
+        }
+    }
+}
+
+bool Game::trace_se_playing(std::size_t channel) const
+{
+    const auto found = trace_sound_started_.find(channel);
+    if (found == trace_sound_started_.end()) {
+        return false;
+    }
+    // <=, not <.  The reference's sound is our own stub: th2ref_pcm_status
+    // reports playing while g_tick - start < TH2REF_PCM_TICKS (50), so the
+    // stub stops one tick sooner than this does, and AVG_WaitSe then sees
+    // the wait a frame later still.  Measured: with <, SEW at offset 1305 of
+    // 070000300.sdt fell through a frame before the reference's did.
+    return trace_tick_ - found->second <= trace_sound_ticks;
+}
+
+void Game::trace_note_audio(const char* kind, int a, int b, int c, int d,
+                            const char* name)
+{
+    if (!trace_mode_) {
+        return;
+    }
+    static std::FILE* log = [] {
+        const char* path = SDL_getenv("TH2_AUDIO_LOG");
+        return path ? std::fopen(path, "a") : nullptr;
+    }();
+    if (!log) {
+        return;
+    }
+    std::fprintf(log, "%llu %s %d %d %d %d %s\n",
+                 static_cast<unsigned long long>(trace_tick_), kind,
+                 a, b, c, d, name ? name : "-");
+    std::fflush(log);
+}
+
+void Game::note_sound_started(std::size_t channel)
+{
+    if (trace_mode_) {
+        trace_sound_started_[channel] = trace_tick_;
+        if (SDL_getenv("TH2_AUDIO_LOG")) {
+            SDL_Log("audio: start ch=%zu at tick %llu", channel,
+                    static_cast<unsigned long long>(trace_tick_));
         }
     }
 }
@@ -628,6 +790,22 @@ void Game::load_background_bitmap(Texture texture)
         display().release_bmp(th2::bmp_back2);
         return;
     }
+    // AVG_SetBack drops the whole scroll block when a picture arrives, and
+    // after the "was it found" return above rather than before it: the flag,
+    // the type, the sx/sy chains, and sc_cnt / sc_max.  Only the flag was
+    // being cleared, and only in AvgBack::begin_back, which nothing calls -
+    // so a Z scroll left its counters behind for good.  After the scroll at
+    // pc 5943 of 040415000.sdt ours held sc_cnt 60 / sc_max 30 for the rest
+    // of the run where the reference zeroed both as the next picture landed.
+    // sh is not in the engine's list either.
+    auto& bk = back();
+    bk.sc_flag = 0;
+    bk.sc_type = 0;
+    bk.sw = 0;
+    bk.sx = bk.sx2 = bk.sx3 = bk.sx4 = 0;
+    bk.sy = bk.sy2 = bk.sy3 = bk.sy4 = 0;
+    bk.sc_cnt = 0;
+    bk.sc_max = 0;
     float width = 0.0f;
     float height = 0.0f;
     SDL_GetTextureSize(texture.get(), &width, &height);
@@ -635,6 +813,37 @@ void Game::load_background_bitmap(Texture texture)
         th2::bmp_back, std::move(texture), static_cast<int>(width),
         static_cast<int>(height));
     display().copy_bmp(th2::bmp_back2, th2::bmp_back);
+    // ...then BackStruct.zoom = 0 and AVG_SetBackPos( x, y ), which puts
+    // w/h back to the screen.  Without it they kept the last zoom scroll's
+    // end window, and the next Z interpolated from a frame the new picture
+    // never had: two zooms in a row (040415000.sdt, pc 5943 and 6397) and
+    // the second one started from 700x525 instead of 800x600.
+    if (avg_back_) {
+        bk.zoom = 0;
+        avgback().set_back_pos(static_cast<int>(background_view_.x),
+                               static_cast<int>(background_view_.y));
+    }
+}
+
+void Game::set_bg_scene(int scene)
+{
+    bg_scene_ = scene;
+    // BackStruct.bno, which AVG_SetBack sets from the same value.  Kept in
+    // step here rather than left to the one caller that happened to need it:
+    // an unset bno made AVG_ResetBackHalfTone's early-out compare against
+    // zero forever, and showed up in a state trace as a background the
+    // engine had loaded and we had not.
+    if (avg_back_) {
+        // Only on the way in.  Clearing the background is BackStruct.flag
+        // going to zero in the original; bno keeps whatever it last held,
+        // which is exactly what AVG_ResetBackHalfTone's early-out wants to
+        // compare the next scene against.  Writing -1 here would make that
+        // comparison always fail and re-run a change the engine skips.
+        back().flag = scene >= 0 ? 1 : 0;
+        if (scene >= 0) {
+            back().bno = scene;
+        }
+    }
 }
 
 void Game::set_background(const th2::Event& event, bool keep_characters)
@@ -643,7 +852,7 @@ void Game::set_background(const th2::Event& event, bool keep_characters)
         display().release_bmp(th2::bmp_back);
         display().release_bmp(th2::bmp_back2);
         background_baked_dirty_ = true;
-        bg_scene_ = -1;
+        set_bg_scene(-1);
         background_kind_ = BackgroundKind::background;
         background_tone_curve_.clear();
         background_view_ = {0.0f, 0.0f, 800.0f, 600.0f};
@@ -653,7 +862,7 @@ void Game::set_background(const th2::Event& event, bool keep_characters)
     int scene = number(event, 1) * 10
         + std::max<std::int32_t>(0, number(event, 2));
     scene = seasonal_background_scene(scene);
-    bg_scene_ = scene;
+    set_bg_scene(scene);
     background_kind_ = BackgroundKind::background;
     background_view_ = {
         static_cast<float>(std::max(0, number(event, 4))),
@@ -691,7 +900,7 @@ void Game::set_cg(
     if (number(event, 2) >= 0) {
         visual += number(event, 2);
     }
-    bg_scene_ = visual;
+    set_bg_scene(visual);
     background_kind_ = kind;
     background_view_ = {
         static_cast<float>(std::max(0, number(event, 5))),

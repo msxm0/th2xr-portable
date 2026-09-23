@@ -84,6 +84,17 @@ void Game::return_to_title()
     for (auto& channel : transient_se_) channel.stop();
     for (auto& channel : se_channels_) channel.stop();
     for (auto& channel : voice_channels_) channel.stop();
+    // Going back to the title re-initialises the AVG state - the reference
+    // reads zero for the message machine and the whole BackStruct from the
+    // frame the script is let go, where ours still carried the last scene's
+    // counters (msg_flag/step1/count/max and the fade, shake and brightness
+    // counts, measured at tick 841153 of the route's SetTitle).
+    if (avg_msg_) {
+        msg().init();
+    }
+    if (avg_back_) {
+        avgback().init();
+    }
     ui_mode_ = UiMode::title;
     title_highlight_ = 0;
     title_extras_ = false;
@@ -476,6 +487,11 @@ void Game::draw_name_input()
                 name_nickname_.data(),
                 name_nickname_.data(),
             };
+            // ESC_SetFlag( _DEFAULT_NAME, DefaultCharName ) in the dialog's
+            // OK handler, which compares each field it offered against its
+            // default.  start_new_game seeds flag 5 from this.
+            default_char_name_ = th2::uses_default_voice_name(
+                player_name_, default_player_name_) ? 1 : 0;
             name_input_open_ = false;
             start_new_game();
         }

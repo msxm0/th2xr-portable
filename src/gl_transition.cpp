@@ -1,16 +1,26 @@
 #include "gl_transition.hpp"
 
-// Built where SDL draws through GLES and the headers are known to exist.
-// Nothing here depends on the canvas size: the quad is in clip space and the
-// textures are sampled with normalised coordinates, so it behaves the same
-// on a phone screen as on a desktop one.
-#ifdef __EMSCRIPTEN__
+// Built where SDL draws through GLES and the headers exist.  Nothing here
+// depends on the canvas size: the quad is in clip space and the textures are
+// sampled with normalised coordinates, so it behaves the same on a phone
+// screen as on a desktop one.
+//
+// Desktop too, not only the browser.  SDL_GPU has no WebGL backend, so
+// everything built on it is desktop-only by construction and the web target
+// gets a different renderer with a different set of features - two shader
+// stacks, each platform missing half of them.  Building this one everywhere
+// is the first step off that: it is the stack that can run in both places.
+// It still only does anything when SDL is actually drawing through GLES -
+// renderer_uses_gl() decides that at runtime - so a desktop on the GPU or
+// desktop-GL renderer keeps the CPU blend as before.
+#if defined(__EMSCRIPTEN__) || defined(TH2_HAVE_GLES3)
 #define TH2_GL_TRANSITION 1
 #include <GLES3/gl3.h>
 #endif
 
 #include <SDL3/SDL_log.h>
 
+#include <cstdlib>
 #include <string>
 #include <string_view>
 
@@ -37,13 +47,26 @@ void main() {
 }
 )";
 
-// highp, not mediump: a desktop GPU quietly promotes mediump to 32 bits, but
-// on a phone it really is 16, whose guaranteed range is only +-16384.  The
-// blend's intermediate reaches about 98000 with a wide mask, overflows, and
-// the whole wipe comes out black.  The arithmetic is also folded so it stays
-// in 0..1 rather than scaling up to 0..65280 and dividing back down.
+// The CPU blend's arithmetic, in the CPU blend's integers:
+//
+//     alpha = LIM((mask + offset - 256) * 256 / vague, 0, 255)
+//     out   = ((255 - alpha) * prev >> 8) + (alpha * next >> 8)
+//
+// every divide truncating, and the two terms truncated independently - that
+// is what BlendTable[i][j] = (i*j)>>8 does, and folding them into a single
+// divide by 255 is a level bright on every pixel.  Doing it in float instead - folding the /255
+// into the alpha as 256.0/255.0 and lerping with mix() - is what put this
+// path 3 to 5 levels off the reference where the CPU path was within 1.
+// Truncation is not a detail here; it is the blend.
+//
+// highp int, explicitly: GLES defaults integers in a fragment shader to
+// mediump, whose guaranteed range is only +-32767, and `prev * (255 - alpha)
+// + next * alpha` reaches 130050.  A mediump float would be worse still -
+// fp16 is exact on integers only to 2048.  This is the arithmetic the wipe
+// is, so it gets the width it needs.
 constexpr char fragment_source[] = R"(#version 300 es
 precision highp float;
+precision highp int;
 precision highp sampler2D;
 in vec2 v_uv;
 in vec2 v_mask_uv;
@@ -51,15 +74,36 @@ out vec4 fragment;
 uniform sampler2D u_previous;
 uniform sampler2D u_next;
 uniform sampler2D u_mask;
-uniform float u_offset;
-uniform float u_vague;
+uniform int u_offset;
+uniform int u_vague;
+uniform ivec2 u_mask_size;
+uniform ivec2 u_target_size;
 void main() {
-    float mask = texture(u_mask, v_mask_uv).r * 255.0;
-    float alpha = clamp(
-        (mask + u_offset - 256.0) * (256.0 / 255.0) / u_vague, 0.0, 1.0);
-    vec3 blended = mix(
-        texture(u_previous, v_uv).rgb, texture(u_next, v_uv).rgb, alpha);
-    fragment = vec4(blended, 1.0);
+    // texelFetch with the CPU blend's own indexing, not a filtered lookup:
+    //     mask_y = y * mask_height / height;
+    //     mask_x = x * mask_width  / width;
+    // A normalised sample has to land on a texel centre to pick the same
+    // texel, and at the wipe front - where alpha steps by 256/vague per mask
+    // unit - being one texel out shows up directly as a wrong pixel.  This
+    // has no centre to miss.  y counts from the top here, as it does in the
+    // CPU loop, while gl_FragCoord counts from the bottom.
+    int px = int(gl_FragCoord.x);
+    // No vertical flip.  SDL renders into a target through a projection that
+    // already lines its y-down origin up with the framebuffer, so
+    // gl_FragCoord.y counts the same way the CPU loop's y does - the same
+    // fact gl_blend.cpp records for its destination lookup.  The old
+    // normalised path flipped the mask (v_mask_uv = 1.0 - clip.y) and read
+    // it upside down; converting that to texelFetch reproduced the flip
+    // faithfully, which is why it changed nothing.
+    int py = int(gl_FragCoord.y);
+    int mask = int(texelFetch(u_mask,
+        ivec2(px * u_mask_size.x / u_target_size.x,
+              py * u_mask_size.y / u_target_size.y), 0).r * 255.0 + 0.5);
+    int alpha = clamp((mask + u_offset - 256) * 256 / u_vague, 0, 255);
+    ivec3 prev = ivec3(round(texture(u_previous, v_uv).rgb * 255.0));
+    ivec3 next = ivec3(round(texture(u_next, v_uv).rgb * 255.0));
+    ivec3 blended = ((255 - alpha) * prev >> 8) + (alpha * next >> 8);
+    fragment = vec4(vec3(clamp(blended, 0, 255)) / 255.0, 1.0);
 }
 )";
 
@@ -67,6 +111,10 @@ GLuint compile(GLenum type, const char* source)
 {
     const GLuint shader = glCreateShader(type);
     if (!shader) {
+        SDL_Log("transition shader: glCreateShader(%s) returned 0, GL error "
+                "0x%x - no usable GLES3 context on this renderer",
+                type == GL_VERTEX_SHADER ? "vertex" : "fragment",
+                glGetError());
         return 0;
     }
     glShaderSource(shader, 1, &source, nullptr);
@@ -113,6 +161,8 @@ struct GlPatternTransition::Impl {
     GLint mask_location = -1;
     GLint offset_location = -1;
     GLint vague_location = -1;
+    GLint mask_size_location = -1;
+    GLint target_size_location = -1;
     bool ready = false;
 
     Impl()
@@ -148,6 +198,8 @@ struct GlPatternTransition::Impl {
         mask_location = glGetUniformLocation(program, "u_mask");
         offset_location = glGetUniformLocation(program, "u_offset");
         vague_location = glGetUniformLocation(program, "u_vague");
+        mask_size_location = glGetUniformLocation(program, "u_mask_size");
+        target_size_location = glGetUniformLocation(program, "u_target_size");
 
         static constexpr GLfloat quad[] = {
             -1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f,
@@ -162,7 +214,13 @@ struct GlPatternTransition::Impl {
         glBindVertexArray(0);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-        ready = glGetError() == GL_NO_ERROR;
+        const GLenum last = glGetError();
+        ready = last == GL_NO_ERROR;
+        if (!ready) {
+            SDL_Log("transition shader: setup left GL error 0x%x "
+                    "(program=%u vao=%u vbo=%u)",
+                    last, program, vertex_array, vertex_buffer);
+        }
         if (ready) {
             report_self_test();
         }
@@ -314,7 +372,7 @@ bool GlPatternTransition::available() const
 
 bool GlPatternTransition::draw(
     SDL_Renderer* renderer, SDL_Texture* previous, SDL_Texture* next,
-    SDL_Texture* mask, float offset, float vague)
+    SDL_Texture* mask, int offset, int vague)
 {
     if (!available()) {
         return false;
@@ -345,16 +403,40 @@ bool GlPatternTransition::draw(
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     };
     glUseProgram(impl_->program);
-    bind(GL_TEXTURE0, previous_name, GL_LINEAR);
-    bind(GL_TEXTURE1, next_name, GL_LINEAR);
+    // Nearest on all three.  The blit is 1:1 - the frames are the size of
+    // the target - so linear filtering has nothing to interpolate in
+    // principle, but it samples between texels wherever the interpolated
+    // coordinate lands a hair off a centre, and the blend then mixes two
+    // neighbouring pixels of the outgoing or incoming frame.  On a gradient
+    // that is a level or two, scattered, which is exactly what this path was
+    // wrong by.  The CPU blend reads whole pixels; so does this now.
+    bind(GL_TEXTURE0, previous_name, GL_NEAREST);
+    bind(GL_TEXTURE1, next_name, GL_NEAREST);
     // The CPU blend indexes the mask with integer division, so this one stays
-    // nearest or the two paths disagree along the wipe's edge.
+    // nearest too.
     bind(GL_TEXTURE2, mask_name, GL_NEAREST);
     glUniform1i(impl_->previous_location, 0);
     glUniform1i(impl_->next_location, 1);
     glUniform1i(impl_->mask_location, 2);
-    glUniform1f(impl_->offset_location, offset);
-    glUniform1f(impl_->vague_location, vague);
+    glUniform1i(impl_->offset_location, offset);
+    glUniform1i(impl_->vague_location, vague);
+    {
+        float mw = 0.0f, mh = 0.0f;
+        SDL_GetTextureSize(mask, &mw, &mh);
+        int tw = 0, th = 0;
+        SDL_Texture* const target = SDL_GetRenderTarget(renderer);
+        if (target) {
+            float fw = 0.0f, fh = 0.0f;
+            SDL_GetTextureSize(target, &fw, &fh);
+            tw = static_cast<int>(fw);
+            th = static_cast<int>(fh);
+        } else {
+            SDL_GetRenderOutputSize(renderer, &tw, &th);
+        }
+        glUniform2i(impl_->mask_size_location,
+                    static_cast<int>(mw), static_cast<int>(mh));
+        glUniform2i(impl_->target_size_location, tw, th);
+    }
 
     // Put these back afterwards rather than trusting SDL to reset them: it
     // caches its own idea of the GL state and only sets what it thinks has

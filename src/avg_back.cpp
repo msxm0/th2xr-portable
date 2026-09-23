@@ -1,5 +1,9 @@
 #include "avg_back.hpp"
 
+#include "engine_rand.hpp"
+
+#include <cmath>
+
 #include <algorithm>
 #include <cstdlib>
 
@@ -437,6 +441,7 @@ void AvgBack::control_shake()
     const int back_max = eff_cnt4(back_.sk_speed);
     const int pich = back_.sk_pich;
 
+    shake_out_ = {};
     if (!back_.sk_flag) {
         return;
     }
@@ -484,6 +489,8 @@ void AvgBack::control_shake()
             default: break;
             }
         }
+        shake_out_.x = x;
+        shake_out_.y = y;
         switch (back_.sk_type) {
         case shake_sin_set:
         case shake_sin:
@@ -535,6 +542,8 @@ void AvgBack::control_shake()
         case DIR_U: case DIR_UL: case DIR_UR: y = -cnt * pich; break;
         default: break;
         }
+        shake_out_.x = x;
+        shake_out_.y = y;
         switch (back_.sk_type) {
         case shake_2ti:
             display_.set_graph_smove(grp_back,     back_.x - x, back_.y - y);
@@ -556,13 +565,37 @@ void AvgBack::control_shake()
         }
         break;
 
+    case shake_zoom: {
+        // cnt  = sk_cnt*((long)sqrt(pich)*2)/back_max;
+        // cnt2 = STD_LimitLoop(cnt, (long)sqrt(pich));  cnt2 = cnt2*cnt2;
+        // DSP_SetGraphZoom2( GRP_BACK(+1), DISP_X/2, DISP_Y/2, cnt2 );
+        // DSP_SetGraphParam( GRP_BACK(+1), DRW_BLD(128) );
+        // STD_LimitLoop folds a sawtooth into a triangle:
+        //     ret = src%(max*2);  if( ret>=max ) ret = max*2 - ret;
+        const long root = static_cast<long>(
+            std::sqrt(static_cast<double>(back_.sk_pich)));
+        const long swept = back_max
+            ? back_.sk_cnt * (root * 2) / back_max : 0;
+        long folded = root > 0 ? swept % (root * 2) : 0;
+        if (folded >= root) {
+            folded = root * 2 - folded;
+        }
+        shake_out_.zoom = static_cast<int>(folded * folded);
+        for (int g = grp_back; g <= grp_back + 1; ++g) {
+            display_.set_graph_zoom2(g, DISP_X / 2, DISP_Y / 2,
+                                     shake_out_.zoom);
+            display_.set_graph_param(g, drw_bld | (128u << 16));
+        }
+        break;
+    }
+
     case shake_rand:
     case shake_all_rand:
     case shake_txt_rand:
         // The direction is re-rolled every frame and never repeats.
-        cnt = std::rand() % 8;
+        cnt = engine_rand() % 8;
         while (back_.sk_dir == cnt) {
-            cnt = std::rand() % 8;
+            cnt = engine_rand() % 8;
         }
         back_.sk_dir = cnt;
         switch (back_.sk_dir) {
@@ -577,6 +610,8 @@ void AvgBack::control_shake()
         case DIR_U: case DIR_UL: case DIR_UR: y = -pich; break;
         default: break;
         }
+        shake_out_.x = x;
+        shake_out_.y = y;
         switch (back_.sk_type) {
         case shake_rand:
             display_.set_graph_smove(grp_back,     back_.x - x, back_.y - y);
@@ -606,6 +641,7 @@ void AvgBack::control_shake()
         } else {
             cnt = 256 - cnt * pich / 2 % 256;
         }
+        shake_out_.roll = cnt;
         display_.set_graph_prim(
             grp_work, GraphType::flat, Poly::rect, 0, true);
         display_.set_graph_pos_rect(grp_work, 0, 0, DISP_X, DISP_Y);
@@ -622,6 +658,7 @@ void AvgBack::control_shake()
         if (back_max) {
             y = y * (back_max - back_.sk_cnt) / back_max;
         }
+        shake_out_.roll = (256 + y) % 256;
         display_.get_graph_bmp_size(grp_back, &w, &h);
         display_.set_graph_roll(
             grp_back, DISP_X / 2, DISP_Y / 2, 0, (256 + y) % 256, 0, 0, w, h);
@@ -639,6 +676,7 @@ void AvgBack::control_shake()
         case 2: y = pich; break;
         default: break;
         }
+        shake_out_.roll = (256 + y) % 256;
         display_.get_graph_bmp_size(grp_back, &w, &h);
         display_.set_graph_roll(
             grp_back, DISP_X / 2, DISP_Y / 2, 0, (256 + y) % 256, 0, 0, w, h);

@@ -1,4 +1,6 @@
 #include "game.hpp"
+#include "text_count.hpp"
+#include "engine_rand.hpp"
 
 #include "icon.hpp"
 #include "image.hpp"
@@ -33,6 +35,7 @@ namespace th2app {
 
 void Game::load_script(std::string name)
 {
+    script_ended_ = false;
     runtime_.load(std::move(name));
     vi_event_voice_no_ = -1;
     vi_event_voice_no_all_ = -1;
@@ -150,6 +153,17 @@ void Game::update_playback_modes()
 
 float Game::choice_y_start() const
 {
+    if (msg().vanilla_layout()) {
+        // DSP_GetTextDispPos( TXT_WINDOW, &px, &py ); ... py + SYS_FONT*2:
+        // from the message's own cursor, which is the top of the row its
+        // last character is on - not from the bottom of the lines we count.
+        const auto& layout = msg().layout();
+        int cx = th2::message_text_box.sx;
+        int cy = th2::message_text_box.sy;
+        th2::txt_cursor_after(layout, th2::message_text_box,
+                              layout.glyph_x.size(), &cx, &cy);
+        return static_cast<float>(cy + th2::message_text_box.font * 2);
+    }
     if (!message_.empty()) {
         return message_text_y()
             + static_cast<float>(display_lines(message_.visible()).size())
@@ -157,6 +171,59 @@ float Game::choice_y_start() const
             + 1.0f;
     }
     return 468.0f;
+}
+
+// TXT_SELECT+i as the engine lays it out:
+//     DSP_SetText( TXT_SELECT+j, LAY_WINDOW+1, SYS_FONT, ON, mes[j] );
+//     DSP_SetTextPos( TXT_SELECT+j, 32, py + SYS_FONT*2 + 13*j+h, 20, 4 );
+//     h += DSP_GetTextDispH( TXT_SELECT+j );
+// with mes[j] = "１．" + the option (AVG_SetSelectMessage's "%c%c．%s").
+// The walk is TXT_DrawTextEx's own, so the wrap at 20 cells, the 24px line
+// pitch (a text object has no pich of its own) and each character's count
+// all come from the same place the engine takes them.
+std::string Game::choice_engine_text(int index) const
+{
+    // "１" + index, "．": U+FF11.. and U+FF0E, three UTF-8 bytes each.
+    const char32_t digit = U'\uFF11' + static_cast<char32_t>(index);
+    std::string text;
+    for (const char32_t c : {digit, U'\uFF0E'}) {
+        text += static_cast<char>(0xE0 | (c >> 12));
+        text += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+        text += static_cast<char>(0x80 | (c & 0x3F));
+    }
+    return text + choices_.at(static_cast<std::size_t>(index)).text;
+}
+
+th2::TextCount Game::choice_layout(int index) const
+{
+    th2::TextBox box{32, static_cast<int>(choice_row_y(index)), 20, 4, 0, 0,
+                     th2::message_text_box.font};
+    return th2::txt_count_text(choice_engine_text(index), box);
+}
+
+// DSP_GetTextDispH: TXT_DrawText's return, (px==sx) ? py-sy : py-sy+fno.
+float Game::choice_row_height(int index) const
+{
+    if (!font_.authentic()) {
+        return choice_height(choices_.at(static_cast<std::size_t>(index)));
+    }
+    th2::TextBox box{32, 0, 20, 4, 0, 0, th2::message_text_box.font};
+    const auto counted = th2::txt_count_text(choice_engine_text(index), box);
+    if (counted.cursor_x.empty()) {
+        return 0.0f;
+    }
+    const int px = counted.cursor_x.back();
+    const int py = counted.cursor_y.back();
+    return static_cast<float>(px == box.sx ? py : py + box.font);
+}
+
+float Game::choice_row_y(int index) const
+{
+    float y = choice_y_start();
+    for (int k = 0; k < index; ++k) {
+        y += choice_row_height(k) + (font_.authentic() ? 13.0f : 0.0f);
+    }
+    return y;
 }
 
 float Game::choice_height(const Choice& choice) const
@@ -170,7 +237,24 @@ std::vector<std::string> Game::choice_lines(
 {
     auto lines = display_lines(choice.text);
     if (!lines.empty()) {
-        lines.front() = std::format("{}. {}", index + 1, lines.front());
+        if (font_.authentic() && index >= 0 && index < 9) {
+            // AVG_SetSelectMessage: "%c%c．%s" with '１'+mnum - the full
+            // width digit and stop, two characters of SYS_FONT, where "1. "
+            // was three half-width ones: every glyph after it sat a column
+            // off and typed in a count late.
+            const char32_t digit = U'\uFF11' + static_cast<char32_t>(index);
+            std::string prefix;
+            const auto put = [&prefix](char32_t c) {
+                prefix += static_cast<char>(0xE0 | (c >> 12));
+                prefix += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+                prefix += static_cast<char>(0x80 | (c & 0x3F));
+            };
+            put(digit);
+            put(U'\uFF0E');
+            lines.front() = prefix + lines.front();
+        } else {
+            lines.front() = std::format("{}. {}", index + 1, lines.front());
+        }
     }
     return lines;
 }
@@ -387,13 +471,106 @@ std::size_t Game::utf8_character_count(std::string_view text)
 // the one above it.  Returns how many characters of this option to show.
 int Game::choice_reveal_count(int index) const
 {
-    if (config_.text_speed_ms <= 0 || !choice_reveal_started_) {
-        return std::numeric_limits<int>::max();
+    // SelectWindow.cnt, less this option's stagger.  The count is stepped
+    // in control_select_window by AVG_MsgCnt(), the same per-frame integer
+    // the message machine uses - so a choice types out at exactly the rate
+    // a line of dialogue does.  Deriving it from elapsed milliseconds
+    // instead ran it slow: measured at the SetSelect at pc 5857 of
+    // 070000400.sdt, where the reference answers after 34 ticks and ours
+    // took 44.
+    return choice_reveal_cnt_ - index * 4;
+}
+
+// SelectWindow.cond flipping from 1 to 0: the options have finished typing.
+//
+//     max_cnt = max( max_cnt, TXT_GetTextCount(SelectWindow.mes[j],-1)+8+j*4 );
+//     ...
+//     if(SelectWindow.cnt>=max_cnt){ SelectWindow.cond=0; ... }
+//
+// choice_reveal_count(i) is that cnt less the option's own i*4 stagger, so
+// the test below is the original's with the stagger put back.  The +8 is the
+// engine's and not a margin of ours: an option is not answerable for eight
+// counts after its last character lands.
+bool Game::choice_reveal_finished() const
+{
+    if (choices_.empty()) {
+        return false;
     }
-    const auto elapsed = std::chrono::duration<float, std::milli>(
-        std::chrono::steady_clock::now() - *choice_reveal_started_).count();
-    return static_cast<int>(elapsed / static_cast<float>(config_.text_speed_ms))
-        - index * 4;
+    int max_count = 0;
+    for (int i = 0; i < static_cast<int>(choices_.size()); ++i) {
+        int count = 0;
+        if (font_.authentic()) {
+            // TXT_GetTextCount( SelectWindow.mes[j], -1 )
+            count = th2::txt_count_text(choice_engine_text(i)).total;
+        } else {
+            for (const auto& line : choice_lines(choices_[i], i)) {
+                count += static_cast<int>(utf8_character_count(line));
+            }
+        }
+        max_count = std::max(max_count, count + 8 + i * 4);
+    }
+    return choice_reveal_count(0) >= max_count;
+}
+
+// AVG_ControlSelectWindow, the number row half of it.
+//
+//     for(j=0;j<SelectWindow.mnum+1;j++){
+//         if(GameKey.num[j]){ select = j-1; click = 1; }
+//     }
+//     if( click && select>=0 ){ SelectWindow.select = select; ... }
+//
+// The other half answers a choice from the cursor's mouse rect, and that
+// already reaches choices_ through the SDL event path.  This is the half
+// nothing here had: num[j] names option j-1 outright, so num[1] is the first
+// option and num[0] selects -1 and is then discarded by the `select>=0`
+// guard.  It is read in cond 0 only - a choice cannot be answered while it is
+// still typing itself out.
+// The body of AVG_ControlSelectWindow's `if( click && select>=0 )`:
+//
+//     SelectWindow.select = select;
+//     ...
+//     AVG_SetNovelMessageDisp(OFF);
+//
+// The message goes off the moment the choice is answered and stays off until
+// whatever the branch lands on puts a new one up - two frames later at the
+// SetSelect at pc 5857 of 070000400.sdt, where the reference blanks the
+// window for exactly those two ticks and ours never blanked it at all.
+void Game::answer_choice(int select)
+{
+    choice_highlight_ = select;
+    choice_selected_ = select;
+    trace_choice_answered_ = true;
+    msg().set_novel_message_disp(false);
+    manual_advance();
+}
+
+void Game::control_select_window()
+{
+    if (!choosing_ || choices_.empty() || choice_selected_ >= 0) {
+        return;
+    }
+    // case 1 types (SelectWindow.cnt += AVG_MsgCnt(), once per control
+    // pass) and, on the frame the count reaches max_cnt, only sets cond = 0;
+    // case 0 is where a key is read, and that is the next frame's switch.
+    // Typing and answering in one pass took the number key a frame early -
+    // hidden for as long as the options were one character too long.
+    if (!choice_reveal_finished()) {
+        for (int step = 0; step < control_steps_; ++step) {
+            choice_reveal_cnt_ += message_count_step();
+        }
+        return;
+    }
+    const int options = static_cast<int>(choices_.size());
+    for (int j = 0; j <= options && j < 10; ++j) {
+        if (!game_key_.num[j]) {
+            continue;
+        }
+        const int select = j - 1;
+        if (select >= 0 && select < options) {
+            answer_choice(select);
+        }
+        break;
+    }
 }
 
 void Game::start_text_reveal(std::size_t start)
@@ -415,8 +592,614 @@ bool Game::finish_text_reveal()
     return true;
 }
 
+void Game::enable_trace(
+    const std::filesystem::path& dir,
+    const std::optional<std::filesystem::path>& input,
+    std::uint64_t ticks, std::uint64_t first, std::uint64_t lead)
+{
+    trace_mode_ = true;
+    // The audio channels' own clock, so a fade advances with the tick
+    // counter rather than with however fast this machine replays.  See
+    // AudioChannel::set_clock: AVG_WaitBGM asks whether a fade has finished,
+    // so on the wall clock the script's program counter picked up the host's
+    // speed and the same tick disagreed with itself between runs.
+    th2::AudioChannel::set_clock([this] { return engine_now(); });
+    // See the note on the declaration: GlobalCount is not reset when the
+    // scenario starts, so it carries the reference's lead-in with it.
+    global_count_ = static_cast<int>(lead);
+    trace_dir_ = dir;
+    trace_last_tick_ = ticks;
+    trace_first_tick_ = first;
+    // A trace tick is a unit of engine progress, not of time, so there is
+    // nothing for the run to be in step with.  Left on, the swapchain's
+    // vsync paces the whole replay at the monitor's refresh - which made a
+    // 695 tick run take 12 seconds of wall clock for about a second of work,
+    // and would make replaying to a divergence deep in a scenario the
+    // dominant cost of every fix-and-retest cycle.
+    if (renderer_ && !SDL_SetRenderVSync(renderer_, SDL_RENDERER_VSYNC_DISABLED)) {
+        SDL_Log("trace: could not disable vsync: %s", SDL_GetError());
+    }
+    std::filesystem::create_directories(trace_dir_);
+    if (input) {
+        trace_script_.load(*input);
+        SDL_Log("trace: %zu input events from %s",
+                trace_script_.size(), input->string().c_str());
+    }
+    // A trace run gets a pinned config rather than the player's, and the
+    // pinned values are the ones reference/run/CONFIG.ini gives the other
+    // side.  Otherwise the comparison measures two option screens: whatever
+    // this profile last saved in the menu would set Avg.wait, which
+    // AVG_EffCnt multiplies every effect length by, and every fade would
+    // diverge for a reason that has nothing to do with the engine.
+    config_.effect_speed = 2;       // Avg.wait
+    config_.text_speed_ms = 20;     // Avg.msg_wait == 2
+    config_.message_half_tone = 64; // Avg.half_tone
+    // The original's bitmap font out of FNT.PAK, at the size the English
+    // release draws it - font24, not the Japanese build's font34.  The high-resolution outline font is the better one to read
+    // and the reason our text layer exists at all - but it cannot be
+    // compared to a 16x16 bitmap glyph, and a comparison that leaves the
+    // text out cannot see the typewriter at all.
+    config_.authentic_font = true;
+    config_.font_size = 24;   // SYS_FONT in the English release
+    // Matching run/CONFIG.ini, which is the point: AVG_WaitSe opens with
+    // `if(!Avg.se) return 0`, so sound on one side and off the other means
+    // one engine waits at an SEW and the other walks straight past it.
+    // Effects and voices are on, so those waits are exercised; BGM is off
+    // on both sides because MW waits on a *fade*, which the reference's
+    // stubbed decoder drives from a worker thread rather than from ticks.
+    // The player's name, pinned to GM_AvgMsg.h's compiled-in defaults.
+    //
+    // The reference is built from the GPL source, so it can only ever have
+    // those; ours reads the shipped executable, which the English patch
+    // romanised.  That is a difference between two binaries rather than
+    // between two engines, but it is not cosmetic: *nnk stands for two
+    // full-width characters in one and four half-width ones in the other,
+    // which is two counts of difference in the typewriter and a different
+    // line break wherever the name appears.
+    player_name_ = th2::PlayerName{
+        "\u6cb3\u91ce",                    // DEF_NAME_L    河野
+        "\u8cb4\u660e",                    // DEF_NAME_F    貴明
+        "\u3053\u3046\u306e",             // DEF_NAME_LK   こうの
+        "\u305f\u304b\u3042\u304d",      // DEF_NAME_FK   たかあき
+        "\u305f\u304b",                    // DEF_NAME_NN   たか
+        "\u30bf\u30ab",                    // DEF_NAME_NNK  タカ
+    };
+    // The same difference one token further out: *h2 is a character's name,
+    // not the player's, and AVG_SetName substitutes the original two-
+    // character one.  Ours ships the romanised English name, which is six
+    // counts rather than two - measured at pc 129 of 110010000.sdt, where
+    // the message came to 76 counts here and 72 there.
+    th2::set_h2_character_name("\u5c0f\u7267", "\u611b\u4f73");
+    config_.se_volume = 256;
+    config_.voice_volume = 256;
+    config_.bgm_volume = 0;
+    // Avg.msg_cut_optin stays 0, which is where the reference's starts: a
+    // trace script never holds the skip key, and the setting is not only a
+    // key gate - it also picks the column the sidebar's skip button is drawn
+    // from, so raising it here put a lit icon where the reference has a dead
+    // one.
+    // Avg.side_option 0, which is what the reference runs: the bar fades by
+    // 24 a frame toward 64 while the pointer is left of DISP_X-24 and back up
+    // to 256 when it is not (GM_AvgMsg.cpp's GRP_HISTORY block).  Ours
+    // defaults to hidden, so without this the bar is simply absent from the
+    // frame; forcing it fully opaque instead is just as wrong, because the
+    // traced pointer sits at x=400 and the engine settles it at 64.
+    config_.sidebar_mode = 0;
+
+    const auto state = trace_dir_ / "state.txt";
+    trace_state_ = std::fopen(state.string().c_str(), "w");
+    if (trace_state_) {
+        // Same columns, same order, same names as the reference's
+        // th2ref_state.cpp, so the two files diff directly.
+        std::fprintf(trace_state_,
+                     "tick script pc "
+                     "msg_flag msg_disp msg_step1 msg_step2 msg_count "
+                     "msg_kstep msg_max "
+                     "tone_tstep tone_tcount "
+                     "bk_bno bk_fd_flag bk_fd_type bk_fd_cnt bk_fd_max "
+                     "bk_sc_flag bk_sc_cnt bk_sc_max "
+                     "bk_sk_flag bk_sk_cnt "
+                     "bk_br_flag bk_br_cnt "
+                     "avg_msg_cut avg_auto avg_frame avg_wait avg_level "
+                     "avg_msg_wait avg_msg_page avg_half_tone "
+                     "txt_cnt txt_step global_count text\n");
+    }
+}
+
+std::string Game::trace_glyph_alpha() const
+{
+    // One character per revealed glyph: alph2/16, which is 0..16, in base 36
+    // - so a fully faded-in glyph is 'g' and an invisible one '0'.  The same
+    // encoding the reference writes from inside TXT_DrawTextEx.
+    //
+    // This is the typewriter itself rather than a summary of it.  No scalar
+    // can stand in: NovelMessage.count and .kstep can agree on both sides
+    // while the formula that turns them into per-glyph alpha disagrees, and
+    // a 'g' that goes back to '0' is precisely the bug that hid from a trace
+    // carrying only the counters.
+    // Nothing when the window is not on screen, which is what the
+    // reference records: with DSP_SetTextDisp off, DrawGraphText is never
+    // reached and no glyph goes by.  Ours has to agree about *when* there is
+    // text as well as about what it looks like.
+    if (!avg_msg_ || !message_visible_ || msg().state().disp == 0
+        || ui_mode_ != UiMode::game || message_.empty()) {
+        return "-";
+    }
+    const auto shown = msg().visible_glyphs();
+    if (shown == 0) {
+        return "-";
+    }
+    std::string out;
+    out.reserve(shown);
+    for (std::size_t i = 0; i < shown; ++i) {
+        int v = msg().glyph_alpha(i) / 16;
+        v = std::clamp(v, 0, 16);
+        out.push_back(static_cast<char>(v < 10 ? '0' + v : 'a' + (v - 10)));
+    }
+    return out;
+}
+
+void Game::set_trace_hold(std::uint64_t tick, int seconds)
+{
+    trace_hold_tick_ = tick;
+    trace_hold_seconds_ = seconds;
+}
+
+void Game::set_trace_checkpoint(const std::filesystem::path& save_file,
+                                std::uint64_t save_tick,
+                                const std::filesystem::path& resume_file,
+                                std::uint64_t resume_trigger)
+{
+    trace_save_file_ = save_file;
+    trace_save_tick_ = save_tick;
+    trace_resume_file_ = resume_file;
+    trace_resume_trigger_ = resume_trigger;
+    trace_resume_pending_ = !resume_file.empty();
+}
+
+// The tick and the free-running counters the save body does not carry, in a
+// text sidecar next to it.  Text so a truncated or stale one fails to parse
+// rather than resuming at a plausible-looking wrong tick, which would put
+// the two sides a few ticks out of phase and look like an engine bug.
+namespace {
+
+std::filesystem::path checkpoint_meta(const std::filesystem::path& save)
+{
+    return std::filesystem::path(save.string() + ".meta");
+}
+
+// The message machine, appended to the trace checkpoint.
+//
+// save_body() is the player-facing save, and the engine's is not a snapshot:
+// it carries ms_step1/ms_count/ms_kstep and rebuilds the rest, so a load lands
+// near where the save was taken rather than on it.  Ours did not carry the
+// machine at all, so a resumed run came back with no message where a linear
+// run had one mid-reveal (count 205 of 213 at tick 3000, against 0 of 0), and
+// the two sides then drifted apart and re-synced for the rest of the window.
+// Appended here rather than added to save_body so the player save's format is
+// left alone - matching the engine's *lossy* load is a separate question from
+// resuming a trace exactly, and only the second one is this file's business.
+void write_state_i32(std::ostream& out, int value)
+{
+    out.write(reinterpret_cast<const char*>(&value), sizeof value);
+}
+
+int read_state_i32(std::istream& in)
+{
+    int value = 0;
+    in.read(reinterpret_cast<char*>(&value), sizeof value);
+    return value;
+}
+
+}  // namespace
+
+void Game::trace_checkpoint_save()
+{
+    if (trace_save_file_.empty() || trace_tick_ != trace_save_tick_) {
+        return;
+    }
+    std::ofstream file(trace_save_file_, std::ios::binary);
+    if (!file) {
+        SDL_Log("trace: cannot write checkpoint %s",
+                trace_save_file_.string().c_str());
+        return;
+    }
+    save_body(file);
+    {
+        const auto& m = msg().state();
+        for (const int field : {m.flag, m.add_flag, m.disp, m.step1, m.step2,
+                                m.count, m.kstep, m.max}) {
+            write_state_i32(file, field);
+        }
+        const auto& tone = msg().half_tone();
+        write_state_i32(file, tone.tstep);
+        write_state_i32(file, tone.tcount);
+        // The text slot, back again.  It was dropped when the reference was
+        // still being resumed too, because its load does not restore
+        // TextStruct and carrying ours made the two sides differ at the
+        // resume tick by construction.  window.sh stopped resuming the
+        // reference, so symmetry with its losses no longer applies and the
+        // only thing that counts is matching a straight-through run - which
+        // needs it.  ts->cnt of -1 means the whole line is uncovered; 0
+        // means none of it, and the machine reconciles a full count against
+        // an empty slot by throwing the message away.
+        write_state_i32(file, msg().text_cnt());
+        write_state_i32(file, msg().text_step());
+        const auto& raw = msg().raw();
+        write_state_i32(file, static_cast<int>(raw.size()));
+        if (!raw.empty()) {
+            file.write(raw.data(),
+                       static_cast<std::streamsize>(raw.size()));
+        }
+        // The background machine.  Left out until now because both sides
+        // lost it identically and restoring ours alone would have *created*
+        // a divergence - but the reference is no longer resumed at all
+        // (reference/window.sh), so symmetry with its losses has stopped
+        // mattering and only fidelity to a straight-through run counts.
+        // BackStruct is plain data, so it round-trips as itself.
+        {
+            const auto& b = back();
+            file.write(reinterpret_cast<const char*>(&b), sizeof b);
+        }
+        // EOprFlag.  A waiting opcode has already run its set-up, and the
+        // latch is how the machine knows not to run it twice:
+        //     if(!EOprFlag[ESC_SETMESSAGE2]){ EOprFlag[..]=1; ...set up... }
+        // Without it a resumed run re-entered the instruction it was parked
+        // on and set the message up again, so at the same pc it threw away a
+        // message 205 characters into 213 and started the next one - which
+        // reads as the two engines disagreeing when it is only ours
+        // forgetting where it was.
+        file.write(reinterpret_cast<const char*>(eopr_flag_.data()),
+                   static_cast<std::streamsize>(eopr_flag_.size()));
+        // The waits.  A checkpoint that lands mid-wait used to resume with
+        // none of this and the script simply carried on: taken 30 frames
+        // into the WaitFrame at pc 5635 of 010319100.sdt, the resumed run
+        // left one tick after the resume where a straight-through run - and
+        // the reference - stood still.  That is invisible until the drift
+        // reaches the compared part of the window, so it reads as an engine
+        // divergence hundreds of ticks later.
+        write_state_i32(file, wake_frames_);
+        write_state_i32(file, wake_time_ ? 1 : 0);
+        write_state_i32(
+            file,
+            wake_time_
+                ? static_cast<int>(
+                      std::chrono::duration_cast<std::chrono::milliseconds>(
+                          *wake_time_ - engine_now()).count())
+                : 0);
+        write_state_i32(file, audio_wait_ ? 1 : 0);
+        write_state_i32(
+            file, audio_wait_ ? static_cast<int>(audio_wait_->kind) : 0);
+        write_state_i32(
+            file, audio_wait_ ? static_cast<int>(audio_wait_->channel) : 0);
+        // trace_se_playing answers from this, so a resumed run with an empty
+        // map calls every effect finished and walks past an SEW the engine
+        // honours.  Stored as "how long ago", because the tick restarts.
+        write_state_i32(file, static_cast<int>(trace_sound_started_.size()));
+        for (const auto& [channel, started] : trace_sound_started_) {
+            write_state_i32(file, static_cast<int>(channel));
+            write_state_i32(file, static_cast<int>(trace_tick_ - started));
+        }
+        // AVG_SetWaitFrame's latch, which is what a parked WaitFrame really
+        // sits on - not wake_frames_, which belongs to the VM's own Wait and
+        // was measured at zero here.  This is the one that was lost.
+        write_state_i32(file, wait_frame_.flag);
+        write_state_i32(file, wait_frame_.type);
+        write_state_i32(file, wait_frame_.count);
+        write_state_i32(file, wait_frame_.max);
+        const auto resume = msg().resume_state();
+        for (const int field : {resume.vanilla_layout, resume.end_key_wait,
+                                resume.auto_count, resume.key_wait_count,
+                                resume.key_wait_count2, resume.wstep,
+                                resume.demo_cnt}) {
+            write_state_i32(file, field);
+        }
+        // Game::message_, the laid-out message the glyphs are drawn from.
+        // AvgMsg's raw source was already here, but this is a separate
+        // object and load_body resets it to empty - so a checkpoint taken
+        // mid-message resumed with every counter right and nothing on
+        // screen.  Measured at tick 759000 of 040426300.sdt, where the
+        // reference had 295 glyphs up and ours had none.
+        const auto& segments = message_.segments();
+        write_state_i32(file, static_cast<int>(segments.size()));
+        for (const auto& segment : segments) {
+            write_state_i32(file, static_cast<int>(segment.size()));
+            file.write(segment.data(),
+                       static_cast<std::streamsize>(segment.size()));
+        }
+        write_state_i32(file, static_cast<int>(message_.revealed_count()));
+        const auto& visible = message_.visible();
+        write_state_i32(file, static_cast<int>(visible.size()));
+        file.write(visible.data(),
+                   static_cast<std::streamsize>(visible.size()));
+    }
+    file.close();
+    std::ofstream meta(checkpoint_meta(trace_save_file_));
+    // AVG_ControlMapEvent's select_back is a function static: it outlives
+    // every map and every save, and a resumed run has to be handed it.
+    meta << trace_tick_ << ' ' << global_count_ << ' ' << map_select_back_
+         << ' ' << th2::engine_rand_state << '\n';
+    SDL_Log("trace: checkpoint at tick %llu -> %s",
+            static_cast<unsigned long long>(trace_tick_),
+            trace_save_file_.string().c_str());
+}
+
+void Game::trace_checkpoint_resume()
+{
+    if (!trace_resume_pending_ || trace_tick_ < trace_resume_trigger_) {
+        return;
+    }
+    trace_resume_pending_ = false;
+
+    std::uint64_t tick = 0;
+    int global = 0;
+    {
+        std::ifstream meta(checkpoint_meta(trace_resume_file_));
+        if (!meta || !(meta >> tick >> global)) {
+            throw std::runtime_error(
+                "no checkpoint sidecar for "
+                + trace_resume_file_.string());
+        }
+        int select_back = 0;
+        if (meta >> select_back) {
+            map_select_back_ = select_back;
+        }
+        // The engine's rand() sequence, which no save carries either.
+        std::uint32_t rand_state = 0;
+        if (meta >> rand_state) {
+            th2::engine_rand_state = rand_state;
+        }
+    }
+    std::ifstream file(trace_resume_file_, std::ios::binary);
+    if (!file || !load_body(file)) {
+        throw std::runtime_error(
+            "cannot read checkpoint " + trace_resume_file_.string());
+    }
+    {
+        auto& m = msg().state();
+        m.flag = read_state_i32(file);
+        m.add_flag = read_state_i32(file);
+        m.disp = read_state_i32(file);
+        m.step1 = read_state_i32(file);
+        m.step2 = read_state_i32(file);
+        m.count = read_state_i32(file);
+        m.kstep = read_state_i32(file);
+        m.max = read_state_i32(file);
+        auto& tone = msg().half_tone();
+        tone.tstep = read_state_i32(file);
+        tone.tcount = read_state_i32(file);
+        const int text_cnt = read_state_i32(file);
+        const int text_step = read_state_i32(file);
+        msg().restore_text_slot(text_cnt, text_step);
+        const int raw_size = read_state_i32(file);
+        std::string raw(static_cast<std::size_t>(std::max(0, raw_size)), '\0');
+        if (raw_size > 0) {
+            file.read(raw.data(), static_cast<std::streamsize>(raw_size));
+        }
+        msg().restore_raw(std::move(raw));
+        file.read(reinterpret_cast<char*>(&back()), sizeof(th2::BackStruct));
+        file.read(reinterpret_cast<char*>(eopr_flag_.data()),
+                  static_cast<std::streamsize>(eopr_flag_.size()));
+        if (!file) {
+            throw std::runtime_error(
+                "checkpoint has no message machine: "
+                + trace_resume_file_.string());
+        }
+        // The waits, appended later than the rest: a checkpoint written
+        // before they were carried simply ends here, and such a file still
+        // loads - it just resumes without them, which is what it always did.
+        const int wake_frames = read_state_i32(file);
+        const int has_wake_time = read_state_i32(file);
+        const int wake_ms = read_state_i32(file);
+        const int has_audio_wait = read_state_i32(file);
+        const int audio_kind = read_state_i32(file);
+        const int audio_channel = read_state_i32(file);
+        const int sounds = read_state_i32(file);
+        std::vector<std::pair<int, int>> sound_ages;
+        if (file && sounds >= 0 && sounds < 4096) {
+            for (int i = 0; i < sounds && file; ++i) {
+                const int channel = read_state_i32(file);
+                const int age = read_state_i32(file);
+                sound_ages.emplace_back(channel, age);
+            }
+        }
+        const int wf_flag = read_state_i32(file);
+        const int wf_type = read_state_i32(file);
+        const int wf_count = read_state_i32(file);
+        const int wf_max = read_state_i32(file);
+        th2::AvgMsg::ResumeState resume;
+        resume.vanilla_layout = read_state_i32(file);
+        resume.end_key_wait = read_state_i32(file);
+        resume.auto_count = read_state_i32(file);
+        resume.key_wait_count = read_state_i32(file);
+        resume.key_wait_count2 = read_state_i32(file);
+        resume.wstep = read_state_i32(file);
+        resume.demo_cnt = read_state_i32(file);
+        const auto read_blob = [&file]() {
+            const int size = read_state_i32(file);
+            std::string value(
+                static_cast<std::size_t>(std::max(0, size)), '\0');
+            if (size > 0 && file) {
+                file.read(value.data(), static_cast<std::streamsize>(size));
+            }
+            return value;
+        };
+        std::vector<std::string> segments;
+        const int segment_count = read_state_i32(file);
+        if (file && segment_count >= 0 && segment_count < 4096) {
+            for (int i = 0; i < segment_count && file; ++i) {
+                segments.push_back(read_blob());
+            }
+        }
+        const int revealed = read_state_i32(file);
+        const std::string visible = read_blob();
+        if (file) {
+            message_.restore_state(
+                segments, static_cast<std::size_t>(std::max(0, revealed)),
+                visible);
+            msg().restore_resume_state(resume);
+            wait_frame_ = WaitFrameState{wf_flag, wf_type, wf_count, wf_max};
+            wake_frames_ = wake_frames;
+            wake_time_ = has_wake_time
+                ? std::optional{engine_now()
+                                + std::chrono::milliseconds(wake_ms)}
+                : std::nullopt;
+            audio_wait_ = has_audio_wait
+                ? std::optional{AudioWait{
+                      static_cast<AudioWaitKind>(audio_kind),
+                      static_cast<std::size_t>(audio_channel)}}
+                : std::nullopt;
+            pending_sound_ages_ = std::move(sound_ages);
+        }
+    }
+    global_count_ = global;
+    trace_tick_ = tick;
+    trace_sound_started_.clear();
+    for (const auto& [channel, age] : pending_sound_ages_) {
+        if (channel >= 0 && age >= 0
+            && static_cast<std::uint64_t>(age) <= trace_tick_) {
+            trace_sound_started_[static_cast<std::size_t>(channel)] =
+                trace_tick_ - static_cast<std::uint64_t>(age);
+        }
+    }
+    pending_sound_ages_.clear();
+    SDL_Log("trace: resumed at tick %llu from %s",
+            static_cast<unsigned long long>(trace_tick_),
+            trace_resume_file_.string().c_str());
+}
+
+std::chrono::steady_clock::time_point Game::engine_now() const
+{
+    if (!trace_mode_) {
+        return std::chrono::steady_clock::now();
+    }
+    // 1000/60 == 16, integer divided, exactly as MAIN_Loop steps next_time
+    // and as th2ref_time() reports it.  Deriving it from trace_tick_ rather
+    // than accumulating keeps the two sides' arithmetic identical.
+    return std::chrono::steady_clock::time_point{}
+        + std::chrono::milliseconds(trace_tick_ * (1000 / 60));
+}
+
+void Game::trace_dump_state()
+{
+    // A resumed run's lead-in ticks would write lines numbered from the
+    // title screen, leaving the trace with two disjoint tick ranges in one
+    // file for statediff to trip over.
+    if (trace_resume_pending_) {
+        return;
+    }
+    // One line per tick of the integers the AVG machine turns on.  Pixels
+    // say two runs disagree; this says which counter disagreed first, and
+    // for a scene that is a black screen for two hundred frames it is the
+    // only thing that says anything at all.
+    if (!trace_state_) {
+        return;
+    }
+    const auto& message = avg_msg_ ? msg().state() : th2::NovelMessageState{};
+    const auto& tone = avg_msg_ ? msg().half_tone() : th2::HalfToneState{};
+    const auto& bk = avg_back_ ? back() : th2::BackStruct{};
+    const auto name = std::string(runtime_.script_name());
+    // On the frame a choice is answered the glyphs were drawn and only then
+    // hidden, which is what the reference records.  Every other frame
+    // computes the string here as usual.
+    std::string glyphs = trace_glyph_alpha();
+    if (trace_choice_answered_) {
+        if (glyphs == "-" && !trace_glyph_drawn_.empty()) {
+            glyphs = trace_glyph_drawn_;
+        }
+        trace_choice_answered_ = false;
+    }
+    std::fprintf(trace_state_,
+                 "%llu %s %lu "
+                 "%d %d %d %d %d %d %d "
+                 "%d %d "
+                 "%d %d %d %d %d "
+                 "%d %d %d "
+                 "%d %d "
+                 "%d %d "
+                 "%d %d %d %d %d %d %d %d %d %d %d %s\n",
+                 static_cast<unsigned long long>(trace_tick_),
+                 name.empty() ? "-" : name.c_str(),
+                 static_cast<unsigned long>(
+                     script_ended_ ? 0 : runtime_.vm_pc()),
+                 message.flag, message.disp, message.step1, message.step2,
+                 message.count, message.kstep, message.max,
+                 tone.tstep, tone.tcount,
+                 bk.bno, bk.fd_flag, bk.fd_type, bk.fd_cnt, bk.fd_max,
+                 bk.sc_flag, bk.sc_cnt, bk.sc_max,
+                 bk.sk_flag, bk.sk_cnt,
+                 bk.br_flag, bk.br_cnt,
+                 skip_held_ ? 1 : 0, auto_mode_ ? 1 : 0, 60,
+                 std::clamp(config_.effect_speed, 0, 4),
+                 config_.effect_speed != 0 ? 1 : 0,
+                 message_wait_setting(),
+                 0,   // Avg.msg_page: hooks.msg_page is a constant false
+                 config_.message_half_tone,
+                 avg_msg_ ? msg().text_cnt() : 0,
+                 avg_msg_ ? msg().text_step() : 0,
+                 global_count_,
+                 glyphs.c_str());
+    std::fflush(trace_state_);
+
+    // A one-shot dump of the message source, for when the two sides agree
+    // about every counter and still draw a different number of glyphs - at
+    // which point the question is no longer the reveal rules but what text
+    // each of them thinks it is revealing.
+    if (const char* at = std::getenv("TH2_STRTICK");
+        at && avg_msg_ && trace_tick_ == std::strtoull(at, nullptr, 10)) {
+        if (std::FILE* f = std::fopen(
+                (trace_dir_ / "string.txt").string().c_str(), "wb")) {
+            std::fwrite(msg().raw().data(), 1, msg().raw().size(), f);
+            std::fclose(f);
+        }
+    }
+}
+
+void Game::trace_apply_input()
+{
+    // The script is the only input.  Same file, same semantics as the
+    // reference's th2ref_input.cpp: trg on the first tick of a press, btn
+    // for its whole duration.
+    const auto state = trace_script_.at(trace_tick_);
+    key_cond_ = {};
+    key_cond_.trg_enter   = state.is_pressed("enter");
+    key_cond_.btn_enter   = state.is_held("enter");
+    key_cond_.trg_space   = state.is_pressed("space");
+    key_cond_.trg_esc     = state.is_pressed("esc");
+    key_cond_.trg_bs      = state.is_pressed("bs");
+    key_cond_.btn_bs      = state.is_held("bs");
+    key_cond_.trg_shift   = state.is_pressed("shift");
+    key_cond_.btn_ctrl    = state.is_held("ctrl");
+    key_cond_.btn_alt     = state.is_held("alt");
+    key_cond_.trg_home    = state.is_pressed("home");
+    key_cond_.trg_end     = state.is_pressed("end");
+    key_cond_.btrg_pup    = state.is_pressed("pup");
+    key_cond_.btrg_pdown  = state.is_pressed("pdown");
+    // num0..num9, which is how a traced run answers a choice at all.
+    for (int digit = 0; digit < 10; ++digit) {
+        const std::string name = "num" + std::to_string(digit);
+        key_cond_.trg_num[digit] = state.is_pressed(name);
+    }
+    trace_mouse_x_ = state.mouse_x;
+    trace_mouse_y_ = state.mouse_y;
+    key_cond_.mouse_trg_left  = state.click;
+    key_cond_.mouse_btn_left  = state.click_held;
+    key_cond_.mouse_trg_right = state.cancel;
+    th2::get_game_key(game_key_, key_cond_, 0);
+    trace_drive_map(state.map_pick);
+    key_cond_.clear_triggers();
+}
+
 void Game::get_game_key()
 {
+    if (trace_mode_) {
+        trace_apply_input();
+        // See the note below the fold: demo mode swallows the click edge.
+        if (demo_mode_) {
+            game_key_.click = 0;
+        }
+        return;
+    }
     // void AVG_GetGameKey(void).  The device state is SDL's rather than
     // KeyCond's, but the fold is the original's: click and cansel are edges,
     // mes_cut is a level, and a click always beats a held skip key.
@@ -427,6 +1210,23 @@ void Game::get_game_key()
             || gamepad_input_.ctrl_skip_held());
     key_cond_.btn_alt = (SDL_GetModState() & SDL_KMOD_ALT) != 0;
     th2::get_game_key(game_key_, key_cond_, 0);
+    // Avg.demo swallows the click edge.  Measured rather than traced: while
+    // SetDemoFlag is on, the reference converts *no* scripted click into
+    // GameKey.click - 28 consecutive 30-tick bursts at pc 18540..18884 of
+    // 040426300.sdt, with the button level asserted on every one of them and
+    // every burst either side of that span converting normally.  The engine
+    // reaches this below AVG_GetGameKey, which has no demo test of its own:
+    // GameKey.click comes from MUS_GetMouseTrigger, and that is gated on
+    // MouseStruct.active.  Exactly how demo mode clears it is NOT traced, so
+    // this reproduces the observed behaviour rather than the mechanism.
+    //
+    // It matters because demo mode also drives auto-advance (hooks.auto_flag),
+    // so the engine walks a demo scene on the auto timer alone.  Ours took
+    // the auto timer *and* the clicks, and finished a line at tick 764340
+    // that the reference was still typing.
+    if (demo_mode_) {
+        game_key_.click = 0;
+    }
     // The edges have now been consumed by exactly one control pass, so they
     // are cleared - KEY_RenewKeybord does this at the top of
     // MAIN_SystemControl, which in the original is every frame.

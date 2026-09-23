@@ -120,6 +120,16 @@ std::filesystem::path Game::anime4k_shader_dir() const
     return base / ".." / "Resources" / TH2_ANIME4K_SHADER_DIR;
 }
 
+std::filesystem::path Game::blend_shader_dir() const
+{
+    const auto base = std::filesystem::path(SDL_GetBasePath());
+    const auto executable_relative = base / TH2_BLEND_SHADER_DIR;
+    if (std::filesystem::exists(executable_relative)) {
+        return executable_relative;
+    }
+    return base / ".." / "Resources" / TH2_BLEND_SHADER_DIR;
+}
+
 void Game::ensure_upscaler()
 {
     if (last_anime4k_wanted_ == config_.anime4k) {
@@ -238,26 +248,84 @@ void Game::start_movie(int mode, int number, bool resume_script)
     default:
         throw std::runtime_error("unsupported movie mode");
     }
-    const auto* entry = movie_archive_.find(name);
-    if (!entry) {
-        throw std::runtime_error("movie not found: " + name);
+    // A traced movie is not decoded, because on the other side it cannot be.
+    // reference/shim/stubs.cpp answers the engine's decode loop out of
+    // th2ref_movie_decoding(), whose TH2REF_MOVIE_TICKS defaults to zero, so
+    // every movie in a reference trace is over before it starts.  Ours has a
+    // real decoder that a headless trace never presents a frame for, so it
+    // never reports finished and the script parks on SetMovie for good - which
+    // is exactly what stopped a sweep dead at pc 20897 of 010301000.sdt, the
+    // last instruction of the first day.  The same length on both sides is the
+    // only way the two are comparable at all; TH2_MOVIE_TICKS matches the
+    // reference's knob, and carries the reference's caveat with it - it moves
+    // only how long the script is told to wait, and nothing here draws a
+    // movie frame either way.
+    if (trace_mode_) {
+        trace_movie_live_ = true;
+        trace_movie_started_ = trace_tick_;
+    } else {
+        const auto* entry = movie_archive_.find(name);
+        if (!entry) {
+            throw std::runtime_error("movie not found: " + name);
+        }
+        movie_bytes_ = movie_archive_.read(*entry);
+        movie_ = std::make_unique<th2::VideoPlayer>(
+            renderer_, movie_bytes_, destination);
     }
-    movie_bytes_ = movie_archive_.read(*entry);
-    movie_ = std::make_unique<th2::VideoPlayer>(
-        renderer_, movie_bytes_, destination);
     movie_resume_script_ = resume_script;
     movie_mode_ = mode;
+    // AVG_SetMovie's own calls, `change` and all:
+    //     case 0: AVG_PlayBGM( 0, 0, FALSE, 255, TRUE );
+    // TRUE is what makes it restart a track that is already playing, and
+    // without it a movie that follows its own music left the music running.
     if (mode == 0) {
-        play_bgm(0, false, 255);
+        play_bgm(0, false, 255, 0, true);
     } else if (mode == 1) {
-        play_bgm(50, false, 255);
+        play_bgm(50, false, 255, 0, true);
     } else if (mode == 2) {
-        play_bgm(99, false, 255);
+        play_bgm(99, false, 255, 0, true);
     }
+}
+
+std::uint64_t Game::trace_movie_ticks()
+{
+    static const std::uint64_t ticks = [] {
+        const char* value = SDL_getenv("TH2_MOVIE_TICKS");
+        if (!value || !*value) {
+            return std::uint64_t{0};
+        }
+        const auto parsed = std::atoll(value);
+        return parsed > 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{0};
+    }();
+    return ticks;
 }
 
 void Game::update_movie()
 {
+    // AVG_WaitMovie's AVG_StopBGM( 0 ) fires on the pass that first sees the
+    // movie finished - and the pass that started it has already run by then,
+    // so it is always the frame after.  Ours notices the end inside the same
+    // frame it started (see below), so the stop is held over to the next one
+    // rather than issued early: the script timing is measured and right, and
+    // only the music was a frame ahead of the reference's.
+    if (movie_bgm_stop_pending_) {
+        movie_bgm_stop_pending_ = false;
+        stop_bgm(0);
+    }
+    if (trace_movie_live_) {
+        // Ended on the first poll, exactly as th2ref_movie_decoding() does
+        // with TH2REF_MOVIE_TICKS at its default of zero.  The tick the
+        // script actually spends on SetMovie comes from the wait, not from
+        // here: update_movie runs after pump_script, and the advance() below
+        // is not seen until the pass after that - so a zero-length movie
+        // still costs the two ticks the reference spends at pc 20897 of
+        // 010301000.sdt.  Making it end a poll later instead cost three.
+        if (trace_tick_ - trace_movie_started_ >= trace_movie_ticks()) {
+            trace_movie_live_ = false;
+            complete_movie();
+        }
+        return;
+    }
     if (!movie_) {
         return;
     }
@@ -275,8 +343,7 @@ void Game::complete_movie()
     movie_bytes_.clear();
     movie_mode_ = -1;
     if (completed_mode != 3) {
-        bgm_.stop();
-        bgm_track_ = -1;
+        movie_bgm_stop_pending_ = true;
     }
     if (movie_resume_script_) {
         movie_resume_script_ = false;

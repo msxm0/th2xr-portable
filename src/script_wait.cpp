@@ -52,7 +52,7 @@ struct WaitOpcode {
     int phases;
 };
 
-constexpr std::array<WaitOpcode, 34> wait_opcodes{{
+constexpr std::array<WaitOpcode, 35> wait_opcodes{{
     {"AddMessage2", WaitKind::novel_message, 1},
     {"B",           WaitKind::back,          2},
     {"BC",          WaitKind::back,          2},
@@ -77,14 +77,25 @@ constexpr std::array<WaitOpcode, 34> wait_opcodes{{
     {"SetMovie",    WaitKind::movie,         1},
     {"SetSelect",   WaitKind::select,        1},
     {"SetShake",    WaitKind::shake,         1},
-    {"SetTitle",    WaitKind::frame,         1},
+    // ESC_EOprSetTitle calls AVG_SetGotoTitle and never adds to the PC:
+    // the script is switched off and the screen fades out, so the
+    // instruction is held for the length of that fade, not one frame.
+    {"SetTitle",    WaitKind::title,         1},
     {"StopSakura",  WaitKind::frame,         1},
     {"V",           WaitKind::back,          2},
     {"VT",          WaitKind::back,          1},
     {"VW",          WaitKind::voice,         1},
-    {"ViewCalender",WaitKind::frame,         1},
-    {"ViewClock",   WaitKind::frame,         1},
+    // Both park until their animation is over.  ESC_EOprViewClock is
+    //     if( AVG_ViewClock( EscParam[0].num ) ){ EXEC_AddPC( EscCnt ); }
+    // and ESC_EOprViewCalender the same around AVG_SetCalender, so the PC
+    // only moves on the frame the thing finishes.  As ESC_WAIT-with-no-
+    // predicate they cost one frame and the script walked on while the clock
+    // was still turning - and worse, update_clock_calendar() called advance()
+    // when it finished, so the script took a step nothing had asked for.
+    {"ViewCalender",WaitKind::clock,         1},
+    {"ViewClock",   WaitKind::clock,         1},
     {"W",           WaitKind::frame,         1},
+    {"WaitFrame",   WaitKind::wait_frame,    1},
     {"WaitTime",    WaitKind::frame,         1},
     {"Z",           WaitKind::back_scroll,   1},
 }};

@@ -1,4 +1,5 @@
 #include "vm.hpp"
+#include "engine_rand.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -110,7 +111,8 @@ void Vm::execute(const Instruction& instruction)
         pc_ += instruction.size;
         break;
     case 5:
-        registers_.at(code[pc + 2]) = std::rand() % 65535;
+        // EXEC_LangInfo->reg[ param1 ] = ( rand() % 65535 ) - the engine's rand.
+        registers_.at(code[pc + 2]) = th2::engine_rand() % 65535;
         pc_ += instruction.size;
         break;
     case 6:

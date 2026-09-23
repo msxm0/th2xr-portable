@@ -3,6 +3,7 @@
 #include <SDL3/SDL.h>
 
 #include <chrono>
+#include <functional>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -145,6 +146,25 @@ public:
     void update();
     bool playing() const;
     bool fading() const { return fade_started_.has_value(); }
+
+    // Where a channel's own sense of time comes from.
+    //
+    // Fades are the reason this exists.  A fade is driven by comparing the
+    // time now against the time it started, and with the wall clock that
+    // makes "has the fade finished" a question about how fast the machine
+    // is - a trace replays at a couple of hundred ticks a second, so the
+    // same tick found the same fade finished on one run and still running on
+    // the next.  AVG_WaitBGM asks exactly that question, so the script's
+    // program counter inherited the jitter: MW held for one tick or two
+    // depending on the host.
+    //
+    // Pointed at Game::engine_now() for a trace run, the fade advances with
+    // the tick counter and the answer is the same on every machine.  It is
+    // deliberately NOT used for the decode budgets, which are real work
+    // against a real deadline and belong on the real clock.
+    static void set_clock(
+        std::function<std::chrono::steady_clock::time_point()> clock);
+    static std::chrono::steady_clock::time_point now();
 
 private:
     // The window of decoded audio kept in front of the device.  It drains as

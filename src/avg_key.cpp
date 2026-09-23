@@ -1,5 +1,7 @@
 #include "avg_key.hpp"
 
+#include <cstddef>
+
 namespace th2 {
 
 void KeyCond::clear_triggers()
@@ -7,6 +9,9 @@ void KeyCond::clear_triggers()
     trg_enter = trg_esc = trg_bs = trg_space = trg_shift = false;
     trg_home = trg_end = btrg_pup = btrg_pdown = false;
     mouse_trg_left = mouse_trg_right = mouse_trg_middle = false;
+    for (bool& digit : trg_num) {
+        digit = false;
+    }
     wheel = 0;
 }
 
@@ -23,6 +28,13 @@ void get_game_key(GameKey& key, const KeyCond& cond, int wheel_mode)
 
     key.click = trg_enter || cond.mouse_trg_left;
     key.cansel = cond.trg_esc || cond.trg_bs || cond.mouse_trg_right;
+
+    //     GameKey.num[j] = KeyCond.trg.kJ || KeyCond.trg.nJ;
+    // ten lines of it in AVG_GetGameKey, the keypad folded onto the number
+    // row.  Ours arrives already folded, one flag per digit.
+    for (std::size_t digit = 0; digit < 10; ++digit) {
+        key.num[digit] = cond.trg_num[digit] ? 1 : 0;
+    }
 
     switch (wheel_mode) {
     case 1:

@@ -533,7 +533,6 @@ bool Game::load_body(std::istream& in)
         state.tick = read_i32(in);
         state.reset_frames = read_i32(in);
         state.no_reset = read_i32(in) != 0;
-        state.updated = std::chrono::steady_clock::now();
         if (state.amount < 0
             || state.amount > static_cast<int>(state.petals.size())) {
             throw std::runtime_error("invalid sakura save state");
@@ -574,7 +573,7 @@ bool Game::load_body(std::istream& in)
     runtime_.vm_restore(regs, stack_data, pc);
 
     // Background
-    bg_scene_ = read_i32(in);
+    set_bg_scene(read_i32(in));
     background_kind_ =
         static_cast<BackgroundKind>(read_i32(in));
     background_view_.x = static_cast<float>(read_i32(in));
@@ -774,6 +773,10 @@ bool Game::load_body(std::istream& in)
     if (player_name_.family.empty()) {
         player_name_ = default_player_name_;
     }
+    // DefaultCharName = ESC_GetFlag( _DEFAULT_NAME ): the save carries it in
+    // flag 5 already, so the load restores it from there rather than
+    // recomputing it from the names.
+    default_char_name_ = runtime_.flag(5);
     return true;
 }
 

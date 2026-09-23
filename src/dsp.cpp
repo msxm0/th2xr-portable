@@ -1,12 +1,272 @@
 #include "dsp.hpp"
 
+#include "image.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 
 namespace th2 {
+
+bool debug_draws = false;
+// The engine's compositing arithmetic as a shader; see dsp.hpp and
+// shaders/blend/premul256.frag.
+struct Display::ExactBlend {
+    SDL_Renderer* renderer = nullptr;
+    SDL_GPUDevice* device = nullptr;
+    SDL_GPUShader* shader = nullptr;
+    SDL_GPURenderState* state = nullptr;
+
+    struct Uniform {
+        std::int32_t engine_alpha;
+        std::int32_t bright_r;
+        std::int32_t bright_g;
+        std::int32_t bright_b;
+    };
+
+    // The same tables the shader implements, for the self-test.
+    static int blend_table(int alpha, int value)
+    {
+        return std::clamp(
+            (std::clamp(alpha, 0, 256) * std::clamp(value, 0, 255)) >> 8,
+            0, 255);
+    }
+    static int bright_of(int value, int level)
+    {
+        const int j = std::clamp(level, 0, 255);
+        const int v = std::clamp(value, 0, 255);
+        return j < 128 ? (v * j) >> 7
+                       : ((((255 - v) * (j - 128)) >> 7) + v);
+    }
+
+    ~ExactBlend() { destroy_state(); }
+
+    void destroy_state()
+    {
+        if (state) {
+            SDL_DestroyGPURenderState(state);
+            state = nullptr;
+        }
+    }
+
+    bool load(SDL_Renderer* r, const std::filesystem::path& dir)
+    {
+        renderer = r;
+        device = SDL_GetGPURendererDevice(renderer);
+        if (!device) {
+            return false;          // software or non-GPU renderer
+        }
+        if (!(SDL_GetGPUShaderFormats(device) & SDL_GPU_SHADERFORMAT_SPIRV)) {
+            // No Metal or DXIL translation is shipped, so those keep SDL's
+            // blend.  Wrong output would be worse than a known level of
+            // drift.
+            return false;
+        }
+        std::size_t size = 0;
+        void* code = SDL_LoadFile(
+            (dir / "premul256.frag.spv").string().c_str(), &size);
+        if (!code) {
+            return false;
+        }
+        SDL_GPUShaderCreateInfo info{};
+        info.code = static_cast<const Uint8*>(code);
+        info.code_size = size;
+        info.entrypoint = "main";
+        info.format = SDL_GPU_SHADERFORMAT_SPIRV;
+        info.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
+        info.num_samplers = 1;
+        info.num_uniform_buffers = 1;
+        shader = SDL_CreateGPUShader(device, &info);
+        SDL_free(code);
+        if (!shader) {
+            SDL_Log("exact blend: shader %s", SDL_GetError());
+            return false;
+        }
+        SDL_GPURenderStateCreateInfo desc{};
+        desc.fragment_shader = shader;
+        state = SDL_CreateGPURenderState(renderer, &desc);
+        if (!state) {
+            SDL_Log("exact blend: render state %s", SDL_GetError());
+        }
+        return state != nullptr;
+    }
+
+    void arm(int engine_alpha, int r, int g, int b)
+    {
+        const Uniform uniform{
+            static_cast<std::int32_t>(engine_alpha),
+            static_cast<std::int32_t>(r),
+            static_cast<std::int32_t>(g),
+            static_cast<std::int32_t>(b)};
+        SDL_SetGPURenderStateFragmentUniforms(
+            state, 0, &uniform, sizeof uniform);
+        SDL_SetGPURenderState(renderer, state);
+    }
+
+    void release() { SDL_SetGPURenderState(renderer, nullptr); }
+
+    // Runs the tables through the shader and compares against the CPU.
+    //
+    // This is the whole defence against the arithmetic being done in
+    // something narrower than it asks for.  A mediump float is fp16: exact
+    // on integers only to 2048 and infinite past 65504, so 255*256 comes
+    // back wrong and 256*256 comes back Inf - a failure that happens on a
+    // phone while the desktop it was written on is fine.  The shader is
+    // written in int for that reason and compiles to 32-bit OpTypeInt with
+    // no RelaxedPrecision, but that is a claim about a translator and a
+    // driver rather than a fact, so it is measured once at startup and the
+    // whole path switched off if it does not hold.
+    //
+    // The destination is cleared to black so that the destination half of
+    // the blend contributes exactly zero whatever the blend unit rounds:
+    // what is under test is the source term, which is the part the shader
+    // is responsible for and the part with the large products in it.
+    //
+    // One readback, at init, never in a frame.
+    bool self_test()
+    {
+        constexpr int width = 256;      // every source value
+        constexpr int height = 6;
+        // Alphas and brightnesses chosen for the corners: 256 is the value
+        // whose square overflows fp16, 255*256 is the largest product the
+        // blend takes, and bright 255 drives (255-v)*(j-128) at its widest.
+        static constexpr int alphas[height] = {256, 255, 128, 1, 256, 256};
+        static constexpr int brights[height] = {128, 128, 128, 128, 255, 64};
+
+        // Through a surface in RGBA32, which is byte-ordered R,G,B,A on
+        // every endianness.  RGBA8888 is a *packed* format whose bytes are
+        // not in that order, and writing the alpha to the wrong one of them
+        // makes the test measure a ramp of alphas rather than the tables.
+        SDL_Surface* const face =
+            SDL_CreateSurface(width, height, SDL_PIXELFORMAT_RGBA32);
+        Texture target(SDL_CreateTexture(
+            renderer, SDL_PIXELFORMAT_RGBA8888,
+            SDL_TEXTUREACCESS_TARGET, width, height));
+        if (!face || !target) {
+            if (face) SDL_DestroySurface(face);
+            return false;
+        }
+        for (int y = 0; y < height; ++y) {
+            auto* row = static_cast<std::uint8_t*>(face->pixels)
+                + static_cast<std::size_t>(y) * face->pitch;
+            for (int x = 0; x < width; ++x) {
+                row[x * 4 + 0] = static_cast<std::uint8_t>(x);
+                row[x * 4 + 1] = static_cast<std::uint8_t>(x);
+                row[x * 4 + 2] = static_cast<std::uint8_t>(x);
+                // Opaque, to take Draw32's src1_p->a == 255 branch.
+                row[x * 4 + 3] = 255;
+            }
+        }
+        Texture source(SDL_CreateTextureFromSurface(renderer, face));
+        SDL_DestroySurface(face);
+        if (!source) {
+            return false;
+        }
+        SDL_SetTextureScaleMode(source.get(), SDL_SCALEMODE_NEAREST);
+
+        SDL_Texture* const held_target = SDL_GetRenderTarget(renderer);
+        float scale_x = 1.0f;
+        float scale_y = 1.0f;
+        SDL_GetRenderScale(renderer, &scale_x, &scale_y);
+        SDL_SetRenderTarget(renderer, target.get());
+        SDL_SetRenderScale(renderer, 1.0f, 1.0f);
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderClear(renderer);
+
+        SDL_SetTextureBlendMode(
+            source.get(), SDL_BLENDMODE_BLEND_PREMULTIPLIED);
+        for (int y = 0; y < height; ++y) {
+            const SDL_FRect rect{0.0f, static_cast<float>(y),
+                                 static_cast<float>(width), 1.0f};
+            arm(alphas[y], brights[y], brights[y], brights[y]);
+            SDL_RenderTexture(renderer, source.get(), &rect, &rect);
+        }
+        release();
+
+        SDL_Surface* const got = SDL_RenderReadPixels(renderer, nullptr);
+        SDL_SetRenderTarget(renderer, held_target);
+        SDL_SetRenderScale(renderer, scale_x, scale_y);
+        if (!got) {
+            SDL_Log("exact blend: self-test readback %s", SDL_GetError());
+            return false;
+        }
+        SDL_Surface* const rgba =
+            SDL_ConvertSurface(got, SDL_PIXELFORMAT_RGBA32);
+        SDL_DestroySurface(got);
+        if (!rgba) {
+            return false;
+        }
+        int wrong = 0;
+        int worst = 0;
+        for (int y = 0; y < height; ++y) {
+            const auto* row = static_cast<const std::uint8_t*>(rgba->pixels)
+                + static_cast<std::size_t>(y) * rgba->pitch;
+            for (int x = 0; x < width; ++x) {
+                const int expected =
+                    blend_table(alphas[y], bright_of(x, brights[y]));
+                const int actual = row[x * 4 + 0];
+                const int off = std::abs(actual - expected);
+                worst = std::max(worst, off);
+                wrong += off != 0;
+            }
+        }
+        SDL_DestroySurface(rgba);
+        if (wrong) {
+            // Reported, not acted on.  Silently demoting a path that is
+            // mostly working hides the problem twice over: the picture goes
+            // back to being uniformly one or two levels bright, and the
+            // reason it did never reaches anyone.  A number on the way past
+            // is what a developer can act on - the same call gl_transition
+            // makes about judging what a shader draws.
+            SDL_Log("Exact blend self-test: %d of %d samples wrong, worst "
+                    "off by %d - this GPU is not reproducing the engine's "
+                    "integer tables (narrow ints, or fp16?).  Continuing "
+                    "with the shader anyway.",
+                    wrong, width * height, worst);
+        } else {
+            SDL_Log("Exact blend self-test: %d samples exact",
+                    width * height);
+        }
+        return true;
+    }
+};
+
+bool Display::enable_exact_blend(const std::filesystem::path& shader_dir)
+{
+    // GL first: it is the only one of the two that can read the destination,
+    // so it is the only one that can be exact, and it is also the stack that
+    // exists in the browser.
+    auto gl = std::make_shared<GlExactBlend>(renderer_);
+    if (gl->available()) {
+        gl_exact_blend_ = std::move(gl);
+        SDL_Log("Blending: engine integer arithmetic (GLES, with destination)");
+        return true;
+    }
+    auto blend = std::make_shared<ExactBlend>();
+    if (!blend->load(renderer_, shader_dir)) {
+        exact_blend_.reset();
+        SDL_Log("Blending: SDL straight alpha - neither shader path is "
+                "available on this renderer");
+        return false;
+    }
+    SDL_Log("Blending: engine integer arithmetic (SDL_GPU, source term only)");
+    // The self-test reports and returns; it does not gate the path.  A
+    // shader that will not load at all is a different thing from one whose
+    // arithmetic came out wrong somewhere, and only the first is a reason
+    // to fall back.
+    blend->self_test();
+    exact_blend_ = std::move(blend);
+    return true;
+}
+
+bool Display::exact_blend_active() const { return exact_blend_ != nullptr; }
+
+GlExactBlend* Display::gl_exact_blend() const { return gl_exact_blend_.get(); }
+
 namespace {
+
 
 // MM_std's SinTbl[256], one turn in 256 steps scaled by 4096.  Every entry
 // is (int)(4096 * sin(2*pi*i/256)) truncated towards zero - checked against
@@ -216,6 +476,9 @@ GraphGeometry resolve_geometry(
     out.red = modulation_of(red);
     out.green = modulation_of(green);
     out.blue = modulation_of(blue);
+    out.bright_r = red;
+    out.bright_g = green;
+    out.bright_b = blue;
     // AVG_ControlBackFade drives GRP_BACK's brightness all the way to 255
     // for a flash to white, which is past what a modulation can reach.
     const int highest = std::max({red, green, blue});
@@ -254,6 +517,16 @@ void Display::create_bmp(int bno, int width, int height)
     bitmap.renderable = bitmap.view != nullptr;
     if (bitmap.view) {
         SDL_SetTextureBlendMode(bitmap.view, SDL_BLENDMODE_BLEND);
+    // Nearest, always.  The rasteriser these bitmaps stand in for indexes
+    // its source by integer pixel - Draw32.cpp walks `src1_p += xinc` and
+    // reads the texel - so there is no filtering to reproduce, and SDL's
+    // default of LINEAR is simply a different picture.  It cost accuracy
+    // twice over: it interpolated wherever a graph sat at a fractional
+    // offset, and the two renderers rounded the sample position differently,
+    // so the GLES and GPU backends disagreed with each other as well as with
+    // the reference.  Filtering belongs in the upscaler, which is a choice
+    // about presentation, not in the layer being compared.
+        SDL_SetTextureScaleMode(bitmap.view, SDL_SCALEMODE_NEAREST);
     }
 }
 
@@ -285,6 +558,10 @@ void Display::set_bmp(int bno, Texture texture, int width, int height)
     bitmap.pos_x = 0;
     bitmap.pos_y = 0;
     bitmap.renderable = false;
+    if (bitmap.view) {
+        // See create_bmp: the rasteriser samples by integer pixel.
+        SDL_SetTextureScaleMode(bitmap.view, SDL_SCALEMODE_NEAREST);
+    }
 }
 
 void Display::borrow_bmp(
@@ -301,6 +578,11 @@ void Display::borrow_bmp(
     bitmap.pos_x = 0;
     bitmap.pos_y = 0;
     bitmap.renderable = renderable && texture != nullptr;
+    if (texture) {
+        // The slot is borrowed, but how it is sampled is this layer's
+        // business - see create_bmp.
+        SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_NEAREST);
+    }
 }
 
 bool Display::ensure_renderable(int bno)
@@ -329,6 +611,7 @@ bool Display::ensure_renderable(int bno)
         return false;
     }
     SDL_SetTextureBlendMode(promoted.get(), SDL_BLENDMODE_BLEND);
+    SDL_SetTextureScaleMode(promoted.get(), SDL_SCALEMODE_NEAREST);
     if (bitmap.view) {
         SDL_Texture* const held = SDL_GetRenderTarget(renderer_);
         float scale_x = 1.0f;
@@ -381,14 +664,53 @@ void Display::copy_bmp2(int db_no, int sb_no, int r, int g, int b)
     SDL_GetRenderScale(renderer_, &scale_x, &scale_y);
     SDL_SetRenderTarget(renderer_, destination.view);
     SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
+    // DSP_CopyBmp2 is a DRW_NML blit with a brightness, so it lands on
+    // BrightTable - (i*j)>>7 when darkening - while SDL's colour modulation
+    // computes round(i*mod/255).  This is the half-toned message plate, and
+    // the difference was a level on most of its pixels for as long as the
+    // wash was up.  The copy overwrites rather than blends, so the shader
+    // reproduces the table exactly.
+    // GL first, exactly as draw_graph does.  Taking only the SDL_GPU blend
+    // here meant that on the GLES renderer - which is every build now - this
+    // copy fell back to SDL's colour modulation, and since BMP_BACKHALF is
+    // the whole screen whenever the message window is up, that one omission
+    // was most of the port's remaining difference from the reference.
+    const bool gl_exact = gl_exact_blend_ && gl_exact_blend_->available();
+    const bool exact = !gl_exact && exact_blend_ != nullptr;
+    if (debug_draws) {
+        SDL_Log("copy_bmp2 %d <- %d  bright %d,%d,%d  gl_exact=%d",
+                db_no, sb_no, r, g, b, (int)gl_exact);
+    }
     const auto shade = [](int value) {
         return static_cast<Uint8>(
             std::clamp(value * 255 / bright_neutral, 0, 255));
     };
+    const bool modulated = !gl_exact && !exact;
     SDL_SetTextureColorMod(
-        source.view, shade(r), shade(g), shade(b));
+        source.view,
+        modulated ? shade(r) : 255, modulated ? shade(g) : 255,
+        modulated ? shade(b) : 255);
     SDL_SetTextureBlendMode(source.view, SDL_BLENDMODE_NONE);
-    SDL_RenderTexture(renderer_, source.view, nullptr, nullptr);
+    bool drawn = false;
+    if (gl_exact) {
+        const SDL_FRect whole{
+            0.0f, 0.0f, static_cast<float>(source.width),
+            static_cast<float>(source.height)};
+        drawn = gl_exact_blend_->capture_destination(renderer_)
+            && gl_exact_blend_->draw(
+                renderer_, source.view, whole, whole, false, false, 0,
+                256, r, g, b);
+    }
+    if (!drawn) {
+        if (exact) {
+            // A plain overwrite, so there is no destination to read.
+            exact_blend_->arm(256, r, g, b);
+        }
+        SDL_RenderTexture(renderer_, source.view, nullptr, nullptr);
+        if (exact) {
+            exact_blend_->release();
+        }
+    }
     SDL_SetTextureColorMod(source.view, 255, 255, 255);
     SDL_SetTextureBlendMode(source.view, SDL_BLENDMODE_BLEND);
     SDL_SetRenderScale(renderer_, scale_x, scale_y);
@@ -907,6 +1229,138 @@ void Display::get_graph_bright(int gno, int* r, int* g, int* b) const
     }
 }
 
+
+namespace {
+
+// DRW_DrawPOLY4_TT's scanline tables, transcribed from Draw.cpp and
+// Draw32.cpp.  The engine rasterises a four-point quad by walking its four
+// edges with a DDA into per-line min/max tables (DrawMinMaxTableSrc), then
+// walking each line between them with a second DDA (DRW_DrawXLine_TT).
+// Both are all-integer and both truncate where C truncates, so the texel a
+// pixel reads is exactly reproducible - and it is not the texel a GPU's
+// interpolated texture coordinate lands on, which is why a rotating shake
+// came out as a fine stipple over the whole frame.
+struct PolyEdge {
+    int x;
+    int sx;
+    int sy;
+};
+
+void min_max_table_src(int x1, int y1, int sx1, int sy1,
+                       int x2, int y2, int sx2, int sy2,
+                       int cy1, int cy2,
+                       std::vector<PolyEdge>& mi, std::vector<PolyEdge>& ma)
+{
+    int dx = x1 - x2;
+    int dy = y1 - y2;
+    if (dx == 0 && dy == 0) {
+        return;
+    }
+    int ax = 1;
+    int ay = 1;
+    if (dx < 0) { ax = -1; dx = -dx; }
+    if (dy < 0) { ay = -1; dy = -dy; }
+    int x = x2;
+    int y = y2;
+    int dsx = sx1 - sx2;
+    int dsy = sy1 - sy2;
+    int sx = sx2;
+    int sy = sy2;
+    int cnt = 0;
+    int sxcnt = 0;
+    int sycnt = 0;
+    const auto record = [&] {
+        if (cy1 <= y && y < cy2) {
+            auto& low = mi[static_cast<std::size_t>(y)];
+            auto& high = ma[static_cast<std::size_t>(y)];
+            if (low.x > x) {
+                low = {x, sx, sy};
+            }
+            if (high.x < x + 1) {
+                high = {x + 1, sx + 1, sy};
+            }
+        }
+    };
+    // The step is divided BEFORE the sign is taken off, so it truncates
+    // toward zero, and the remainder is taken of the magnitude.
+    const int span = dx < dy ? dy : dx;
+    const int dsx1 = dsx / span;
+    const int dsy1 = dsy / span;
+    int asx = 1;
+    int asy = 1;
+    if (dsx < 0) { asx = -1; dsx = -dsx; }
+    if (dsy < 0) { asy = -1; dsy = -dsy; }
+    const int dsx2 = dsx % span;
+    const int dsy2 = dsy % span;
+    for (int i = 0; i < span; ++i) {
+        record();
+        if (dx < dy) {
+            y += ay;
+            cnt += dx;
+            if (cnt >= dy) { cnt -= dy; x += ax; }
+        } else {
+            x += ax;
+            cnt += dy;
+            if (cnt >= dx) { cnt -= dx; y += ay; }
+        }
+        sxcnt += dsx2; if (sxcnt >= span) { sxcnt -= span; sx += asx; } sx += dsx1;
+        sycnt += dsy2; if (sycnt >= span) { sycnt -= span; sy += asy; } sy += dsy1;
+    }
+}
+
+}  // namespace
+
+// Eight ints a display line: (dx1, w, sx2, sy2) - where the line's span
+// starts, how long it is and the texel it starts on - then (dsx, dsy, ww, 0),
+// the source delta across the full unclipped span.  DRW_DrawXLine_TT's own
+// set-up, including the -1 it adds to a start whose delta is negative.
+std::vector<int> Display::poly4_rows(const int corners[4][2],
+                                     const int sources[4][2]) const
+{
+    const int height = display_height;
+    const int width = display_width;
+    std::vector<PolyEdge> mi(static_cast<std::size_t>(height), {width, 0, 0});
+    std::vector<PolyEdge> ma(static_cast<std::size_t>(height), {0, 0, 0});
+    // DRW_DrawPOLY4_TT walks 1-2, 2-4, 4-3, 3-1; ClipRectDef is the display.
+    const auto edge = [&](int a, int b) {
+        min_max_table_src(corners[a][0], corners[a][1],
+                          sources[a][0], sources[a][1],
+                          corners[b][0], corners[b][1],
+                          sources[b][0], sources[b][1], 0, height, mi, ma);
+    };
+    edge(0, 1);
+    edge(1, 3);
+    edge(3, 2);
+    edge(2, 0);
+
+    std::vector<int> rows(static_cast<std::size_t>(height) * 8, 0);
+    for (int y = 0; y < height; ++y) {
+        const auto& low = mi[static_cast<std::size_t>(y)];
+        const auto& high = ma[static_cast<std::size_t>(y)];
+        const int ww = high.x - low.x;
+        if (low.x == width || ww == 0) {
+            continue;
+        }
+        const int dx1 = std::max(low.x, 0);
+        const int dx2 = std::min(high.x, width);
+        const int w = dx2 - dx1;
+        const int xx = dx1 - low.x;
+        const int dsx = high.sx - low.sx;
+        const int dsy = high.sy - low.sy;
+        const int sx2 = dsx * xx / ww + low.sx - (dsx < 0 ? 1 : 0);
+        const int sy2 = dsy * xx / ww + low.sy - (dsy < 0 ? 1 : 0);
+        int* row = rows.data() + static_cast<std::size_t>(y) * 8;
+        row[0] = dx1;
+        row[1] = w;
+        row[2] = sx2;
+        row[3] = sy2;
+        row[4] = dsx;
+        row[5] = dsy;
+        row[6] = ww;
+    }
+    return rows;
+}
+
 // --- drawing -----------------------------------------------------------
 
 SDL_Texture* Display::blend_pair(const Graph& graph)
@@ -1001,24 +1455,127 @@ void Display::draw_graph_bmp(
         graph, global_x, global_y, bitmap.pos_x, bitmap.pos_y,
         bright_r_, bright_g_, bright_b_);
 
-    // A graph with a second bitmap is blended into one sprite first.
-    SDL_Texture* const paired = blend_pair(graph);
-    SDL_Texture* const texture = paired ? paired : bitmap.view;
-    SDL_SetTextureColorMod(
-        texture, geometry.red, geometry.green, geometry.blue);
+    // A graph with a second bitmap is one sprite whose pixels are a mix of
+    // the two.  The rasteriser composites that in a single pass; the scratch
+    // buffer below is a stand-in for callers that cannot, and it rounds where
+    // the rasteriser truncates - a level on half the sprite.  So the pair is
+    // handed to the exact path whole, and only a fallback pre-blends.
+    SDL_Texture* pair_second = nullptr;
+    int pair_rate = 256;
+    if (graph.bset == 1 && graph.bno2 >= 0 && graph.bno2 < bitmap_max
+        && bitmaps_[graph.bno2].valid()) {
+        pair_second = bitmaps_[graph.bno2].view;
+        pair_rate = std::clamp(draw_alpha_of(graph.param2), 0, 256);
+    }
+    SDL_Texture* paired = nullptr;
+    SDL_Texture* texture = bitmap.view;
     const int alpha = draw_alpha_of(graph.param);
+    // The exact path carries the alpha in a uniform and does the multiply
+    // itself, so the texture's own modulation has to stand down - otherwise
+    // it would be applied twice, once rounded at /255 by SDL and once
+    // truncated at /256 by the shader.  It is only taken for the plain
+    // source-over modes and only for the straight blit below: the poly4 path
+    // carries its colour in the vertices, where the alpha would arrive
+    // already folded into `color` and be counted twice again.
+    const std::uint32_t mode = draw_mode_of(graph.param);
+    // DRW_DrawBMP_TT_Bld leaves before it touches a pixel:
+    //     if( blnd==256 ) return DRW_DrawBMP_TT_Std( dobj );
+    //     if( blnd==0   ) return 1;
+    // Nothing at all at zero - and that is not the same as compositing
+    // nothing, because the partial-alpha branch scales the destination by
+    // 255-blnd_tbl[a], which at blnd 0 is 255 and costs the destination a
+    // level.  A character fading in is drawn at 0 on its first frame.
+    if (mode == drw_bld && draw_alpha_of(graph.param) == 0) {
+        return;
+    }
+    // The modes the shader reproduces: source-over, and the saturating add.
+    // Everything else still goes to SDL, which rounds differently on each
+    // backend - that is the remaining source of GLES-vs-GPU disagreement.
+    const bool additive = mode == drw_add || mode == drw_ooi;
+    const bool plain = graph.poly != Poly::poly4
+        && (mode == drw_nml || mode == drw_bld || additive);
+    // The SDL_GPU shader has no additive form, so it keeps its narrower set.
+    const bool exact = exact_blend_ && plain && !additive;
+    // The GL path draws the quad itself, so it only takes the cases whose
+    // geometry it reproduces: no clip rectangle (it does not set a scissor)
+    // and no render scale (its vertices are in target pixels).
+    float exact_scale_x = 1.0f;
+    float exact_scale_y = 1.0f;
+    SDL_GetRenderScale(renderer_, &exact_scale_x, &exact_scale_y);
+    // A clip rectangle is no longer a reason to decline: the exact path sets
+    // it as a scissor.  Baking a character into the background bitmap is a
+    // clipped draw, and sending that one to SDL left every solid pixel of
+    // every baked character a level bright.
+    const bool gl_exact = gl_exact_blend_ && plain
+        && exact_scale_x == 1.0f && exact_scale_y == 1.0f;
+    // A picture that came with an alpha channel is one the rasteriser stores
+    // premultiplied, so its colour goes in already folded - mode 3 - while a
+    // picture with none is taken at its own value.  The difference is a level
+    // on every solid pixel of every sprite, which is most of a character.
+    const bool premultiplied = th2::texture_has_source_alpha(texture);
+    // Folded on load, before its tone curve: mode 3's blend without the fold.
+    const bool folded = th2::texture_source_folded(texture);
+    if (pair_second && !gl_exact) {
+        // No exact path for this draw, so fall back to the scratch mix.
+        paired = blend_pair(graph);
+        if (paired) {
+            texture = paired;
+        }
+        pair_second = nullptr;
+    }
+    // Under the exact path the tint rides in the uniform with the alpha, so
+    // that BrightTable and BlendTable are applied in that order and each
+    // truncates where the rasteriser truncates.  SDL's modulation would
+    // round both, in the other order.
+    SDL_SetTextureColorMod(
+        texture,
+        exact ? 255 : static_cast<Uint8>(geometry.red),
+        exact ? 255 : static_cast<Uint8>(geometry.green),
+        exact ? 255 : static_cast<Uint8>(geometry.blue));
     SDL_SetTextureAlphaMod(
         texture,
-        static_cast<Uint8>(std::clamp(alpha, 0, 256) * 255 / 256));
-    SDL_SetTextureBlendMode(texture, blend_of(graph.param));
+        exact ? 255
+              : static_cast<Uint8>(std::clamp(alpha, 0, 256) * 255 / 256));
+    SDL_SetTextureBlendMode(
+        texture,
+        exact ? SDL_BLENDMODE_BLEND_PREMULTIPLIED : blend_of(graph.param));
 
     const bool clipping = geometry.clipped;
     if (clipping) {
         SDL_SetRenderClipRect(renderer_, &geometry.clip);
     }
-    if (graph.poly == Poly::poly4) {
-        // A four-point quad: two triangles through RenderGeometry, which is
-        // what the rasteriser's DRW_DrawPOLY4 does by hand.  Corner order is
+    bool poly_drawn = false;
+    if (graph.poly == Poly::poly4 && gl_exact_blend_ && !additive
+        && (mode == drw_nml || mode == drw_bld)
+        && exact_scale_x == 1.0f && exact_scale_y == 1.0f) {
+        // DRW_DrawPOLY4_TT, texel for texel - see poly4_rows().  The quad is
+        // the whole target; the shader discards outside each line's span.
+        int corners[4][2];
+        int sources[4][2];
+        for (int i = 0; i < 4; ++i) {
+            corners[i][0] = static_cast<int>(geometry.corners[i].x);
+            corners[i][1] = static_cast<int>(geometry.corners[i].y);
+            sources[i][0] = static_cast<int>(geometry.source_corners[i].x);
+            sources[i][1] = static_cast<int>(geometry.source_corners[i].y);
+        }
+        const auto rows = poly4_rows(corners, sources);
+        float target_w = 0.0f;
+        float target_h = 0.0f;
+        if (SDL_Texture* target = SDL_GetRenderTarget(renderer_)) {
+            SDL_GetTextureSize(target, &target_w, &target_h);
+        }
+        const SDL_FRect whole{0.0f, 0.0f, target_w, target_h};
+        poly_drawn = target_w > 0.0f
+            && gl_exact_blend_->capture_destination(renderer_)
+            && gl_exact_blend_->draw(
+                renderer_, texture, whole, whole, false, false, 0,
+                std::clamp(alpha, 0, 256), geometry.bright_r,
+                geometry.bright_g, geometry.bright_b, nullptr, 256,
+                clipping ? &geometry.clip : nullptr,
+                rows.data(), display_height);
+    }
+    if (graph.poly == Poly::poly4 && !poly_drawn) {
+        // Fallback: two triangles through RenderGeometry.  Corner order is
         // 1 top-left, 2 top-right, 3 bottom-left, 4 bottom-right.
         float width = 0.0f;
         float height = 0.0f;
@@ -1043,7 +1600,7 @@ void Display::draw_graph_bmp(
             SDL_SetTextureAlphaMod(texture, 255);
             SDL_RenderGeometry(renderer_, texture, vertices, 4, indices, 6);
         }
-    } else {
+    } else if (graph.poly != Poly::poly4) {
         // DSP_SetGraphSMove can push the source window off the edge of the
         // bitmap - the background is exactly screen-sized, so any slide
         // does.  The rasteriser's ClipRect narrows the blit and pushes the
@@ -1062,14 +1619,76 @@ void Display::draw_graph_bmp(
         const SDL_FlipMode flip = static_cast<SDL_FlipMode>(
             (geometry.flip_x ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE)
             | (geometry.flip_y ? SDL_FLIP_VERTICAL : SDL_FLIP_NONE));
-        if (flip == SDL_FLIP_NONE) {
-            SDL_RenderTexture(renderer_, texture, &source, &destination);
-        } else {
-            SDL_RenderTextureRotated(
-                renderer_, texture, &source, &destination,
-                0.0, nullptr, flip);
+        // The GL path does the whole blend, destination included, so it
+        // is tried first and the SDL draw is skipped when it succeeds.  It
+        // reports failure rather than drawing something wrong, so falling
+        // through is always safe.
+        bool drawn = false;
+        if (gl_exact) {
+            drawn = gl_exact_blend_->capture_destination(renderer_)
+                && gl_exact_blend_->draw(
+                    renderer_, texture, source, destination,
+                    geometry.flip_x, geometry.flip_y,
+                    pair_second ? 4 : additive ? 1
+                        : folded ? 6 : premultiplied ? 3 : 0,
+                    std::clamp(alpha, 0, 256), geometry.bright_r,
+                    geometry.bright_g, geometry.bright_b,
+                    pair_second, pair_rate,
+                    geometry.clipped ? &geometry.clip : nullptr);
         }
-        if (geometry.brighten > 0) {
+        if (pair_second && !drawn) {
+            // The pair could not be composited in one pass after all - mix
+            // it in the scratch and let the SDL path below draw that.
+            paired = blend_pair(graph);
+            if (paired) {
+                texture = paired;
+                SDL_SetTextureColorMod(
+                    texture,
+                    exact ? 255 : static_cast<Uint8>(geometry.red),
+                    exact ? 255 : static_cast<Uint8>(geometry.green),
+                    exact ? 255 : static_cast<Uint8>(geometry.blue));
+                SDL_SetTextureAlphaMod(
+                    texture,
+                    exact ? 255
+                          : static_cast<Uint8>(
+                                std::clamp(alpha, 0, 256) * 255 / 256));
+                SDL_SetTextureBlendMode(
+                    texture,
+                    exact ? SDL_BLENDMODE_BLEND_PREMULTIPLIED
+                          : blend_of(graph.param));
+            }
+        }
+        if (debug_draws) {
+            SDL_Log("draw_graph bno=%d mode=%u dst=%.0f,%.0f %.0fx%.0f "
+                    "alpha=%d gl_exact=%d drawn=%d",
+                    graph.bno, mode, destination.x, destination.y,
+                    destination.w, destination.h, alpha, (int)gl_exact,
+                    (int)drawn);
+        }
+        if (!drawn) {
+            if (exact) {
+                exact_blend_->arm(
+                    std::clamp(alpha, 0, 256),
+                    geometry.bright_r, geometry.bright_g, geometry.bright_b);
+            }
+            if (flip == SDL_FLIP_NONE) {
+                SDL_RenderTexture(renderer_, texture, &source, &destination);
+            } else {
+                SDL_RenderTextureRotated(
+                    renderer_, texture, &source, &destination,
+                    0.0, nullptr, flip);
+            }
+            if (exact) {
+                exact_blend_->release();
+            }
+        }
+        // BrightTable's upper half is in the shader, so the additive pass
+        // that stands in for it has nothing left to do - on either exact
+        // path.  It only asked about the CPU one, so every GRP_BACK the GL
+        // path had already brightened got the picture added on again: a
+        // flash to white (FB 256) went white a good deal sooner than it
+        // should, and at 204 there was nothing of the CG's shadows left.
+        if (geometry.brighten > 0 && !exact && !drawn) {
             // The same picture again, added on.  A white rectangle over the
             // destination would light up everything transparent in it too.
             SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_ADD);
@@ -1106,6 +1725,12 @@ void Display::draw_graph_prim(
         static_cast<Uint8>(std::clamp(alpha, 0, 256) * 255 / 256));
     if (geometry.clipped) {
         SDL_SetRenderClipRect(renderer_, &geometry.clip);
+    }
+    if (debug_draws) {
+        SDL_Log("draw_flat mode=%u dst=%.0f,%.0f %.0fx%.0f alpha=%d",
+                draw_mode_of(graph.param), geometry.destination.x,
+                geometry.destination.y, geometry.destination.w,
+                geometry.destination.h, alpha);
     }
     SDL_RenderFillRect(renderer_, &geometry.destination);
     if (geometry.clipped) {

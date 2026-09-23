@@ -336,6 +336,11 @@ void Game::begin_transition(
     // so a menu fade lasts the same half second whatever the effect speed.
     const int effective_frames = timing == EffectTiming::menu
         ? frames * 2 : effect_frames(frames);
+    // AVG_SetBack's other half: the outgoing screen goes into GRP_BACK+1 a
+    // layer below and GRP_BACK moves on top of it, so the fade has a fixed
+    // backdrop instead of compositing over a framebuffer that already holds
+    // the picture it is fading to.  A menu cross-fade is of the whole
+    // composited screen rather than of GRP_BACK, so it keeps out of this.
     Surface previous_pixels;
     Texture previous;
     if (transition_needs_pixels(type)) {
@@ -401,7 +406,7 @@ void Game::update_transition()
 // The shader form of draw_pattern_transition(): same blend, same mask, but
 // both frames stay on the GPU, so the wipe costs no readback.  Returns false
 // if anything is missing, and the caller falls back to the CPU blend.
-bool Game::draw_pattern_transition_gpu(float progress)
+bool Game::draw_pattern_transition_gpu(int rate)
 {
     if (!gl_transition_usable()) {
         return false;
@@ -419,14 +424,28 @@ bool Game::draw_pattern_transition_gpu(float progress)
     if (!mask) {
         return false;
     }
+    // blnd2, exactly as draw_pattern_transition_rate() builds it: the
+    // integer rate through a truncating divide, not a float progress
+    // rescaled.  The two disagree by a step at the wipe front.
     const int vague = std::clamp(transition.vague, 1, 256);
-    const float offset = progress * static_cast<float>(256 + vague);
+    const int offset = rate * (256 + vague) / 256;
+    if (th2::debug_draws) {
+        SDL_Log("wipe: mask %dx%d  vague=%d offset=%d rate=%d",
+                transition.mask_width, transition.mask_height, vague, offset,
+                rate);
+    }
     return gl_transition_->draw(
         renderer_, transition.previous.get(), transition.composite.get(),
-        mask, offset, static_cast<float>(vague));
+        mask, offset, vague);
 }
 
 void Game::draw_pattern_transition(float progress)
+{
+    draw_pattern_transition_rate(
+        std::clamp(static_cast<int>(progress * 256.0f), 0, 256));
+}
+
+void Game::draw_pattern_transition_rate(int rate)
 {
     auto& transition = *transition_;
     if (!transition.next_pixels) {
@@ -456,9 +475,12 @@ void Game::draw_pattern_transition(float progress)
         static_cast<const std::uint8_t*>(transition.previous_pixels->pixels);
     const auto* next =
         static_cast<const std::uint8_t*>(transition.next_pixels->pixels);
+    //     blnd3 = LIM(dobj->dnum3, 1, 256);
+    //     blnd2 = dobj->dnum2*(256+blnd3)/256;
+    //     PtnTable[i] = LIM( (i-256)*256/blnd3, 0, 255 );
+    // with dnum2 the rate and dnum3 the vagueness, both integers.
     const int vague = std::clamp(transition.vague, 1, 256);
-    const int blend_offset = static_cast<int>(
-        progress * static_cast<float>(256 + vague));
+    const int blend_offset = rate * (256 + vague) / 256;
 
     for (int y = 0; y < height; ++y) {
         const int mask_y = y * transition.mask_height / height;
@@ -477,11 +499,20 @@ void Game::draw_pattern_transition(float progress)
                 + static_cast<std::size_t>(x) * 4;
             const auto output_offset =
                 (static_cast<std::size_t>(y) * width + x) * 4;
+            // Draw24.cpp's pattern blit, term by term:
+            //     blnd_tbl = BlendTable[     PtnTable[mask+blnd2] ];
+            //     brev_tbl = BlendTable[ 255-PtnTable[mask+blnd2] ];
+            //     dest = brev_tbl[dest] + blnd_tbl[src];
+            // BlendTable is (i*j)>>8, so this is two independent truncations
+            // at /256 - not one combined divide by 255, which is what this
+            // used to do and which came out a level bright on every pixel of
+            // the screen for the length of a wipe.
             for (int channel = 0; channel < 3; ++channel) {
-                pixels[output_offset + channel] = static_cast<std::uint8_t>(
-                    (previous[previous_offset + channel] * (255 - alpha)
-                     + next[source_offset + channel] * alpha)
-                    / 255);
+                const int kept =
+                    ((255 - alpha) * previous[previous_offset + channel]) >> 8;
+                const int added = (alpha * next[source_offset + channel]) >> 8;
+                pixels[output_offset + channel] =
+                    static_cast<std::uint8_t>(std::clamp(kept + added, 0, 255));
             }
             pixels[output_offset + 3] = 255;
         }
@@ -759,15 +790,29 @@ void Game::draw_active_transition()
         // Instant: there is no frame of the old screen left to show.
         return;
     }
-    const auto elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - transition_->started);
+    // AVG_ControlBackChange measures the wipe with BackStruct's own counter:
+    //
+    //     int back_max = AVG_EffCnt(BackStruct.fd_max);
+    //     ...
+    //     rate = 256*BackStruct.fd_cnt/back_max;
+    //
+    // - a tick count, re-asking AVG_EffCnt every frame so a held skip key
+    // collapses it.  This read a wall clock instead, which is the last one
+    // left in the drawing path: the wipe ran at whatever rate the machine
+    // managed rather than at the engine's, and no two runs agreed.  fd_cnt
+    // and fd_max are already in step with the reference tick for tick.
+    const int back_max = effect_frames(back().fd_max);
+    const int rate = back_max > 0
+        ? std::clamp(256 * back().fd_cnt / back_max, 0, 256)
+        : 256;
     const float progress = std::clamp(
-        static_cast<float>(
-            elapsed.count() * 60.0 / transition_->frames),
-        0.0f, 1.0f);
+        static_cast<float>(rate) / 256.0f, 0.0f, 1.0f);
     if (transition_->type >= 0x80) {
-        if (!draw_pattern_transition_gpu(progress)) {
-            draw_pattern_transition(progress);
+        // The integer rate, not the float: blnd2 is built from it with two
+        // truncating divisions and the wipe front sits a step off if either
+        // is done in floating point.
+        if (!draw_pattern_transition_gpu(rate)) {
+            draw_pattern_transition_rate(rate);
         }
     } else if (transition_->type == 0) {
         if (progress < 0.5f) {
@@ -905,155 +950,31 @@ Game::ShakeSample Game::shake_sample()
     if (!back().sk_flag) {
         return result;
     }
-    // AVG_ControlShake() increments sk_cnt before it does anything, so the
-    // first frame of a shake is count 1.  The counter is BackStruct's now,
-    // stepped once per sixtieth by the AVG_Control* pass, so this samples
-    // the same integer the engine would be looking at.
-    const int count = std::max(1, back().sk_cnt);
-    const int span = effect_frames4(back().sk_speed);  // AVG_EffCnt4(sk_speed)
-    const int pitch = back().sk_pich;
-
-    // COS(X) is SinTbl[X%256] and SIN(X) is SinTbl[(X+64)%256], so despite
-    // the names the engine's COS is a sine - COS(0) is zero, not the peak.
-    // Taking it for a cosine put every sine shake a quarter period out.
-    const auto wave = [](int phase) {
-        return std::sin(static_cast<float>(((phase % 256) + 256) % 256)
-                        * 2.0f * std::numbers::pi_v<float> / 256.0f);
-    };
-    // x = x*(back_max-sk_cnt)/back_max, and only when back_max is non-zero:
-    // a shake with no duration runs at full strength forever.
-    const float taper = span > 0
-        ? std::clamp(static_cast<float>(span - count)
-                         / static_cast<float>(span), 0.0f, 1.0f)
-        : 1.0f;
-    // STD_LimitLoop: a triangle, not a sawtooth - it mirrors back down once
-    // it passes the limit.
-    const auto limit_loop = [](float value, float limit) {
-        if (limit <= 0.0f) {
-            return 0.0f;
-        }
-        float wrapped = std::fmod(value, limit * 2.0f);
-        if (wrapped < 0.0f) {
-            wrapped += limit * 2.0f;
-        }
-        return wrapped >= limit ? limit * 2.0f - wrapped : wrapped;
-    };
-    // A rate in the engine's 256-unit circle, as DSP_SetGraphRoll takes it.
-    const auto degrees = [](float rate) {
-        return static_cast<double>(rate) * 360.0 / 256.0;
-    };
-
+    // AVG_ControlShake has already run this frame and worked the numbers out
+    // in its own integer arithmetic - see AvgBack::ShakeOut.  The draw only
+    // applies them.  This used to derive them a second time in floating
+    // point, which truncates once at the end where the engine truncates
+    // after every step, and on SHAKE_ROLL_SIN (010301100.sdt, Q 13 20 40 0)
+    // that put the whole frame a 256th of a turn away from the reference.
+    const auto& out = avgback().shake_out();
     const int type = back().sk_type;
-    bool translates = false;
-    float amount = 0.0f;
-
-    switch (type) {
-    case 0:   // SHAKE_SIN
-    case 3:   // SHAKE_TXT_SIN
-    case 6:   // SHAKE_ALL_SIN
-    case 15:  // SHAKE_SIN_SET
-    case 16:  // SHAKE_ALL_SIN_SET
-        // COS(cnt2)*pich/4096 with COS peaking at 4096, so simply pitch
-        // scaled by the wave.  Both branches of the original divide by the
-        // same 4096; only the taper differs.
-        amount = static_cast<float>(pitch)
-            * wave(count * back().sk_swing / 8) * taper;
-        translates = true;
-        break;
-    case 1:   // SHAKE_2TI
-    case 4:   // SHAKE_TXT_2TI
-    case 7:   // SHAKE_ALL_2TI
-        // cnt = (sk_cnt%2)*2-1: hard alternation, no taper.
-        amount = static_cast<float>(pitch) * ((count % 2) ? 1.0f : -1.0f);
-        translates = true;
-        break;
-    case 9:   // SHAKE_RAND
-    case 10:  // SHAKE_TXT_RAND
-    case 11:  // SHAKE_ALL_RAND
-        // A fresh direction every frame, never the one just used, at full
-        // pitch.  Advanced per frame rather than per call so a frame that
-        // samples twice does not roll twice.
-        while (back().sk_cnt2 < count) {
-            int direction = std::rand() % 8;
-            while (direction == back().sk_dir) {
-                direction = std::rand() % 8;
-            }
-            back().sk_dir = direction;
-            ++back().sk_cnt2;
-        }
-        amount = static_cast<float>(pitch);
-        translates = true;
-        break;
-    case 2: {  // SHAKE_ZOOM
-        const float root = std::sqrt(static_cast<float>(std::max(0, pitch)));
-        const float swept = span > 0
-            ? static_cast<float>(count) * root * 2.0f
-                / static_cast<float>(span)
-            : 0.0f;
-        const float step = limit_loop(swept, root);
-        // DSP_SetGraphZoom2's zoom is 256ths: sw*(zoom+256)/256.
-        result.zoom_256 = static_cast<int>(step * step);
-        result.scale = 1.0f + static_cast<float>(result.zoom_256) / 256.0f;
+    result.x = static_cast<float>(out.x);
+    result.y = static_cast<float>(out.y);
+    if (out.roll >= 0) {
+        result.roll_rate = out.roll;
+        result.angle = static_cast<double>(out.roll) * 360.0 / 256.0;
+    }
+    if (type == th2::shake_zoom && out.zoom >= 0) {
+        // SHAKE_ZOOM alone sets DRW_BLD(128) on the background while it runs.
+        result.zoom_256 = out.zoom;
+        result.scale = 1.0f + static_cast<float>(out.zoom) / 256.0f;
         result.half_blend = true;
-        break;
     }
-    case 12: {  // SHAKE_ROLL
-        // cnt = 256 - sk_cnt*256/back_max; cnt = 256 - cnt*cnt/256.  Kept in
-        // the engine's 0..256 units rather than normalised, because the
-        // modulo below is taken in those units - dividing first made the
-        // rotation 256 times too small.
-        const float linear = span > 0
-            ? 256.0f - static_cast<float>(count) * 256.0f
-                / static_cast<float>(span)
-            : 0.0f;
-        const float eased = 256.0f - linear * linear / 256.0f;
-        float rate = std::fmod(eased * static_cast<float>(pitch) / 2.0f,
-                               256.0f);
-        if ((back().sk_dir % 2) == 0) {
-            rate = 256.0f - rate;
-        }
-        result.roll_rate = static_cast<int>(rate);
-        result.angle = degrees(rate);
-        break;
-    }
-    case 13: {  // SHAKE_ROLL_SIN
-        const float rate =
-            -wave(count * back().sk_swing / 8) * static_cast<float>(pitch)
-            * taper;
-        // (256+y)%256 - the rate wraps into a turn rather than going
-        // negative, which is what DSP_SetGraphRoll indexes the table with.
-        result.roll_rate = (static_cast<int>(rate) % 256 + 256) % 256;
-        result.angle = degrees(rate);
-        break;
-    }
-    case 14: {  // SHAKE_ROLL_2TI
-        // sk_cnt%4 gives -pich, 0, +pich, 0.  The two flat frames are what
-        // wipe the corners the rotation leaves uncovered, so they have to
-        // land exactly - smoothing this into a curve would let the
-        // uncovered region accumulate.
-        static constexpr std::array<int, 4> steps{-1, 0, 1, 0};
-        const int turn = steps[static_cast<std::size_t>(count % 4)] * pitch;
-        result.roll_rate = (turn % 256 + 256) % 256;
-        result.angle = degrees(static_cast<float>(turn));
-        break;
-    }
-    default:
-        break;
-    }
-
-    if (translates) {
-        // DIR_D 0, DIR_DL 1, DIR_L 2, DIR_UL 3, DIR_U 4, DIR_UR 5, DIR_R 6,
-        // DIR_DR 7.
-        const int dir = back().sk_dir;
-        const bool left = dir == 1 || dir == 2 || dir == 3;
-        const bool right = dir == 5 || dir == 6 || dir == 7;
-        const bool up = dir == 3 || dir == 4 || dir == 5;
-        const bool down = dir == 0 || dir == 1 || dir == 7;
-        result.x = left ? -amount : right ? amount : 0.0f;
-        result.y = up ? -amount : down ? amount : 0.0f;
-    }
-    result.text_only = type == 3 || type == 4 || type == 10;
-    result.includes_text = type == 6 || type == 7 || type == 11 || type == 16;
+    result.text_only = type == th2::shake_txt_sin
+        || type == th2::shake_txt_2ti || type == th2::shake_txt_rand;
+    result.includes_text = type == th2::shake_all_sin
+        || type == th2::shake_all_2ti || type == th2::shake_all_rand
+        || type == th2::shake_all_sin_set;
     return result;
 }
 

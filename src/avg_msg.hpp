@@ -165,6 +165,68 @@ public:
     const NovelMessageState& state() const { return message_; }
     NovelMessageState& state() { return message_; }
     const HalfToneState& half_tone() const { return half_tone_; }
+    HalfToneState& half_tone() { return half_tone_; }
+    // Restoring a trace checkpoint.  The machine's state is not only
+    // NovelMessage: ts->cnt for TXT_WINDOW says how much of the text is
+    // uncovered, and -1 means all of it.  Restoring the message without it
+    // left count at 205 of 213 beside a slot showing nothing, and the machine
+    // resolved that by abandoning the message and starting the next one.
+    void restore_text_slot(int cnt, int step)
+    {
+        text_cnt_ = cnt;
+        text_step_ = step;
+    }
+    // Restoring the source is not enough: counted_ is derived from it
+    // (txt_count_text) and holds the per-glyph tables the typewriter draws
+    // from, so without recomputing it a resumed run has the counters but no
+    // glyphs - the state trace showed "-" where a straight-through run had a
+    // full line, and the first click after the resume then advanced a
+    // message that had nothing in it.
+    void restore_raw(std::string raw);
+    // ts->cnt and ts->step for TXT_WINDOW; see text_cnt_.
+    int text_cnt() const { return text_cnt_; }
+    int text_step() const { return text_step_; }
+
+    // The rest of the machine's own state.  NovelMessage's eight fields are
+    // not all of it: these decide what happens when a message finishes, and
+    // a checkpoint that leaves them behind resumes into the wrong arm.
+    // end_key_wait_ is the one that was measured - resuming mid-message at
+    // pc 22370 of 040425000.sdt, ours took the no-keywait arm and retired
+    // the instruction on the frame the text completed, where a run that had
+    // been there all along waited for the reader.
+    struct ResumeState {
+        int vanilla_layout = 0;
+        int end_key_wait = 0;
+        int auto_count = 0;
+        int key_wait_count = 0;
+        int key_wait_count2 = 0;
+        int wstep = 0;
+        int demo_cnt = 0;
+    };
+    ResumeState resume_state() const
+    {
+        return {vanilla_layout_ ? 1 : 0, end_key_wait_ ? 1 : 0, auto_count_,
+                key_wait_count_, key_wait_count2_, wstep_, demo_cnt_};
+    }
+    void restore_resume_state(const ResumeState& state)
+    {
+        vanilla_layout_ = state.vanilla_layout != 0;
+        end_key_wait_ = state.end_key_wait != 0;
+        auto_count_ = state.auto_count;
+        key_wait_count_ = state.key_wait_count;
+        key_wait_count2_ = state.key_wait_count2;
+        wstep_ = state.wstep;
+        demo_cnt_ = state.demo_cnt;
+    }
+    // The accumulated message source, tags and all.
+    const std::string& raw() const { return raw_; }
+    // The engine's own layout of the message, in the message window's box.
+    // Used for drawing and for the overflow clip when the original bitmap
+    // font is selected; ignored otherwise, where our own wrapping and the
+    // scrolling window take over.
+    const TextCount& layout() const { return layout_; }
+    void set_vanilla_layout(bool on) { vanilla_layout_ = on; }
+    bool vanilla_layout() const { return vanilla_layout_; }
 
     // What the renderer needs to draw the typewriter.
     const TextCount& counted() const { return counted_; }
@@ -183,9 +245,20 @@ private:
     BackStruct* back_;
     Hooks hooks_;
     NovelMessageState message_{};
+    // TEXT_STRUCT's own cnt and step for TXT_WINDOW, which the engine keeps
+    // *separately* from NovelMessage.count and .kstep and writes through
+    // DSP_SetTextCount / DSP_SetTextStep.  They are not the same thing and
+    // collapsing them was wrong twice over: -1 in either is a distinct
+    // state, meaning "draw the lot" and "no \k stop", and the engine parks
+    // them there at every wait while the NovelMessage fields carry on
+    // holding live values.
+    int text_cnt_ = 0;
+    int text_step_ = 0;
     HalfToneState half_tone_{};
     TextCount counted_{};
     std::string raw_;
+    TextCount layout_{};
+    bool vanilla_layout_ = false;
     bool end_key_wait_ = false;
     int auto_count_ = 0;
     // The two statics inside AVG_ControlNovelMessage.

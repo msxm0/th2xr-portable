@@ -63,20 +63,22 @@ enum {
     bak_ptf_rev_h = 0x1000,
 };
 
-// SHAKE_ types, from the top of AVG_SetShake's neighbourhood.
+// SHAKE_ types, the #defines above AVG_SetShake in GM_AvgBack.cpp.  The
+// numbering has gaps - 5 and 8 are unused, and the random ones are 9 to 11,
+// not the 2/5/8 their position after SIN and 2TI suggests.  That guess is
+// what this table used to hold, which ran SHAKE_ZOOM as a random shake and
+// never ran the real random shakes at all.
 enum {
     shake_sin = 0,
     shake_2ti = 1,
-    shake_rand = 2,
+    shake_zoom = 2,
     shake_txt_sin = 3,
     shake_txt_2ti = 4,
-    shake_txt_rand = 5,
     shake_all_sin = 6,
     shake_all_2ti = 7,
-    shake_all_rand = 8,
-    shake_ct_sin = 9,
-    shake_ct_2ti = 10,
-    shake_all_rand2 = 11,
+    shake_rand = 9,
+    shake_txt_rand = 10,
+    shake_all_rand = 11,
     shake_roll = 12,
     shake_roll_sin = 13,
     shake_roll_2ti = 14,
@@ -94,7 +96,10 @@ enum { tone_normal = 0, tone_evening = 1, tone_night = 2, tone_nt_room = 3 };
 struct BackStruct {
     int flag = 0;
 
-    int bno = -1;
+    // BACK_STRUCT is a zero-initialised global in the original, so every
+    // field starts at 0 - including this one.  Nothing here reads bno as a
+    // "no background" sentinel; that question is has_background().
+    int bno = 0;
 
     int x = 0, y = 0;
     int x2 = 0, y2 = 0;
@@ -154,9 +159,11 @@ struct BackStruct {
     int sk_type = 0;
     int sk_speed = 0;
     int sk_swing = 256;
-    // Not in BACK_STRUCT: the random shake re-rolls its direction once per
-    // frame inside AVG_ControlShake, which a sampler called from the draw
-    // cannot do without repeating itself.  This is how far it has rolled.
+    // Unused now - AVG_ControlShake rolls the random shake's direction itself
+    // (see AvgBack::ShakeOut).  Kept because harness checkpoints write this
+    // struct as raw bytes (Game::trace_checkpoint_resume), and dropping a
+    // field shifts every one after it: removing it once made every saved
+    // checkpoint resume with the message and the background scrambled.
     int sk_cnt2 = 0;
 
     int tone_no2 = 0;
@@ -276,6 +283,19 @@ public:
 
     int shake_text_dx() const { return shake_text_dx_; }
     int shake_text_dy() const { return shake_text_dy_; }
+    // What AVG_ControlShake worked out this frame, in its own integer
+    // arithmetic, for the draw to apply.  Deriving these a second time in
+    // floating point at draw time is not the same number: the engine
+    // truncates after each step (COS*pich/512/8, then the taper), and one
+    // truncation at the end lands elsewhere - on a rolling shake a whole
+    // 1/256 of a turn elsewhere, which is every pixel of the frame.
+    struct ShakeOut {
+        int x = 0;
+        int y = 0;
+        int roll = -1;   // DSP_SetGraphRoll's rate, or -1 for no roll
+        int zoom = -1;   // DSP_SetGraphZoom2's 256ths, or -1 for no zoom
+    };
+    const ShakeOut& shake_out() const { return shake_out_; }
 
 private:
     Display& display_;
@@ -287,6 +307,7 @@ private:
     // offset, which the renderer adds to the message position.
     int shake_text_dx_ = 0;
     int shake_text_dy_ = 0;
+    ShakeOut shake_out_;
 
     int eff_cnt(int n) const { return hooks_.eff_cnt ? hooks_.eff_cnt(n) : n; }
     int eff_cnt4(int n) const { return hooks_.eff_cnt4 ? hooks_.eff_cnt4(n) : n; }

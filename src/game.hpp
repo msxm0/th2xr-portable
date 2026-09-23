@@ -1,5 +1,6 @@
 #pragma once
 #include "archive.hpp"
+#include "text_count.hpp"
 #include "audio.hpp"
 #include "character.hpp"
 #include "config.hpp"
@@ -10,6 +11,7 @@
 #include "texture.hpp"
 #include "dsp.hpp"
 #include "avg_back.hpp"
+#include "trace.hpp"
 #include "avg_msg.hpp"
 #include "avg_char.hpp"
 #include "gl_transition.hpp"
@@ -31,6 +33,7 @@
 #include <deque>
 #include <unordered_map>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -67,6 +70,18 @@ enum class WaitKind {
     voice,          // AVG_WaitVoice( EscParam[0].num )
     movie,          // !AVG_WaitMovie()
     select,         // AVG_WaitSelect() != -1
+    wait_frame,     // AVG_WaitFrame()
+    clock,          // AVG_ViewClock() / AVG_SetCalender()
+    title,          // AVG_SetGotoTitle's fade, then the release frame
+};
+
+// WAIT_STRUCT, the counter behind AVG_SetWaitFrame / AVG_WaitFrame.  A frame
+// count, not a duration: the original never looks at a clock for this.
+struct WaitFrameState {
+    int flag = 0;
+    int type = 0;
+    int count = 0;
+    int max = 0;
 };
 
 // Set by --cpu-transitions.  Forces the CPU blend even where the shader
@@ -77,8 +92,13 @@ extern bool trace_prefetch;
 
 std::filesystem::path writable_directory();
 std::filesystem::path profile_directory();
+// `may_prompt` is false for a run with no one in front of it - a trace, a
+// soak - where the file picker is not a fallback but a hang: the dialog is
+// modal, nothing answers it, and a sweep that takes an hour sits on it until
+// someone notices.  Such a run fails with the path it looked in instead.
 std::optional<std::filesystem::path> discover_game_data_path(
-    const std::filesystem::path& default_path, bool explicit_path);
+    const std::filesystem::path& default_path, bool explicit_path,
+    bool may_prompt = true);
 std::pair<float, float> logical_coordinates(
     float x, float y, int window_width, int window_height);
 void convert_event_to_logical_coordinates(
@@ -144,6 +164,7 @@ private:
     static constexpr std::uint32_t first_backlog_voice_save_version_ = 25;
     static constexpr std::uint32_t oldest_supported_save_version_ = 26;
     static bool is_confirm_key(SDL_Keycode key);
+    static int choice_number_key(SDL_Keycode key);
     static bool is_alt_enter(const SDL_KeyboardEvent& key);
     enum class AudioWaitKind {
         bgm,
@@ -154,6 +175,38 @@ private:
         AudioWaitKind kind;
         std::size_t channel;
     };
+    // The tick a trace run's audio wait began on, or 0 for none.  A real
+    // channel stops when the samples run out, which is a wall clock: the
+    // same SEW would cost a different number of ticks on a fast machine
+    // than on a slow one.  The reference has exactly the same problem and
+    // solves it the same way - see th2ref_pcm_play - so both sides agree
+    // that a sound lasts trace_sound_ticks and nothing looks at a clock.
+    static constexpr std::uint64_t trace_sound_ticks = 50;
+    // Keyed the same way AudioWait::channel is, and stamped when the sound
+    // *starts* rather than when something waits for it.  That distinction is
+    // the whole point: a script plays an effect with SEP and waits for it
+    // several opcodes later with SEW, by which time most of its length has
+    // already gone by.  Timing the wait from the SEW instead made ours hold
+    // for the full fifty ticks where the reference held for fourteen.
+    std::unordered_map<std::size_t, std::uint64_t> trace_sound_started_;
+    void note_sound_started(std::size_t channel);
+    // Audio as events.  The reference decodes nothing, so there is no
+    // waveform to compare against - what is comparable is which sound it
+    // asked for, on which channel, on which tick.  Argument order matches
+    // the reference's AVG_Play* probes so the two logs diff directly.
+    void trace_note_audio(const char* kind, int a, int b, int c, int d,
+                          const char* name = nullptr);
+    // Is a traced effect still running on this channel?  AVG_WaitSe reads
+    // SeStruct[sno], which on the other side is fed by the stub in
+    // reference/shim - a tick count, not a decoder.  Asking our real decoder
+    // whether it is playing is a different question with a different answer.
+    bool trace_se_playing(std::size_t channel) const;
+    // A traced movie, which is not decoded on either side.  See
+    // Game::start_movie for why, and for what TH2_MOVIE_TICKS does and does
+    // not change.
+    bool trace_movie_live_ = false;
+    std::uint64_t trace_movie_started_ = 0;
+    static std::uint64_t trace_movie_ticks();
     struct CharacterTexture {
         int pose = -1;
         Texture texture;
@@ -300,17 +353,36 @@ private:
         int frame;
         int ticks;
     };
+    // One SPRITE_OPR: code (0 NULL, 1 DRAW, 2 LOOP, 3 REPEAT), data1..3.
+    struct SpriteOperation {
+        int code = 0;
+        int data1 = 0;
+        int data2 = 0;
+        int data3 = 0;
+    };
     struct MapCharacter {
         Texture texture;
         std::vector<std::vector<MapSpritePart>> frames;
         std::vector<MapSpriteStep> steps;
+        // Sprite 0's program, NULL-terminated, and ANIME_STRUCT.frame.
+        std::vector<SpriteOperation> program;
+        int rate = 60;
     };
+    // The chip SPR_RenewSprite has sprite 0 of `animation` on after
+    // `renews` calls, from SPR_SetSprite's fresh ANIME_CONTROL.
+    static int sprite_frame_after(const MapCharacter& animation, int renews);
+    // A frame count, not a duration.  AVG_ViewClock counts its own frames -
+    // sixteen fading in, one per six minutes of travel, sixteen fading out -
+    // and never asks what time it is.  Deriving the frame from engine_now()
+    // instead put it 4% slow, because that clock steps in integer 1000/60 ms,
+    // so sixty of its milliseconds-worth is 0.96 frames: the clock at pc 3748
+    // of 010301110.sdt held the script 71 frames where the engine holds it 66.
     struct ClockState {
         int target = 0;
         int start_minutes = 0;
         int target_minutes = 0;
         int travel_frames = 0;
-        std::chrono::steady_clock::time_point started;
+        int frame = 0;
     };
     struct CalendarState {
         int month = 0;
@@ -318,7 +390,7 @@ private:
         int weekday = 0;
         int holiday = -1;
         bool dismissing = false;
-        std::chrono::steady_clock::time_point started;
+        int frame = 0;
     };
     struct SakuraPetal {
         bool active = false;
@@ -338,7 +410,6 @@ private:
         int tick = 0;
         int reset_frames = -1;
         bool no_reset = false;
-        std::chrono::steady_clock::time_point updated;
     };
     static constexpr std::array<MapPosition, 22> map_positions_{{
         {0, 280, 340, 0}, {2, 488, 210, 1}, {2, 326, 356, 2},
@@ -390,7 +461,12 @@ private:
     // three belong to the display layer now - the game asks it for them.
     bool has_background() const;
     void load_background_bitmap(Texture texture);
+    // BackStruct.bno under another name.  AVG_SetBack stores the scene
+    // number in the struct and AVG_ResetBackHalfTone's early-out compares
+    // against it, so the two must not drift; set_bg_scene() is the only
+    // place either is written.
     int bg_scene_ = -1;
+    void set_bg_scene(int scene);
     BackgroundKind background_kind_ = BackgroundKind::background;
     BackgroundView background_view_;
     std::optional<BackgroundScroll> background_scroll_;
@@ -555,6 +631,8 @@ private:
     int skipped_day_ = 0;
     Texture sakura_large_;
     Texture sakura_small_;
+    SDL_Point sakura_large_pos_{};
+    SDL_Point sakura_small_pos_{};
     std::optional<SakuraState> sakura_;
     std::uint32_t sakura_random_ = 0x13579bdfu;
     Surface title_foreground_pixels_;
@@ -769,8 +847,23 @@ private:
     };
     bool choosing_ = false;
     std::vector<Choice> choices_;
-    std::optional<std::chrono::steady_clock::time_point>
-        choice_reveal_started_;
+    // SelectWindow.cnt.  A count of characters, stepped once per control
+    // pass by AVG_MsgCnt() - not a span of milliseconds.  It used to be a
+    // timestamp that choice_reveal_count divided into engine_now(), which
+    // at text_speed_ms=20 advanced 16/20 of a character a tick where the
+    // engine advanced a whole one, so every choice took a quarter longer to
+    // become answerable than the reference's did.
+    int choice_reveal_cnt_ = 0;
+    // The glyph string as it stood when the frame was DRAWN, kept only for
+    // the frame a choice is answered on.  The reference records glyph alpha
+    // from inside TXT_DrawTextEx - what actually went to the screen - while
+    // ours recomputes it at dump time, after the control pass.  Normally
+    // those agree; on the frame AVG_ControlSelectWindow answers a choice it
+    // sets NovelMessage.disp to 0 *after* the draw, so the reference reports
+    // disp 0 with the glyphs still on screen and ours reported no glyphs at
+    // all.  The draw really did happen on both sides - only the dump differed.
+    std::string trace_glyph_drawn_;
+    bool trace_choice_answered_ = false;
     int choice_highlight_ = 0;
     int choice_selected_ = -1;
     int choice_result_register_ = -1;
@@ -899,6 +992,16 @@ private:
     std::string name_error_;
     std::string load_error_;
     th2::PlayerName default_player_name_;
+    // long DefaultCharName = 1, mirrored into ESC_FlagBuf[_DEFAULT_NAME]
+    // (flag 5).  The engine does not work this out by comparing names: it
+    // starts at 1, the name dialog writes it when the player presses OK, and
+    // a load takes it back out of flag 5.  Deriving it instead from
+    // player_name_ == default_player_name_ broke on the English patch, where
+    // load_default_player_name reads romanised names out of the executable
+    // while a loaded save still holds the Japanese ones - so every line that
+    // names a character took the "this guy" branch the reference never took.
+    // Found at pc 564 of 070000501.sdt, a GetFlag 5 feeding an IfV.
+    int default_char_name_ = 1;
     th2::PlayerName player_name_;
     std::array<char, 64> name_family_{};
     std::array<char, 64> name_given_{};
@@ -917,6 +1020,14 @@ private:
     // Which of those phases handle() is being called for.
     int opcode_phase_ = 1;
     bool demo_mode_ = false;
+    // AVG_SetGotoTitle stopped the script (MAIN_SetScriptFlag(OFF)) and left
+    // the fade to run; the title itself comes once that fade is done.  Ours
+    // used to switch straight to the title and walk on to End, so the route
+    // ended thirty frames early and never went back to the title at all.
+    bool goto_title_pending_ = false;
+    // The frame between the title fade ending and the script being let go.
+    // Release is its own frame here as it is for the map and the calendar.
+    bool goto_title_released_ = false;
     bool replay_mode_ = false;
     int demo_delay_frames_ = 0;
     std::vector<MapEvent> map_events_;
@@ -924,8 +1035,75 @@ private:
     int map_previous_field_ = 1;
     int map_hover_ = -1;
     int map_slide_ticks_ = 0;
+    // AVG_ControlMapEvent's select_back (a function static, so it outlives
+    // each map) and the pointer it reads select from every frame.
+    int map_select_back_ = 0;
+    // The arrow clicked this frame or rolling since (-2 left, -3 right).
+    int map_arrow_pressed_ = 0;
+    // The frame's text-shake offset, re-applied after each target change.
+    SDL_Point text_shake_{};
+    // MouseCheck[10][0..15].flag: every destination's rect is switched on
+    // when the map is set up, and step 3 narrows them to the page shown -
+    // after it has read select for the frame.
+    std::array<bool, 16> map_rect_on_{};
+    int map_anim_frames_ = 0;
+    // map_anim_frames_ on the frame the characters' sprites were set.
+    int map_sprite_start_ = -1;
+    float map_pointer_x_ = 0.0f;
+    float map_pointer_y_ = 0.0f;
     int map_fade_ticks_ = 0;
     int map_selected_ = -1;
+    // Where the trace script's pointer is, and the map driven from it.  The
+    // map is the one screen a trace cannot answer with a key: it is picked by
+    // the pointer being inside a destination's rect when a click lands, and
+    // our map only ever listened to SDL events, which a trace does not
+    // produce.
+    // AVG_ControlMapEvent's step 2: the map fades in over sixteen frames
+    // before it will take input.  Ours drew a fade off steady_clock and
+    // gated nothing, so the screen was answerable on its first frame.
+    // No script running, as opposed to one parked at its last offset.  The
+    // engine's state dump is
+    //     const DWORD pc = EXEC_LangInfo ? EXEC_LangInfo->pc : 0;
+    // so a zero there means there is no script at all - which is what a
+    // finished script waiting on the map screen is.  Ours kept the VM on the
+    // ended script's last offset and reported that, so every tick of a map
+    // read as a divergence.
+    // The map's step 5: releasing the map and loading what was chosen is its
+    // own frame, after the sixteen the fade takes.  Ours did both on the
+    // fade's last frame and so left the screen early.
+    bool map_finish_pending_ = false;
+    // AVG_SetCalender's step 4: releasing the page is its own frame, after
+    // the sixteen step 3 spends fading it out.  Same shape as the map's
+    // step 5 - the engine consistently separates "the animation ended" from
+    // "the script may move on".
+    bool calendar_finish_pending_ = false;
+    // A frame wait, counted in frames.  It used to be turned into
+    // milliseconds (wait_value * 1000 / 60) and compared against
+    // engine_now(), which itself steps by 1000/60 == 16 integer-divided
+    // milliseconds a tick - so a twelve frame wait needed 200ms against
+    // 16ms ticks and took thirteen.  Every WaitFrame in the game was one
+    // tick long, which is what held pc 148 of 070000200.sdt a tick past the
+    // engine.  The sixth wall-clock bug of its kind here: audio fades, the
+    // choice reveal, the clock, the map's animations, its entry fade, this.
+    int wake_frames_ = 0;
+    // Sound start ticks read out of a checkpoint, held until trace_tick_ has
+    // been restored: they are stored as ages, so they mean nothing until the
+    // tick they are relative to is back.
+    std::vector<std::pair<int, int>> pending_sound_ages_;
+    bool script_ended_ = false;
+    int map_enter_ticks_ = 0;
+    // True on the frame the entry fade spent its last tick.  The map ignores
+    // input while it is fading in, and the frame that finishes the fade is
+    // one of those frames - the counter is already zero by the time the
+    // input gate reads it, so without this the gate opens a frame early.
+    // Same mistake as the calendar's dismiss check, and it costs the same:
+    // a click landing on that frame is one the reference cannot see, and
+    // with input arriving every thirty ticks that is thirty ticks of drift,
+    // measured at the April 20th map where ours picked at tick 610320.
+    bool map_enter_finished_this_frame_ = false;
+    int trace_mouse_x_ = 0;
+    int trace_mouse_y_ = 0;
+    void trace_drive_map(bool pick);
     std::chrono::steady_clock::time_point map_tick_{};
     std::chrono::steady_clock::time_point map_started_{};
     std::optional<th2::ReadMarker> current_read_marker() const;
@@ -948,11 +1126,18 @@ private:
     };
     int weekday(int month, int day) const;
     int calendar_holiday(int month, int day) const;
-    void begin_clock(int requested);
+    void begin_clock(int requested, int first_frame = 1);
     void begin_calendar(int month, int day);
     void update_clock_calendar();
+    static int sprite_blend_mode(SDL_Texture* texture);
     void draw_sprite_frame(
-        const MapCharacter& animation, int frame, float x, float y);
+        const MapCharacter& animation, int frame, float x, float y,
+        int level = 256);
+    // `mode` -1 picks from the texture (3 for a premultiplied 32 bit
+    // bitmap, else 0); `bright` is a BrightTable level, 128 neutral.
+    void draw_engine_blit(SDL_Texture* texture, const SDL_FRect& source,
+                          const SDL_FRect& destination, int level,
+                          int mode = -1, int bright = 128);
     void draw_clock_calendar();
     Texture load_sakura_texture(std::string_view name);
     void start_sakura(int amount, bool no_reset);
@@ -961,7 +1146,7 @@ private:
     void update_background_sakura(int scene, bool background);
     std::uint32_t next_sakura_random();
     void spawn_sakura_petals();
-    void update_sakura();
+    void update_sakura(int steps);
     void draw_sakura();
     std::string map_field_name(int field) const;
     void begin_map();
@@ -982,6 +1167,10 @@ private:
     std::array<SaveMetadata, 10> visible_saves_{};
     float choice_y_start() const;
     float choice_height(const Choice& choice) const;
+    std::string choice_engine_text(int index) const;
+    th2::TextCount choice_layout(int index) const;
+    float choice_row_height(int index) const;
+    float choice_row_y(int index) const;
     std::vector<std::string> choice_lines(
         const Choice& choice, int index) const;
     float message_text_width() const;
@@ -998,7 +1187,12 @@ private:
     // How many frames of setting-up it does before it starts asking.
     static int opcode_phases(std::string_view name);
     // The predicate itself: true while the instruction must stay put.
-    bool opcode_waiting(WaitKind kind, const th2::Event& event) const;
+    // Not const: AVG_WaitFrame() counts a frame every time it is asked,
+    // which is the whole of how it measures one.
+    bool opcode_waiting(WaitKind kind, const th2::Event& event);
+    // BOOL AVG_WaitFrame( void ).  True on the frame the wait retires.
+    bool avg_wait_frame();
+    WaitFrameState wait_frame_{};
     int effect_frames(int frames) const;
     // AVG_EffCnt3: 30fps units, and the one that ignores the skip key.
     int effect_frames3(int frames) const;
@@ -1007,6 +1201,83 @@ private:
     // sixtieth in the AVG_Control* pass, like everything else.
     int global_count_ = 0;
     int control_steps_ = 0;
+    // --trace: the engine as a pure function of a tick counter and a script.
+    // Nothing may read a clock, exactly one control tick happens per frame,
+    // and the 800x600 art layer is written out for comparison against the
+    // reference build's dump of the same tick.
+    bool trace_mode_ = false;
+    std::filesystem::path trace_dir_;
+    TraceScript trace_script_;
+    std::uint64_t trace_tick_ = 0;
+    std::uint64_t trace_last_tick_ = 0;
+    // Frames before this tick are computed but not written.  A frame is
+    // 1.37MB and the replay to a divergence deep in a scenario is thousands
+    // of ticks, so dumping the whole run to look at thirty of its frames is
+    // most of the cost of a fix-and-retest cycle.  The state trace is not
+    // windowed: it is one short line per tick and it is what the alignment
+    // is read off.
+    std::uint64_t trace_first_tick_ = 0;
+    // --trace-hold: stop dead on this tick for a few seconds, so the window
+    // can be photographed at a known point in the run.  A trace otherwise
+    // goes past in a second and there is nothing to look at.
+    std::uint64_t trace_hold_tick_ = 0;
+    int trace_hold_seconds_ = 0;
+    // Checkpoints, so a comparison window deep in the game does not cost a
+    // replay of everything before it.  A segment saves at one tick and the
+    // next segment resumes from that file, which makes a sweep linear in the
+    // length of the game instead of quadratic in the number of windows.
+    //
+    // The resume waits for the lead-in to put the engine in the scenario,
+    // exactly as the reference's does, and then moves the trace clock to the
+    // tick the save was taken at - the scripted input and the dump window
+    // are keyed to absolute ticks, so a resumed run has to answer to the
+    // same numbers as the straight-through run it stands in for.
+    std::filesystem::path trace_save_file_;
+    std::uint64_t trace_save_tick_ = 0;
+    std::filesystem::path trace_resume_file_;
+    std::uint64_t trace_resume_trigger_ = 0;
+    bool trace_resume_pending_ = false;
+    void trace_checkpoint_save();
+    void trace_checkpoint_resume();
+    void trace_apply_input();
+    void trace_dump_state();
+    std::string trace_glyph_alpha() const;
+public:
+    // The clock the script machinery waits on.  Real time normally; in a
+    // trace run, tick * (1000/60) from the epoch - the same integer step the
+    // reference's th2ref_time() hands the engine, so a wait of N
+    // milliseconds costs both sides the same whole number of ticks.
+    //
+    // This exists because a trace tick is a unit of engine progress rather
+    // than of time.  With a real clock the run was only accidentally
+    // deterministic: it worked while the loop happened to be paced at sixty
+    // ticks a second, and the moment that sleep came out, a WaitFrame 90 sat
+    // there for fifteen times as many ticks.
+    std::chrono::steady_clock::time_point engine_now() const;
+    void set_trace_hold(std::uint64_t tick, int seconds);
+    // Write a checkpoint at the end of `tick`, and resume from `file` once
+    // the lead-in has reached `trigger`.  Either may be left unset.
+    void set_trace_checkpoint(const std::filesystem::path& save_file,
+                              std::uint64_t save_tick,
+                              const std::filesystem::path& resume_file,
+                              std::uint64_t resume_trigger);
+private:
+    std::FILE* trace_state_ = nullptr;
+public:
+    // Called before run() when --trace is given.  Throws if the script
+    // cannot be read or names a key the reference does not know.
+    // `lead` is how many ticks the reference spends before the point our
+    // trace starts at.  Free-running counters - GlobalCount above all, which
+    // drives the click indicator's thirty frame spin - count from process
+    // start, not from the scenario's, so without it the two runs are in
+    // phase on everything the script drives and out of phase on everything
+    // it does not.
+    void enable_trace(const std::filesystem::path& dir,
+                      const std::optional<std::filesystem::path>& input,
+                      std::uint64_t ticks, std::uint64_t first = 0,
+                      std::uint64_t lead = 0);
+private:
+    void trace_dump_frame();
     // The menu cross-fades use begin_transition's machinery but are not
     // AVG_SetBack, so they keep their own clock rather than BackStruct's.
     int menu_transition_frames_ = 0;
@@ -1026,6 +1297,12 @@ private:
         std::string_view text, std::size_t characters);
     static std::size_t utf8_character_count(std::string_view text);
     int choice_reveal_count(int index) const;
+    bool choice_reveal_finished() const;
+    // The single point at which a choice is committed.  AVG_ControlSelectWindow
+    // has exactly one - `if( click && select>=0 )` - and it blanks the message
+    // there; ours had four, none of which did.
+    void answer_choice(int select);
+    void control_select_window();
     void start_text_reveal(std::size_t start);
     bool finish_text_reveal();
     void skip(bool force_unread = false);
@@ -1055,7 +1332,9 @@ private:
         EffectTiming timing = EffectTiming::script);
     void update_transition();
     void draw_pattern_transition(float progress);
-    bool draw_pattern_transition_gpu(float progress);
+    // AVG_ControlBackChange's integer rate, 0..256.
+    void draw_pattern_transition_rate(int rate);
+    bool draw_pattern_transition_gpu(int rate);
     void ensure_transition_target();
     void draw_pixel_transition(float progress);
     void draw_geometric_transition(float progress);
@@ -1098,10 +1377,22 @@ private:
     void play_se(int channel, int sound, bool loop, int volume, int fade = 0,
                  bool wait_for_completion = false);
     void sync_game_flags();
-    void play_bgm(int music, bool loop, int volume);
+    // void AVG_PlayBGM( int mus_no, int fade, int loop, int vol, int change )
+    // and int AVG_StopBGM( int fade ).  Every way the music starts or stops
+    // goes through these two in the engine, which is also where the
+    // reference's trace probe sits - so a caller that reaches the mixer some
+    // other way is invisible to the comparison even when it behaves
+    // correctly.  AVG_SetMovie was exactly that: it stops the music, ours
+    // stopped it too, and the audio trace still showed the reference alone.
+    void play_bgm(int music, bool loop, int volume, int fade = 0,
+                  bool change = false);
+    void stop_all_se(int fade);
+    void stop_bgm(int fade);
+    bool movie_bgm_stop_pending_ = false;
     void play_voice(const th2::Event& event);
     void replay_backlog_voice(const BacklogVoice& voice);
     void update_audio();
+    void refresh_audio_wait(bool before_script);
     void set_background(const th2::Event& event, bool keep_characters);
     void set_cg(
         const th2::Event& event, BackgroundKind kind, char prefix);
@@ -1133,6 +1424,7 @@ private:
     std::filesystem::path thumbnail_path(int slot) const;
     std::filesystem::path metadata_path(int slot) const;
     std::filesystem::path anime4k_shader_dir() const;
+    std::filesystem::path blend_shader_dir() const;
     void save_preview(int slot);
     SaveMetadata read_save_metadata(int slot) const;
     void perform_autosave();
@@ -1150,6 +1442,7 @@ private:
     std::string read_str(std::istream& in, std::size_t size) const;
     // --- UI Methods ---
     void push_backlog();
+    int novel_log_depth() const;
     void open_system_menu();
     void reset_play_state();
     void initialize_scenario_flags();
@@ -1295,9 +1588,7 @@ private:
         std::uint8_t blue = 255);
     void draw_save_digit_number(float x, float y, int number, int digits);
     void draw_system_menu();
-    void draw_map_layer(
-        int field, float x, float alpha,
-        bool draw_field, bool draw_events);
+    int map_marker_level(int field) const;
     void draw_map(bool ui);
     bool title_extras_available() const;
     bool title_item_disabled(int item) const;
@@ -1402,6 +1693,7 @@ private:
     void handle_system_menu_input(const SDL_Event& event);
     void change_map_field(int direction);
     void update_map_hover(float x, float y);
+    bool map_hover_on_page() const;
     void handle_map_input(const SDL_Event& event);
     void update_map();
     void draw_backlog();
@@ -1418,6 +1710,11 @@ private:
     void finish_sidebar_drag();
     void handle_backlog_input(const SDL_Event& event);
     void draw_click_indicator();
+    // GRP_KEYWAIT's sprite frame; see the definition.
+    bool draw_keywait_sprite(
+        SDL_Texture* texture, const SDL_FRect& source,
+        const SDL_FRect& destination);
+    int keywait_frame() const;
     std::size_t message_visible_lines() const;
     int message_scroll_limit(std::size_t total_lines) const;
     void draw_scrollbar(
@@ -1450,6 +1747,7 @@ private:
     void clear_sidebar();
     void clear_authentic_text();
     void begin_authentic_text();
+    void apply_text_shake();
     float imgui_display_scale() const;
     void present_frame();
     void reset_render_state();
