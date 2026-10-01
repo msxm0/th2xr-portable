@@ -60,6 +60,32 @@ inline constexpr const char* bmp_pos_y_property = "th2.bmp_pos_y";
 inline constexpr const char* bmp_alpha_plane_property = "th2.bmp_alpha_plane";
 void fold_source_alpha(SDL_Surface* surface);
 bool texture_source_folded(SDL_Texture* texture);
+// A render target that is composited over the picture rather than being
+// the picture: the text, overlay and side bar layers.  It is cleared to
+// transparent and composited premultiplied, because SDL's BLEND into a
+// cleared target stores colour times alpha - composited as straight alpha
+// that multiplies by alpha a second time, and every soft edge came out dark.
+// GlExactBlend reads this to write a premultiplied alpha instead of an
+// opaque one.
+inline constexpr const char* premultiplied_layer_property =
+    "th2.premultiplied_layer";
+// Inline, so the upscalers' standalone test builds need nothing else.
+inline void make_premultiplied_layer(SDL_Texture* texture)
+{
+    if (!texture) {
+        return;
+    }
+    SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND_PREMULTIPLIED);
+    SDL_SetBooleanProperty(
+        SDL_GetTextureProperties(texture), premultiplied_layer_property, true);
+}
+inline bool texture_is_premultiplied_layer(SDL_Texture* texture)
+{
+    return texture
+        && SDL_GetBooleanProperty(
+            SDL_GetTextureProperties(texture), premultiplied_layer_property,
+            false);
+}
 
 SDL_Surface* load_image(
     std::span<const std::uint8_t> bytes, std::string_view name);

@@ -14,6 +14,31 @@
 #include <mutex>
 #include <stdexcept>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <emscripten/html5.h>
+
+#include <cmath>
+#include <ctime>
+
+// The clock, read without a BigInt.  Emscripten's clock_gettime goes through
+// the WASI clock_time_get import, which hands the time back as a BigInt
+// written into the heap - an allocation on every std::chrono::steady_clock
+// reading, of which a frame makes dozens.  This is the same arithmetic on the
+// same sources (Date.now for the wall clock, performance.now otherwise),
+// rounded to the nanosecond as the import rounds it.  A strong definition
+// here takes the place of libc's weak alias.
+extern "C" int clock_gettime(clockid_t clock, struct timespec* time)
+{
+    const double now = clock == CLOCK_REALTIME ? emscripten_date_now()
+                                               : emscripten_get_now();
+    const auto nanoseconds = static_cast<long long>(std::llround(now * 1e6));
+    time->tv_sec = static_cast<time_t>(nanoseconds / 1000000000LL);
+    time->tv_nsec = static_cast<long>(nanoseconds % 1000000000LL);
+    return 0;
+}
+#endif
+
 namespace th2app {
 
 
@@ -21,18 +46,34 @@ namespace th2app {
 // working directory is not writable, so use the app-internal storage path.
 // On desktop platforms use the system-preferred user data directory so the
 // game works regardless of where the binary is launched from.
+namespace {
+
+// SDL_GetPrefPath creates the directory every time it is asked, and a save
+// asks for a path per file per slot - an autosave was a hundred mkdir calls,
+// each one an exception object on the web's filesystem.  The answer does not
+// change while the game runs.
+std::filesystem::path pref_path()
+{
+    static const std::filesystem::path path = [] {
+        char* raw = SDL_GetPrefPath("ripdog", "ToHeart2XR");
+        if (!raw) {
+            return std::filesystem::path(".");
+        }
+        std::filesystem::path result(raw);
+        SDL_free(raw);
+        return result;
+    }();
+    return path;
+}
+
+}  // namespace
+
 std::filesystem::path writable_directory()
 {
 #ifdef __ANDROID__
     return std::filesystem::path(SDL_GetAndroidInternalStoragePath());
 #else
-    char* path = SDL_GetPrefPath("ripdog", "ToHeart2XR");
-    if (!path) {
-        return std::filesystem::path(".");
-    }
-    std::filesystem::path result(path);
-    SDL_free(path);
-    return result;
+    return pref_path();
 #endif
 }
 
@@ -46,13 +87,7 @@ std::filesystem::path app_config_directory()
 #ifdef __ANDROID__
     return std::filesystem::path(SDL_GetAndroidInternalStoragePath());
 #else
-    char* path = SDL_GetPrefPath("ripdog", "ToHeart2XR");
-    if (!path) {
-        return std::filesystem::path(".");
-    }
-    std::filesystem::path result(path);
-    SDL_free(path);
-    return result;
+    return pref_path();
 #endif
 }
 
@@ -397,24 +432,61 @@ std::vector<std::string> display_lines(
     std::vector<std::string> lines;
     std::string line;
     bool just_wrapped = false;
+    // The current word's characters: where each starts and ends in `line`.
+    struct Character {
+        std::size_t start;
+        std::size_t end;
+    };
+    std::vector<Character> word;
     for (std::size_t position = 0; position < source.size();) {
         if (source[position] == '\n') {
             if (!line.empty() || !just_wrapped) {
                 lines.push_back(line);
             }
             line.clear();
+            word.clear();
             just_wrapped = false;
             ++position;
             continue;
         }
-        const auto previous_length = line.size();
+        const auto start_length = line.size();
         append_character(line, position);
         just_wrapped = false;
         // A trailing separator is allowed to overhang: the original renderer
         // does not wrap until the next printable glyph is over width.
-        if (line.back() == ' ' || measure(line) <= max_width) {
+        if (line.back() == ' ') {
+            word.clear();
             continue;
         }
+        word.push_back({start_length, line.size()});
+        // Measured where the word ends, not after every character: asking
+        // for the width of a growing line once per character is quadratic
+        // in the line, and Japanese, with no spaces, is one long word.  A
+        // width only grows as characters are added, so the first character
+        // over the edge - the one the per-character check stopped at - is
+        // found by a binary search inside the word that crossed it.
+        const bool word_end = position >= source.size()
+            || source[position] == ' ' || source[position] == '\n';
+        if (!word_end || measure(line) <= max_width) {
+            continue;
+        }
+        std::size_t low = 0;
+        std::size_t high = word.size() - 1;
+        while (low < high) {
+            const std::size_t middle = (low + high) / 2;
+            if (measure(std::string_view(line).substr(0, word[middle].end))
+                > max_width) {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        // Back to just after that character, as if the walk had stopped
+        // there.
+        const auto previous_length = word[low].start;
+        position -= line.size() - word[low].end;
+        line.resize(word[low].end);
+        word.clear();
         if (const auto space = line.find_last_of(' ');
             space != std::string::npos && space > 0) {
             lines.push_back(line.substr(0, space));

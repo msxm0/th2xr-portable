@@ -31,6 +31,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 
 namespace th2 {
 
@@ -134,6 +135,9 @@ struct Graph {
     bool target = false;
 
     std::optional<SDL_Rect> clip;
+
+    // PRM_STR: the characters DrawGraphStr blits out of a 16x4 sheet.
+    std::string str;
 };
 
 // One bitmap slot.  The original's BmpSet entries are raw pixel buffers with
@@ -361,6 +365,9 @@ public:
                    int nuki = check_none);                 // DSP_SetGraph
     void set_graph_prim(int gno, GraphType type, Poly poly,
                         int lno, bool disp);               // DSP_SetGraphPrim
+    // DSP_SetGraphStr: a line of characters from a 16x4 sheet, '!'..'_'.
+    void set_graph_str(int gno, int bno, int lno, bool disp, int nuki,
+                       std::string str);
     void reset_graph(int gno);                             // DSP_ResetGraph
     void reset_graph_all();                                // DSP_ResetGraphAll
 

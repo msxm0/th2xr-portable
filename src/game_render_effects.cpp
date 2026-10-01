@@ -113,9 +113,32 @@ Texture Game::capture_frame_texture()
     if (!SDL_GetTextureSize(source, &width, &height)) {
         throw std::runtime_error(SDL_GetError());
     }
-    Texture copy(SDL_CreateTexture(
-        renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET,
-        static_cast<int>(width), static_cast<int>(height)));
+    // A finished transition's own target if one is spare: creating a target
+    // texture makes SDL's GLES2 renderer check the framebuffer's status, a
+    // round trip to the GPU process in WebGL, once or twice a wipe.
+    Texture copy;
+    for (auto at = spare_frame_targets_.begin();
+         at != spare_frame_targets_.end(); ++at) {
+        float spare_width = 0.0f;
+        float spare_height = 0.0f;
+        SDL_GetTextureSize(at->get(), &spare_width, &spare_height);
+        if (spare_width == width && spare_height == height) {
+            copy = std::move(*at);
+            spare_frame_targets_.erase(at);
+            // As a new one would be: whatever the wipe set is gone.
+            SDL_SetTextureColorMod(copy.get(), 255, 255, 255);
+            SDL_SetTextureAlphaMod(copy.get(), 255);
+            SDL_ScaleMode scale = SDL_SCALEMODE_LINEAR;
+            SDL_GetDefaultTextureScaleMode(renderer_, &scale);
+            SDL_SetTextureScaleMode(copy.get(), scale);
+            break;
+        }
+    }
+    if (!copy) {
+        copy.reset(SDL_CreateTexture(
+            renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET,
+            static_cast<int>(width), static_cast<int>(height)));
+    }
     if (!copy) {
         throw std::runtime_error(SDL_GetError());
     }
@@ -143,6 +166,27 @@ Texture Game::capture_frame_texture()
     }
     SDL_SetTextureBlendMode(copy.get(), SDL_BLENDMODE_BLEND);
     return copy;
+}
+
+void Game::end_transition()
+{
+    if (!transition_) {
+        return;
+    }
+    // Its frame copies go back for the next wipe; see capture_frame_texture.
+    // Only render targets - a CPU wipe's composite is a streaming texture.
+    for (Texture* held : {&transition_->previous, &transition_->composite}) {
+        if (!*held || spare_frame_targets_.size() >= 4) {
+            continue;
+        }
+        const auto access = SDL_GetNumberProperty(
+            SDL_GetTextureProperties(held->get()),
+            SDL_PROP_TEXTURE_ACCESS_NUMBER, -1);
+        if (access == SDL_TEXTUREACCESS_TARGET) {
+            spare_frame_targets_.push_back(std::move(*held));
+        }
+    }
+    transition_.reset();
 }
 
 Texture Game::texture_from_surface(SDL_Surface* surface)
@@ -245,8 +289,11 @@ void Game::prepare_pending_transition_mask()
             pending_transition_masks_.erase(pending_transition_masks_.begin());
             continue;  // Not in this release; nothing to prepare.
         }
-        if (!graphics_.resident(*entry)) {
-            return;  // Still in flight; try again on the next idle scan.
+        // The pre-decoder unpacks the bitmap in budgeted slices (the scan
+        // names it); building the mask from that is one quick pass.  Until
+        // it is there, wait - decoding it here was the 14-24 ms frame.
+        if (!decoded_images_.contains("grp:" + name)) {
+            return;
         }
         pending_transition_masks_.erase(pending_transition_masks_.begin());
         try {
@@ -262,11 +309,25 @@ std::vector<std::uint8_t> Game::load_transition_mask(
     int type, int& width, int& height)
 {
     const auto name = std::format("f0{:03d}.bmp", type & 0x7f);
+    // The pre-decoder's copy if it has one: it unpacks the bitmap a slice a
+    // frame, which is what keeps preparing a wipe off any single frame.  It
+    // is read, not taken - the same bitmap serves every flip and curve of
+    // the pattern.
+    if (Surface* held = decoded_images_.find("grp:" + name);
+        held && *held) {
+        return transition_mask_pixels(held->get(), type, width, height);
+    }
     const auto* entry = graphics_.find(name);
     if (!entry) {
         throw std::runtime_error("transition mask not found: " + name);
     }
     Surface surface(th2::load_image(graphics_.read(*entry), entry->name));
+    return transition_mask_pixels(surface.get(), type, width, height);
+}
+
+std::vector<std::uint8_t> Game::transition_mask_pixels(
+    SDL_Surface* surface, int type, int& width, int& height)
+{
     width = surface->w;
     height = surface->h;
     std::array<std::uint8_t, 256> curve{};
@@ -296,22 +357,48 @@ std::vector<std::uint8_t> Game::load_transition_mask(
         std::copy(bytes.begin(), bytes.end(), curve.begin());
     }
 
+    // One pass over the pixels as stored.  SDL_ReadSurfacePixel per pixel
+    // was the whole cost: 480,000 calls, each resolving the format again,
+    // 14-24 ms on whichever frame prepared the wipe.  The value is the same
+    // blue channel it returned - the palette entry for an 8 bit bitmap, the
+    // converted pixel otherwise.
+    const SDL_Palette* palette = SDL_GetSurfacePalette(surface);
+    const bool indexed =
+        SDL_BITSPERPIXEL(surface->format) == 8 && palette != nullptr;
+    Surface converted;
+    SDL_Surface* source = surface;
+    if (!indexed) {
+        converted.reset(SDL_ConvertSurface(surface, SDL_PIXELFORMAT_RGBA32));
+        if (!converted) {
+            throw std::runtime_error(SDL_GetError());
+        }
+        source = converted.get();
+    }
+    if (!SDL_LockSurface(source)) {
+        throw std::runtime_error(SDL_GetError());
+    }
     std::vector<std::uint8_t> mask(
         static_cast<std::size_t>(width) * height);
     const bool flip_x = type & 0x800;
     const bool flip_y = type & 0x1000;
     for (int y = 0; y < height; ++y) {
+        const auto* row = static_cast<const std::uint8_t*>(source->pixels)
+            + static_cast<std::size_t>(flip_y ? height - y - 1 : y)
+                * source->pitch;
+        auto* out = mask.data() + static_cast<std::size_t>(y) * width;
         for (int x = 0; x < width; ++x) {
-            Uint8 r = 0;
-            Uint8 g = 0;
-            Uint8 b = 0;
-            Uint8 a = 0;
-            SDL_ReadSurfacePixel(
-                surface.get(), flip_x ? width - x - 1 : x,
-                flip_y ? height - y - 1 : y, &r, &g, &b, &a);
-            mask[static_cast<std::size_t>(y) * width + x] = curve[b];
+            const int sx = flip_x ? width - x - 1 : x;
+            std::uint8_t blue = 0;
+            if (indexed) {
+                const int index = row[sx];
+                blue = index < palette->ncolors ? palette->colors[index].b : 0;
+            } else {
+                blue = row[static_cast<std::size_t>(sx) * 4 + 2];
+            }
+            out[x] = curve[blue];
         }
     }
+    SDL_UnlockSurface(source);
     return mask;
 }
 
@@ -372,6 +459,21 @@ void Game::begin_transition(
         transition.mask_width = mask.width;
         transition.mask_height = mask.height;
     }
+    // AVG_SetBack:
+    //     int back_max = AVG_EffCnt(fd_max);
+    //     ...
+    //     if( chg_type!=BAK_DIRECT ){ if(back_max){ ...DSP_GetDispBmp,
+    //         GRP_BACK+1, GRP_BACK up a layer... } fd_flag = 1; ... }
+    // back_max is taken once, here, while AVG_ControlBackChange re-asks it
+    // every frame.  A B that lands on the frame a held skip key comes up
+    // sees Avg.msg_cut still set from the frame before - no snapshot, GRP_BACK
+    // left at LAY_BACK - and then a fade of the full length once the key is
+    // up, compositing over whatever the last frame left.  Measured on
+    // ERRATIC2 at pc 5480 of 010302000.sdt: the reference drew GRP_BACK alone
+    // at DRW_BLD(2, 4, 6, 8...) and never called GetGraph.
+    transition.no_snapshot = timing != EffectTiming::menu
+        && effective_frames == 0;
+    end_transition();   // one still running hands its targets back first
     transition_ = std::move(transition);
     // AVG_SetBack's tail: fd_flag on, fd_cnt zeroed, fd_max left as the raw
     // number the script wrote so AVG_EffCnt can be re-asked every frame.
@@ -390,7 +492,7 @@ void Game::update_transition()
     if (menu_transition_frames_ > 0) {
         if (transition_progress() >= 1.0f) {
             menu_transition_frames_ = 0;
-            transition_.reset();
+            end_transition();
         }
         return;
     }
@@ -399,7 +501,7 @@ void Game::update_transition()
     // Nothing is resumed: the B instruction that started this is still the
     // current instruction and re-asks AVG_WaitBack at the top of the frame.
     if (transition_ && !back().fd_flag) {
-        transition_.reset();
+        end_transition();
     }
 }
 

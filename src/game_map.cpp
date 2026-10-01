@@ -369,6 +369,86 @@ void Game::trace_drive_map(bool pick)
     // that is destination 0 wherever it is, which is why the first frame of
     // step 3 can hover something off the page.
     if (pick) {
+        trace_map_pick_position(trace_mouse_x_, trace_mouse_y_);
+    }
+    // MUS_GetMouseNo reads the cursor wherever the harness left it, so the
+    // pointer follows it on every frame, answered or not.
+    trace_map_follow_pointer();
+    // The map ignores input while it is fading in, sliding or fading out,
+    // exactly as handle_map_input does.
+    if (clock_state_ || map_enter_ticks_ != 0
+        || map_enter_finished_this_frame_
+        || map_slide_ticks_ != 0 || map_fade_ticks_ != 0) {
+        return;
+    }
+    update_map_hover(map_pointer_x_, map_pointer_y_);
+    if (game_key_.click) {
+        if (map_hover_ == -2 || map_hover_ == -3) {
+            // case 16/17: AVG_PlaySE3( 9015 ) and GameKey.pup/pdown = 1.
+            // It is the key the arrow raises, not a page turn of its own:
+            // the turn below answers it, and so does AVG_ControlSystem2 later
+            // in the frame - GameKey.pup switches auto mode off, which is
+            // how clicking a map arrow ends it.
+            play_se(-1, 9015, false, 255);
+            map_arrow_pressed_ = map_hover_;
+            if (map_hover_ == -2) {
+                game_key_.pup = 1;
+            } else {
+                game_key_.pdown = 1;
+            }
+        } else if (map_hover_ >= 0 && map_hover_on_page()) {
+            finish_map_selection(map_hover_);
+        }
+    }
+    //     if(GameKey.pup){   AVG_PlaySE3( 9015 ); ...+1... }
+    //     if(GameKey.pdown){ AVG_PlaySE3( 9015 ); ...-1... }
+    // PageUp and PageDown turn the page as well as the arrows do.
+    if (game_key_.pup) {
+        change_map_field(1);
+    } else if (game_key_.pdown) {
+        change_map_field(-1);
+    }
+}
+
+void Game::trace_map_follow_pointer()
+{
+    map_pointer_x_ = static_cast<float>(trace_mouse_x_);
+    map_pointer_y_ = static_cast<float>(trace_mouse_y_);
+}
+
+void Game::trace_peek_map_pointer()
+{
+    // MUS_RenewMouse runs at the top of the engine's frame, before anything
+    // else in it - th2ref_input moves the cursor first, map pick included -
+    // so AVG_ControlMapEvent's hover reads this tick's pointer.  Ours steps
+    // the map (update_map) before the input pass, so the pointer is looked
+    // up here, without consuming the tick's input: read a tick late, every
+    // hover sound over the map came a tick after the reference's.
+    if (!trace_mode_ || ui_mode_ != UiMode::map) {
+        return;
+    }
+    int x = 0;
+    int y = 0;
+    bool pick = false;
+    if (record_live()) {
+        x = recorder_.x();
+        y = recorder_.y();
+    } else {
+        const auto state = trace_script_.at(trace_tick_);
+        x = state.mouse_x;
+        y = state.mouse_y;
+        pick = state.map_pick;
+    }
+    if (pick) {
+        trace_map_pick_position(x, y);
+    }
+    map_pointer_x_ = static_cast<float>(x);
+    map_pointer_y_ = static_cast<float>(y);
+}
+
+void Game::trace_map_pick_position(int& out_x, int& out_y) const
+{
+    {
         int x = 748;
         int y = 300;
         std::array<int, 10> overlaps{};
@@ -391,32 +471,8 @@ void Game::trace_drive_map(bool pick)
                 break;
             }
         }
-        trace_mouse_x_ = x;
-        trace_mouse_y_ = y;
-    }
-    // MUS_GetMouseNo reads the cursor wherever the harness left it, so the
-    // pointer follows it on every frame, answered or not.
-    map_pointer_x_ = static_cast<float>(trace_mouse_x_);
-    map_pointer_y_ = static_cast<float>(trace_mouse_y_);
-    // The map ignores input while it is fading in, sliding or fading out,
-    // exactly as handle_map_input does.
-    if (clock_state_ || map_enter_ticks_ != 0
-        || map_enter_finished_this_frame_
-        || map_slide_ticks_ != 0 || map_fade_ticks_ != 0) {
-        return;
-    }
-    update_map_hover(map_pointer_x_, map_pointer_y_);
-    if (!game_key_.click) {
-        return;
-    }
-    if (map_hover_ == -2 || map_hover_ == -3) {
-        // case 16/17: AVG_PlaySE3( 9015 ) and GameKey.pup/pdown = 1 - and
-        // the page turn that follows plays 9015 again, in the same frame.
-        play_se(-1, 9015, false, 255);
-        map_arrow_pressed_ = map_hover_;
-        change_map_field(map_hover_ == -2 ? 1 : -1);
-    } else if (map_hover_ >= 0 && map_hover_on_page()) {
-        finish_map_selection(map_hover_);
+        out_x = x;
+        out_y = y;
     }
 }
 
@@ -439,6 +495,7 @@ void Game::update_clock_calendar()
     }
     if (calendar_state_) {
         calendar_state_->frame += control_steps_;
+
         if (!calendar_state_->dismissing) {
             // AVG_SetCalender's step 2:
             //     if( AVG_GetMesCut() || AVG_GetHitKey() ){ step=3; count=0; }
@@ -455,8 +512,23 @@ void Game::update_clock_calendar()
             // ticks, missing that edge is not one tick of difference but
             // thirty: measured at the March 8th calendar, where ours
             // dismissed at tick 169111 and the reference waited to 169141.
-            if (calendar_state_->frame > 16
-                && (game_key_.click || message_cut())) {
+            //
+            // The skip key is not an edge, and reads no lagged GameKey: in
+            // AVG_CALENDER, Avg.msg_cut is the latch AVG_ControlSystem2 left
+            // before the page went up, the same value on every frame of it.
+            // The click above is this frame's game_key_, which the input
+            // pass has not refreshed yet - a tick behind the engine's - and
+            // the release below is a frame ahead of the engine's (it resumes
+            // the script from the next EXEC_ControlLang, ours from this
+            // one).  The two cancel for a click; a held skip key only has
+            // the second, so for the day-change page it is taken a frame
+            // later.  Measured: a skip through the March 2nd page released
+            // the script at S+35 on the reference and S+34 here.
+            const bool cut_ready = calendar_state_->step
+                ? calendar_state_->frame > 17
+                : calendar_state_->frame > 16;
+            if ((calendar_state_->frame > 16 && game_key_.click)
+                || (cut_ready && message_cut())) {
                 calendar_state_->dismissing = true;
                 calendar_state_->frame = 0;
             }
@@ -917,7 +989,8 @@ void Game::update_sakura(int steps)
 
 void Game::draw_sakura()
 {
-    if (!sakura_) {
+    // !weather_disp_: AVG_CloseBack has hidden every GRP_WEATHER graph.
+    if (!sakura_ || !weather_disp_) {
         return;
     }
     {

@@ -13,10 +13,12 @@
  *     300 esc
  *     420 ctrl 90      # held from tick 420 for 90 ticks
  *     30 every 30 lclick 3   # that click, every 30 ticks, forever
+ *     30 every 30 lclick 3 until 9000   # ...on the ticks before 9000
  *
- * A route is hundreds of thousands of ticks of clicking, which as one line
- * per click overruns the table below and makes every tick scan every event.
- * `every` is one event whose firing is arithmetic, so neither happens.
+ * A route is hundreds of thousands of ticks of clicking; `every` is one event
+ * whose firing is arithmetic.  A recorded run (reference/record.sh) is the
+ * opposite - thousands of one-shot lines - which is why the events are
+ * sorted and looked up by tick rather than scanned.
  *
  * A press sets both trg (the edge) and btn (the level) for its duration,
  * and btrg follows trg, which is what KEY_RenewKeybord would do for a key
@@ -26,6 +28,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <algorithm>
+#include <vector>
 
 #include "keybord.h"
 #include "mouse.h"
@@ -63,11 +68,18 @@ struct Event {
     int           x, y;     /* EV_MOVE */
     unsigned long hold;
     unsigned long period;   /* 0 one-shot, else repeats every `period` */
+    unsigned long until;    /* a repeat stops on this tick (0: never) */
 };
 
-const int MAX_EVENTS = 4096;
-Event  g_events[MAX_EVENTS];
-int    g_count  = 0;
+/* Split and sorted once, so a tick costs a binary search and the events in
+ * effect instead of a scan of every line - a recorded run is thousands of
+ * pointer moves (reference/record.sh), which used to overrun a fixed table
+ * and make every tick quadratic in the length of the run.  Kept exactly in
+ * step with TraceScript in src/trace.cpp. */
+std::vector<Event> g_moves;     /* by tick */
+std::vector<Event> g_shots;     /* one-shots, by tick */
+std::vector<Event> g_repeats;
+unsigned long g_longest = 1;
 bool   g_loaded = false;
 
 /* Only the keys a trace script plausibly needs.  Anything else in the
@@ -92,6 +104,8 @@ const Named g_keys[] = {
 #undef K
 #undef KN
 
+bool by_tick(const Event &a, const Event &b) { return a.tick < b.tick; }
+
 void load(void)
 {
     g_loaded = true;
@@ -102,10 +116,23 @@ void load(void)
         fprintf(stderr, "th2ref: cannot open input script %s\n", path);
         return;
     }
-    char line[256];
+    char line[512];
+    size_t count = 0;
     while (fgets(line, sizeof line, f)) {
         char *hash = strchr(line, '#');
         if (hash) *hash = 0;
+
+        /* "... until <tick>" ends a repeat; cut off first, so the optional
+         * hold before it still reads as the last number. */
+        unsigned long until = 0;
+        for (char *p = line; *p; ++p) {
+            if (_strnicmp(p, "until", 5) == 0 && (p == line || p[-1] == ' ')) {
+                until = strtoul(p + 5, NULL, 10);
+                *p = 0;
+                break;
+            }
+        }
+
         unsigned long tick = 0, hold = 1, period = 0;
         char name[64] = {0};
         int a = 0, b = 0;
@@ -129,15 +156,16 @@ void load(void)
             strcpy(name, word);
             n = m;              /* args after the name, counted the same way */
         }
-
-        /* Loud, because a script that is silently half-loaded still runs:
-         * the reference simply stops clicking, the port does not, and the
-         * divergence looks like an engine bug rather than a full table. */
-        if (g_count >= MAX_EVENTS) {
-            fprintf(stderr, "th2ref: more than %d input events - use 'every'\n",
-                    MAX_EVENTS);
-            break;
+        if (until && !period) {
+            fprintf(stderr, "th2ref: until only ends a repeat\n");
+            continue;
         }
+
+        Event e;
+        memset(&e, 0, sizeof e);
+        e.tick = tick;
+        e.period = period;
+        e.until = until;
 
         /* "mappick": stand on a map destination, whichever page it is on.
          *
@@ -151,54 +179,54 @@ void load(void)
          * the first enabled destination, or on the page-forward arrow when
          * this page has none, and let the periodic click do the rest. */
         if (!_stricmp(name, "mappick")) {
-            g_events[g_count].tick = tick;
-            g_events[g_count].kind = EV_MAPPICK;
-            g_events[g_count].hold = 1;
-            g_events[g_count].period = period ? period : 1;
-            ++g_count;
+            e.kind = EV_MAPPICK;
+            e.hold = 1;
+            if (!e.period) e.period = 1;
+            g_repeats.push_back(e);
+            ++count;
             continue;
         }
         if (!_stricmp(name, "move") && n >= 4) {
-            g_events[g_count].tick = tick; g_events[g_count].kind = EV_MOVE;
-            g_events[g_count].x = a; g_events[g_count].y = b;
-            g_events[g_count].hold = 1; g_events[g_count].period = 0;
-            ++g_count;
+            e.kind = EV_MOVE; e.x = a; e.y = b; e.hold = 1; e.period = 0;
+            g_moves.push_back(e);
+            ++count;
             continue;
         }
         if (!_stricmp(name, "lclick") || !_stricmp(name, "rclick")) {
-            g_events[g_count].tick = tick;
-            g_events[g_count].kind = name[0] == 'l' || name[0] == 'L' ? EV_LCLICK : EV_RCLICK;
-            g_events[g_count].hold = (n >= 3 && a > 0) ? (unsigned long)a : 2;
-            g_events[g_count].period = period;
-            if (period && g_events[g_count].hold > period) {
-                fprintf(stderr, "th2ref: repeat holds longer than its period\n");
+            e.kind = name[0] == 'l' || name[0] == 'L' ? EV_LCLICK : EV_RCLICK;
+            e.hold = (n >= 3 && a > 0) ? (unsigned long)a : 2;
+        } else {
+            hold = (n >= 3 && a > 0) ? (unsigned long)a : 1;
+            int offset = -1;
+            for (size_t i = 0; i < sizeof g_keys / sizeof g_keys[0]; ++i) {
+                if (!_stricmp(g_keys[i].name, name)) { offset = g_keys[i].offset; break; }
+            }
+            if (offset < 0) {
+                fprintf(stderr, "th2ref: unknown key '%s' in input script\n", name);
                 continue;
             }
-            ++g_count;
-            continue;
+            e.kind = EV_KEY;
+            e.offset = offset;
+            e.hold = hold ? hold : 1;
         }
-        hold = (n >= 3 && a > 0) ? (unsigned long)a : 1;
-        int offset = -1;
-        for (size_t i = 0; i < sizeof g_keys / sizeof g_keys[0]; ++i) {
-            if (!_stricmp(g_keys[i].name, name)) { offset = g_keys[i].offset; break; }
-        }
-        if (offset < 0) {
-            fprintf(stderr, "th2ref: unknown key '%s' in input script\n", name);
-            continue;
-        }
-        g_events[g_count].tick   = tick;
-        g_events[g_count].kind   = EV_KEY;
-        g_events[g_count].offset = offset;
-        g_events[g_count].hold   = hold ? hold : 1;
-        g_events[g_count].period = period;
-        if (period && g_events[g_count].hold > period) {
+        if (period && e.hold > period) {
             fprintf(stderr, "th2ref: repeat holds longer than its period\n");
             continue;
         }
-        ++g_count;
+        if (period) {
+            g_repeats.push_back(e);
+        } else {
+            g_shots.push_back(e);
+            if (e.hold > g_longest) g_longest = e.hold;
+        }
+        ++count;
     }
     fclose(f);
-    fprintf(stderr, "th2ref: %d input events loaded\n", g_count);
+    /* Stable, so two moves on one tick keep their order and the later line
+     * wins, as it always has. */
+    std::stable_sort(g_moves.begin(), g_moves.end(), by_tick);
+    std::stable_sort(g_shots.begin(), g_shots.end(), by_tick);
+    fprintf(stderr, "th2ref: %u input events loaded\n", (unsigned)count);
 }
 
 }  /* namespace */
@@ -221,31 +249,51 @@ extern "C" void th2ref_input(void)
     g_mouse_l = g_mouse_r = false;
     int map_pick = 0;
 
-    for (int i = 0; i < g_count; ++i) {
-        const Event &e = g_events[i];
-        /* a move is a state change, so it applies from its tick onwards */
-        if (e.kind == EV_MOVE) {
-            if (now >= e.tick) { g_mouse_x = e.x; g_mouse_y = e.y; }
-            continue;
+    /* a move is a state change: the latest one at or before now holds */
+    {
+        Event probe; memset(&probe, 0, sizeof probe); probe.tick = now;
+        std::vector<Event>::const_iterator it = std::upper_bound(
+            g_moves.begin(), g_moves.end(), probe, by_tick);
+        if (it != g_moves.begin()) {
+            --it;
+            g_mouse_x = it->x;
+            g_mouse_y = it->y;
         }
-        if (now < e.tick) continue;
-        /* one-shot: distance from its tick; repeat: phase within a period */
-        const unsigned long phase = e.period ? (now - e.tick) % e.period
-                                             : now - e.tick;
-        if (phase >= e.hold) continue;
-        if (e.kind == EV_MAPPICK) { map_pick = 1; continue; }
+    }
+
+    const auto apply = [&](const Event &e, bool first) {
         switch (e.kind) {
+        case EV_MAPPICK: map_pick = 1; break;
         case EV_LCLICK: g_mouse_l = true; break;
         case EV_RCLICK: g_mouse_r = true; break;
         case EV_KEY:
             btn[e.offset] = 1;                   /* level, for the whole hold */
-            if (phase == 0) {                    /* edge, only on the first */
+            if (first) {                         /* edge, only on the first */
                 trg[e.offset]  = 1;
                 btrg[e.offset] = 1;
             }
             break;
         default: break;
         }
+    };
+
+    /* one-shots in effect started within the longest hold of now */
+    {
+        Event probe; memset(&probe, 0, sizeof probe);
+        probe.tick = now + 1 > g_longest ? now + 1 - g_longest : 0;
+        std::vector<Event>::const_iterator it = std::lower_bound(
+            g_shots.begin(), g_shots.end(), probe, by_tick);
+        for (; it != g_shots.end() && it->tick <= now; ++it) {
+            if (now - it->tick < it->hold) apply(*it, now == it->tick);
+        }
+    }
+
+    /* repeats: phase within a period, from the first tick until `until` */
+    for (size_t i = 0; i < g_repeats.size(); ++i) {
+        const Event &e = g_repeats[i];
+        if (now < e.tick || (e.until && now >= e.until)) continue;
+        const unsigned long phase = (now - e.tick) % e.period;
+        if (phase < e.hold) apply(e, phase == 0);
     }
     if (map_pick) th2ref_map_pick();
 

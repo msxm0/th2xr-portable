@@ -58,10 +58,14 @@ void main()
 // mediump *float* is worse - fp16 is exact on integers only to 2048 and
 // overflows to infinity past 65504, so 256*256 would be Inf.  That is the
 // shape of bug that works on a desktop and destroys the screen on a phone,
-// so it is stated here and measured at startup by self_test().
+// so it is stated here and measured at startup by self_test().  Samplers
+// default to lowp, which a GPU may implement as 8 bit fixed point - close
+// enough to misround a level when every texel is read back as an integer -
+// so they are highp too, as in gl_transition.cpp and gl_anime4k.cpp.
 constexpr char fragment_source[] = R"(#version 300 es
 precision highp float;
 precision highp int;
+precision highp sampler2D;
 
 uniform sampler2D u_source;
 uniform sampler2D u_source2;    // mode 4: the pose being left
@@ -97,6 +101,7 @@ uniform int u_pair;             // mode 4: DSP_SetGraphBSet's rate, 0..256
 uniform int u_folded;           // mode 4: bit 0/1 - source 1/2 is stored
                                 // folded already (a toned 32 bit load)
 uniform ivec3 u_ink;            // mode 2: the colour the mask is drawn in
+uniform int u_layer;            // 1: the target is a premultiplied layer
 
 in vec2 v_uv;
 out vec4 fragment;
@@ -123,6 +128,32 @@ int bright_of(int value, int level)
     int v = clamp(value, 0, 255);
     return j < 128 ? (v * j) >> 7
                    : ((((255 - v) * (j - 128)) >> 7) + v);
+}
+
+// The destination, as the engine's integer blend reads it - or nothing, on
+// a layer (th2::premultiplied_layer_property: the text, overlay and side bar
+// targets, cleared transparent and composited premultiplied over the
+// picture).  There the GPU's blend unit does the destination half instead,
+// so the draw needs no copy of its target: with the destination read as 0,
+// every formula below reduces to exactly its source contribution, which is
+// already premultiplied, and out_alpha() hands the blend unit the factor the
+// destination is kept by.  A layer is not the engine's framebuffer and is
+// never compared, so the blend unit's rounding costs nothing there - while a
+// framebuffer copy per sprite costs a tiling GPU a render-pass flush of the
+// whole layer every time.
+ivec3 read_dest(vec2 at)
+{
+    return u_layer != 0 ? ivec3(0) : ivec3(round(texture(u_dest, at).rgb * 255.0));
+}
+
+// The alpha to write: opaque into the picture, which has no alpha of its
+// own; on a layer, the coverage the draw put down - one minus `keep`, the
+// factor (0..256) the destination is kept by - for the blend unit's
+// ONE, ONE_MINUS_SRC_ALPHA.  Writing 1 on a layer, as this once did, made
+// every soft edge an opaque dark rim.
+float out_alpha(int keep)
+{
+    return u_layer == 0 ? 1.0 : float(clamp(256 - keep, 0, 256)) / 256.0;
 }
 
 void main()
@@ -179,14 +210,16 @@ void main()
             discard;
         }
         vec2 gat = gl_FragCoord.xy / u_target;
-        ivec3 gdst = ivec3(round(texture(u_dest, gat).rgb * 255.0));
+        ivec3 gdst = read_dest(gat);
         ivec3 gout;
+        int gkeep;
         if (u_alpha >= 256) {
             // FNT_DrawTextBuf_Fx2's alph==256 branch: BlendTable16 on both
             // terms, which is a divide by 15 and not by 256.
             //     bld_tbl = BlendTable16[c];  rev_tbl = BlendTable16[15-c];
             //     dest = rev_tbl[dest] + bld_tbl[ink];
             gout = ((15 - coverage) * gdst) / 15 + (coverage * u_ink) / 15;
+            gkeep = (15 - coverage) * 256 / 15;
         } else {
             // The alpha branch of the same function:
             //     eff = BlendTable16[c][alph];
@@ -201,8 +234,9 @@ void main()
                 blend_table(255 - geff, gdst.r) + blend_table(geff, u_ink.r),
                 blend_table(255 - geff, gdst.g) + blend_table(geff, u_ink.g),
                 blend_table(255 - geff, gdst.b) + blend_table(geff, u_ink.b));
+            gkeep = 255 - geff;
         }
-        fragment = vec4(vec3(clamp(gout, 0, 255)) / 255.0, 1.0);
+        fragment = vec4(vec3(clamp(gout, 0, 255)) / 255.0, out_alpha(gkeep));
         return;
     }
 
@@ -265,10 +299,10 @@ void main()
             sum = t2;
         }
         vec2 pair_at = gl_FragCoord.xy / u_target;
-        ivec3 pdst = ivec3(round(texture(u_dest, pair_at).rgb * 255.0));
+        ivec3 pdst = read_dest(pair_at);
         ivec3 pout = ivec3(blend_table(df, pdst.r), blend_table(df, pdst.g),
                            blend_table(df, pdst.b)) + sum;
-        fragment = vec4(vec3(clamp(pout, 0, 255)) / 255.0, 1.0);
+        fragment = vec4(vec3(clamp(pout, 0, 255)) / 255.0, out_alpha(df));
         return;
     }
 
@@ -336,13 +370,39 @@ void main()
                                            : blend_table(blnd, texel_alpha);
     }
 
+    // Mode 6 - a 32 bit TGA loaded as BMP_FULL, its colour never folded -
+    // under a brightness that is not neutral goes the long way round on a
+    // partially covered texel, in both the NML and the BLD blits of
+    // Draw32.cpp:
+    //     alp3_tbl = BlendTable2[a];     // (s<<8)/(a+1): un-premultiply
+    //     src = BlendTable[eff][ BrightTable[ alp3_tbl[s] ] ];
+    // with eff the texel's coverage times the blend level.  "Un-premultiplying"
+    // a colour that was never premultiplied brightens it, clamped at 255, and
+    // that is what the edges of the map's fields show while the map fades
+    // out: measured one level off on every antialiased edge until this.  The
+    // same code runs for folded bitmaps too, but there the round trip is not
+    // what ours was missing - applied to modes 0 and 3 it made that same
+    // frame worse, so it is left to the one mode it was measured on.
+    bool bright_neutral = u_bright_r == 128 && u_bright_g == 128
+                          && u_bright_b == 128;
+    if (!bright_neutral && texel_alpha < 255 && u_mode == 6) {
+        ivec3 unfolded = clamp((raw * 256) / (texel_alpha + 1),
+                               ivec3(0), ivec3(255));
+        src = ivec3(bright_of(unfolded.r, u_bright_r),
+                    bright_of(unfolded.g, u_bright_g),
+                    bright_of(unfolded.b, u_bright_b));
+        eff = blend_table(blnd, texel_alpha);
+        rev = 255 - eff;
+    }
+
     // No flip: the scratch is filled by glCopyTexSubImage2D straight out of
     // the framebuffer, so it carries the framebuffer's own orientation, and
     // gl_FragCoord is in those same coordinates.
     vec2 dest_at = gl_FragCoord.xy / u_target;
-    ivec3 dst = ivec3(round(texture(u_dest, dest_at).rgb * 255.0));
+    ivec3 dst = read_dest(dest_at);
 
     ivec3 result;
+    int keep = rev;
     if (u_mode == 1) {
         // DRW_ADD, Draw32.cpp: dest = AddTable[dest + src], and
         // AddTable[i] = min(i, 255) over 0..511 - a saturating add of the
@@ -354,6 +414,7 @@ void main()
                                    blend_table(eff, src.g),
                                    blend_table(eff, src.b));
         result = min(dst + contribution, ivec3(255));
+        keep = 256;     // light added; the coverage underneath is unchanged
     } else {
         result = ivec3(
             blend_table(rev, dst.r) + blend_table(eff, src.r),
@@ -363,7 +424,7 @@ void main()
             result = result & ivec3(255);   // unsigned char, not saturated
         }
     }
-    fragment = vec4(vec3(clamp(result, 0, 255)) / 255.0, 1.0);
+    fragment = vec4(vec3(clamp(result, 0, 255)) / 255.0, out_alpha(keep));
 }
 )";
 
@@ -445,6 +506,7 @@ struct GlExactBlend::Impl {
     GLint bright_locations[3] = {-1, -1, -1};
     GLint mode_location = -1;
     GLint ink_location = -1;
+    GLint layer_location = -1;
     bool ready = false;
 
     // A copy of the render target.  Sampling the texture being drawn into is
@@ -461,6 +523,11 @@ struct GlExactBlend::Impl {
     int scratch_width = 0;
     int scratch_height = 0;
     bool captured = false;
+
+    // Copies [x0,x1)x[y0,y1) of the bound framebuffer, a width x height
+    // render target, into the scratch.  False if the box is empty.
+    bool copy_destination(int width, int height, int x0, int y0, int x1,
+                          int y1);
 
     Impl()
     {
@@ -511,6 +578,7 @@ struct GlExactBlend::Impl {
         bright_locations[2] = glGetUniformLocation(program, "u_bright_b");
         mode_location = glGetUniformLocation(program, "u_mode");
         ink_location = glGetUniformLocation(program, "u_ink");
+        layer_location = glGetUniformLocation(program, "u_layer");
 
         // Four vertices, rewritten per draw: position then uv.
         glGenVertexArrays(1, &vertex_array);
@@ -551,74 +619,63 @@ GlExactBlend::~GlExactBlend() = default;
 
 bool GlExactBlend::available() const { return impl_ && impl_->ready; }
 
-bool GlExactBlend::capture_destination(SDL_Renderer* renderer,
-                                      const SDL_FRect* region)
+bool GlExactBlend::capture_destination(SDL_Renderer* renderer)
 {
     if (!available()) {
         return false;
     }
-    impl_->captured = false;
-    SDL_Texture* const target = SDL_GetRenderTarget(renderer);
-    if (!target) {
-        return false;           // the window; nothing to sample
-    }
-    float w = 0.0f;
-    float h = 0.0f;
-    if (!SDL_GetTextureSize(target, &w, &h) || w <= 0.0f || h <= 0.0f) {
-        return false;
-    }
-    const int width = static_cast<int>(w);
-    const int height = static_cast<int>(h);
+    // Only asked for here; draw() makes the copy, because only draw() knows
+    // which pixels it will read.  Nothing here may touch GL either: SDL may
+    // still have draws queued, and they run against whatever is bound.
+    impl_->captured = SDL_GetRenderTarget(renderer) != nullptr;
+    return impl_->captured;     // the window has nothing to sample
+}
 
-    // Everything SDL has queued has to reach the driver first: the copy
-    // below reads the framebuffer as it stands, and a queued draw that has
-    // not landed yet is not in it.
-    if (!SDL_FlushRenderer(renderer)) {
-        return false;
-    }
-
-    if (!impl_->scratch_name || impl_->scratch_width != width
-        || impl_->scratch_height != height) {
-        if (impl_->scratch_name) {
-            glDeleteTextures(1, &impl_->scratch_name);
+bool GlExactBlend::Impl::copy_destination(
+    int width, int height, int x0, int y0, int x1, int y1)
+{
+    if (!scratch_name || scratch_width != width || scratch_height != height) {
+        if (scratch_name) {
+            glDeleteTextures(1, &scratch_name);
         }
-        glGenTextures(1, &impl_->scratch_name);
-        glBindTexture(GL_TEXTURE_2D, impl_->scratch_name);
+        glGenTextures(1, &scratch_name);
+        glBindTexture(GL_TEXTURE_2D, scratch_name);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA,
                      GL_UNSIGNED_BYTE, nullptr);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        impl_->scratch_width = width;
-        impl_->scratch_height = height;
+        scratch_width = width;
+        scratch_height = height;
     } else {
-        glBindTexture(GL_TEXTURE_2D, impl_->scratch_name);
+        glBindTexture(GL_TEXTURE_2D, scratch_name);
     }
-    // Reads whatever framebuffer SDL left bound, which is the render target
-    // we are about to draw into.  A region is in SDL's top-left coordinates
-    // and the framebuffer counts from the bottom, so the row range flips;
-    // the offsets into the scratch are the same numbers, which is what keeps
-    // it aligned with gl_FragCoord.
-    int cx = 0, cy = 0, cw = width, ch = height;
-    if (region) {
-        cx = std::clamp(static_cast<int>(region->x), 0, width);
-        cw = std::clamp(static_cast<int>(region->w) + 1, 0, width - cx);
-        const int top = std::clamp(static_cast<int>(region->y), 0, height);
-        const int bottom =
-            std::clamp(static_cast<int>(region->y + region->h) + 1, 0, height);
-        ch = bottom - top;
-        cy = height - bottom;
-        if (cw <= 0 || ch <= 0) {
-            return false;
-        }
-    }
-    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, cx, cy, cx, cy, cw, ch);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    if (glGetError() != GL_NO_ERROR) {
+    // Only the box the draw covers.  The shader reads the scratch at its own
+    // fragment and nowhere else, so outside the box it may hold anything -
+    // and a whole-target copy per sprite, at monitor resolution, was ~29
+    // million pixels a frame with the side bar up, measured in the browser at
+    // 2x - over ten gigabytes a second of copying at 100 fps, and on a tiling
+    // GPU the copy is a render-pass flush whatever its size.
+    //
+    // Rows are SDL's y, unflipped.  SDL draws into a target through a
+    // projection that puts its y-down origin at the framebuffer's row 0, the
+    // same fact the quad and the shader's gl_FragCoord lookup rely on.  The
+    // region copy this replaces flipped the rows as if for the window, so
+    // the shader read a stale band from the far end of the scratch: glyphs
+    // re-blended over last frame's copy of themselves and went solid, bar
+    // buttons blended over black.  That is why the copy had been widened to
+    // the whole target - it hid the flip rather than fixing it.
+    x0 = std::clamp(x0, 0, width);
+    x1 = std::clamp(x1, 0, width);
+    y0 = std::clamp(y0, 0, height);
+    y1 = std::clamp(y1, 0, height);
+    if (x1 <= x0 || y1 <= y0) {
+        glBindTexture(GL_TEXTURE_2D, 0);
         return false;
     }
-    impl_->captured = true;
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, x0, y0, x1 - x0, y1 - y0);
+    glBindTexture(GL_TEXTURE_2D, 0);
     return true;
 }
 
@@ -635,33 +692,55 @@ bool GlExactBlend::draw(
     // SDL's own draws are relative to the viewport, and this one has to land
     // where they would: the text shakes move the message by moving the
     // viewport, and a glyph placed in absolute target pixels stayed put.
+    //
+    // And through the render scale, which SDL applies to the viewport and
+    // the coordinates alike.  A trace draws into the 800x600 art target at
+    // scale 1, so it never showed; normal play draws the side bar and the
+    // text into monitor-resolution overlays at target/800, and there the
+    // quad landed in the top-left corner at 1/scale its size - the whole bar
+    // a thin strip a third of the way across the browser window.
     SDL_Rect sdl_viewport{};
     SDL_GetRenderViewport(renderer, &sdl_viewport);
-    SDL_FRect dst = requested_dst;
-    dst.x += static_cast<float>(sdl_viewport.x);
-    dst.y += static_cast<float>(sdl_viewport.y);
+    float scale_x = 1.0f;
+    float scale_y = 1.0f;
+    SDL_GetRenderScale(renderer, &scale_x, &scale_y);
+    SDL_FRect dst{
+        (requested_dst.x + static_cast<float>(sdl_viewport.x)) * scale_x,
+        (requested_dst.y + static_cast<float>(sdl_viewport.y)) * scale_y,
+        requested_dst.w * scale_x, requested_dst.h * scale_y};
     SDL_Rect clip_rect{};
     const SDL_Rect* clip = nullptr;
     if (requested_clip) {
-        clip_rect = *requested_clip;
-        clip_rect.x += sdl_viewport.x;
-        clip_rect.y += sdl_viewport.y;
+        const float left = (requested_clip->x + sdl_viewport.x) * scale_x;
+        const float top = (requested_clip->y + sdl_viewport.y) * scale_y;
+        const float right = left + requested_clip->w * scale_x;
+        const float bottom = top + requested_clip->h * scale_y;
+        clip_rect.x = static_cast<int>(std::floor(left));
+        clip_rect.y = static_cast<int>(std::floor(top));
+        clip_rect.w = static_cast<int>(std::ceil(right)) - clip_rect.x;
+        clip_rect.h = static_cast<int>(std::ceil(bottom)) - clip_rect.y;
         clip = &clip_rect;
     }
     if (!available() || !impl_->captured) {
         return false;
     }
-    // Flush first, then ask for the names.  SDL creates a texture's GL
-    // object lazily, on the first draw that actually reaches the driver -
-    // and the copy capture_destination() made into the scratch is still
-    // sitting in SDL's queue at this point, so asking now returns 0 for it
-    // and the whole path silently declines on every single draw.
+    // Flush first, then touch GL.  SDL creates a texture's GL object
+    // lazily, on the first draw that actually reaches the driver, so a name
+    // asked for before the queue has run can be 0; and the copy below reads
+    // the framebuffer as it stands, which a queued draw has not reached yet.
+    //
+    // The flush also marks SDL's cached GL state invalid - SDL_FlushRenderer
+    // is documented to, and SDL_render_gles2.c's InvalidateCachedState makes
+    // viewport, scissor, blend, program and textures dirty - so SDL sets all
+    // of it again before its next draw.  That is what lets this function
+    // change that state without saving it first.  Querying it instead - a
+    // glIsEnabled and a glGetIntegerv per sprite - can each be a round trip
+    // to the GPU process in WebGL.
     if (!SDL_FlushRenderer(renderer)) {
         return false;
     }
     const GLuint source_name = texture_name(source);
-    const GLuint dest_name = impl_->scratch_name;
-    if (!source_name || !dest_name) {
+    if (!source_name) {
         return false;
     }
     GLuint source2_name = 0;
@@ -681,8 +760,63 @@ bool GlExactBlend::draw(
         || source_w <= 0.0f || source_h <= 0.0f) {
         return false;
     }
-    const float target_w = static_cast<float>(impl_->scratch_width);
-    const float target_h = static_cast<float>(impl_->scratch_height);
+    SDL_Texture* const target = SDL_GetRenderTarget(renderer);
+    float target_w = 0.0f;
+    float target_h = 0.0f;
+    if (!target || !SDL_GetTextureSize(target, &target_w, &target_h)
+        || target_w <= 0.0f || target_h <= 0.0f) {
+        return false;
+    }
+
+    // A layer composites through the blend unit and reads no destination;
+    // see read_dest() in the shader.
+    const bool layer = th2::texture_is_premultiplied_layer(target);
+
+    // The box this draw can write, in target pixels: the quad's, or for a
+    // polygon the rows' spans, and in either case inside the scissor.  The
+    // quad covers the pixels whose centres fall inside it, all of which are
+    // inside floor..ceil of its edges.
+    int box_x0 = 0, box_y0 = 0, box_x1 = 0, box_y1 = 0;
+    if (poly_rows) {
+        box_x0 = static_cast<int>(target_w);
+        box_y0 = poly_row_count;
+        for (int y = 0; y < poly_row_count; ++y) {
+            const int* const row = poly_rows + static_cast<std::size_t>(y) * 8;
+            if (row[6] <= 0 || row[1] <= 0) {
+                continue;               // the shader discards this row
+            }
+            box_x0 = std::min(box_x0, row[0]);
+            box_x1 = std::max(box_x1, row[0] + row[1]);
+            box_y0 = std::min(box_y0, y);
+            box_y1 = y + 1;
+        }
+    } else {
+        box_x0 = static_cast<int>(std::floor(dst.x));
+        box_y0 = static_cast<int>(std::floor(dst.y));
+        box_x1 = static_cast<int>(std::ceil(dst.x + dst.w));
+        box_y1 = static_cast<int>(std::ceil(dst.y + dst.h));
+    }
+    if (clip) {
+        box_x0 = std::max(box_x0, clip->x);
+        box_y0 = std::max(box_y0, clip->y);
+        box_x1 = std::min(box_x1, clip->x + clip->w);
+        box_y1 = std::min(box_y1, clip->y + clip->h);
+    }
+    // The target changes under SDL's feet from here on; the next draw needs
+    // a capture of its own.
+    impl_->captured = false;
+    if (box_x1 <= box_x0 || box_y1 <= box_y0) {
+        return true;    // none of it lands on the target: drawn, invisibly
+    }
+    if (!layer
+        && !impl_->copy_destination(static_cast<int>(target_w),
+                                    static_cast<int>(target_h), box_x0,
+                                    box_y0, box_x1, box_y1)) {
+        return true;    // the box is off the target entirely
+    }
+    // On a layer nothing samples it, but unit 1 still wants a texture that
+    // is not the one being drawn into.
+    const GLuint dest_name = impl_->scratch_name;
 
     // Destination rectangle to clip space, y NOT inverted.  SDL renders
     // into a target through a projection that already puts its y-down origin
@@ -724,7 +858,14 @@ bool GlExactBlend::draw(
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     };
     bind(GL_TEXTURE0, source_name);
-    bind(GL_TEXTURE1, dest_name);
+    if (dest_name) {
+        bind(GL_TEXTURE1, dest_name);
+    } else {
+        // A layer drawn before anything needed a scratch: unbound, since
+        // setting sampling state on no texture is itself a GL error.
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
     if (source2_name) {
         bind(GL_TEXTURE2, source2_name);
     }
@@ -753,16 +894,12 @@ bool GlExactBlend::draw(
         // or the texture is incomplete and reads zero.
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        GLint row_length = 0;
-        GLint alignment = 4;
-        glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
-        glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
-        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        // Unpack state as SDL leaves it - alignment 1, which it sets once
+        // at creation, and no row length, which nothing here sets - suits
+        // rows of 16 byte texels as it is, so it is neither changed nor
+        // queried.
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32I, 2, poly_row_count, 0,
                      GL_RGBA_INTEGER, GL_INT, poly_rows);
-        glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
-        glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
     }
     const auto to_int = [](float value) {
         return static_cast<GLint>(std::lround(value));
@@ -780,53 +917,50 @@ bool GlExactBlend::draw(
     glUniform1i(impl_->bright_locations[2], bright_b);
     glUniform1i(impl_->mode_location, mode);
     glUniform3i(impl_->ink_location, bright_r, bright_g, bright_b);
+    glUniform1i(impl_->layer_location, layer ? 1 : 0);
 
-    // The shader has already folded the destination in, so the blend unit
-    // must not do it again.  Put these back rather than trusting SDL to
-    // reset them: it caches its own idea of the GL state.
-    const GLboolean blend_was_on = glIsEnabled(GL_BLEND);
-    const GLboolean scissor_was_on = glIsEnabled(GL_SCISSOR_TEST);
-    GLint viewport[4] = {0, 0, 0, 0};
-    glGetIntegerv(GL_VIEWPORT, viewport);
-    glDisable(GL_BLEND);
+    // Into the picture the shader has already folded the destination in, so
+    // the blend unit must not do it again; on a layer it is the blend unit's
+    // job - premultiplied "over", with the shader's alpha as the coverage.
+    // Nothing is saved to put back: see the flush above.
+    if (layer) {
+        glEnable(GL_BLEND);
+        glBlendEquation(GL_FUNC_ADD);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    } else {
+        glDisable(GL_BLEND);
+    }
     // Scissor and viewport are SDL's, set for whatever it last drew - a clip
     // rectangle, or a sub-rect of the target.  The quad below is in clip
     // space over the whole target, so both have to be the whole target too
     // or it lands scaled into a corner and clipped to something unrelated.
-    // The probes never caught this: they run on a freshly cleared target
-    // where SDL happened to have left the viewport covering all of it.
     if (clip) {
-        // ClipRect, as a scissor.  GL counts its box from the bottom of the
-        // framebuffer and SDL's rectangle from the top, so only the row
-        // range flips; the quad itself is unchanged, because clipping is not
-        // a smaller draw but the same draw with less of it kept.
+        // ClipRect, as a scissor, in the same unflipped rows as everything
+        // else here - SDL's own glScissor for a target is viewport.y +
+        // rect.y.  Flipping it, as for the window, only came out right for
+        // a clip centred on the target, which is every clip a trace has hit.
         glEnable(GL_SCISSOR_TEST);
-        glScissor(clip->x, impl_->scratch_height - (clip->y + clip->h),
-                  clip->w, clip->h);
+        glScissor(clip->x, clip->y, clip->w, clip->h);
     } else {
         glDisable(GL_SCISSOR_TEST);
     }
-    glViewport(0, 0, impl_->scratch_width, impl_->scratch_height);
+    // The target's size, not the scratch's: a layer draw makes no copy, so
+    // the scratch can be the size of whatever target last needed one.
+    glViewport(0, 0, static_cast<GLsizei>(target_w),
+               static_cast<GLsizei>(target_h));
     glBindVertexArray(impl_->vertex_array);
     glBindBuffer(GL_ARRAY_BUFFER, impl_->vertex_buffer);
     glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(quad), quad);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindVertexArray(0);
-    if (blend_was_on) {
-        glEnable(GL_BLEND);
-    }
-    if (scissor_was_on) {
-        glEnable(GL_SCISSOR_TEST);
-    }
-    glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
     glActiveTexture(GL_TEXTURE0);
     glUseProgram(0);
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-
-    // The target has changed under SDL's feet; the next capture must see it.
-    impl_->captured = false;
-    return glGetError() == GL_NO_ERROR;
+    // No glGetError: in WebGL it is a synchronous round trip to the GPU
+    // process, and this runs for every sprite.  The program and the scratch
+    // were checked once, when the path was set up.
+    return true;
 }
 
 #else   // no GLES headers: a stub that is never available
@@ -835,7 +969,7 @@ struct GlExactBlend::Impl {};
 GlExactBlend::GlExactBlend(SDL_Renderer*) : impl_(nullptr) {}
 GlExactBlend::~GlExactBlend() = default;
 bool GlExactBlend::available() const { return false; }
-bool GlExactBlend::capture_destination(SDL_Renderer*, const SDL_FRect*) { return false; }
+bool GlExactBlend::capture_destination(SDL_Renderer*) { return false; }
 bool GlExactBlend::draw(SDL_Renderer*, SDL_Texture*, const SDL_FRect&,
                         const SDL_FRect&, bool, bool, int, int, int, int, int,
                         SDL_Texture*, int, const SDL_Rect*, const int*, int)

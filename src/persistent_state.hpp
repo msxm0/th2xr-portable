@@ -46,6 +46,13 @@ public:
     bool unlock(UnlockKind kind, int id);
 
 private:
+    // The last answer: the game asks about the same line several times a
+    // frame, and each asking prepared and ran a statement.  Any write clears
+    // it - the table compares script names without case, so a write for
+    // another spelling of the same line has to be seen too.
+    mutable bool read_memo_valid_ = false;
+    mutable ReadMarker read_memo_marker_;
+    mutable bool read_memo_result_ = false;
     sqlite3* db_ = nullptr;
 
     void initialize_schema();

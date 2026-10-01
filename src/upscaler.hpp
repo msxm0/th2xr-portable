@@ -35,6 +35,23 @@ public:
     // Composite the art and overlay layers to the window backbuffer.
     virtual void present() = 0;
 
+    // Which of the optional layers hold anything this frame.  A layer that
+    // does not is neither composited nor cleared - each of those is a pass
+    // over every pixel of the screen, which a phone pays for in fill rate,
+    // and the authentic-text layer is empty whenever the outline font is
+    // in use.
+    void set_layer_content(bool authentic_text, bool sidebar)
+    {
+        authentic_text_content_ = authentic_text;
+        sidebar_content_ = sidebar;
+    }
+
+protected:
+    bool authentic_text_content_ = true;
+    bool sidebar_content_ = true;
+
+public:
+
     // Recreate all owned render targets (e.g. after a GPU device reset).
     virtual void reset() = 0;
 

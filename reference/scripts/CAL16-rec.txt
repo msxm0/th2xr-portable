@@ -1,0 +1,12 @@
+# Synthetic: the steady route to the March 2nd day-change calendar (it goes
+# up at tick 45335), then a single click on its sixteenth frame - the frame
+# its fade-in completes - and the steady clicks again well after.  Measures
+# whether that click dismisses the page (see game_map.cpp, the calendar's
+# dismiss gate).
+1 move 400 403
+30 every 30 lclick 3 until 45340
+30 every 1 num1
+30 every 1 mappick
+45351 lclick 3
+45390 every 30 lclick 3
+# End of recording at tick 48000.

@@ -117,6 +117,7 @@ void Game::reset_play_state()
 
     message_ = th2::Message{};
     message_visible_ = true;
+    window_hidden_ = false;
     message_ends_block_ = true;
     waiting_for_input_ = false;
     current_line_key_.clear();
@@ -136,7 +137,7 @@ void Game::reset_play_state()
 
     wake_time_.reset();
     audio_wait_.reset();
-    transition_.reset();
+    end_transition();
     back().br_flag = 0;
     screen_flash_.reset();
     shake_.reset();
@@ -170,7 +171,7 @@ void Game::start_new_game()
     reset_play_state();
     initialize_scenario_flags();
     direct_scenario_ = false;
-    load_script("EV_0301MORNING.SDT");
+    load_script(new_game_script);
     ui_mode_ = UiMode::game;
     advance();
 }

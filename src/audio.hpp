@@ -89,11 +89,16 @@ public:
 
 private:
     void open_stream();
+    // Plain PCM, converted without ffmpeg; `spent` says the budget is gone.
+    template <typename Spent>
+    bool decode_pcm(const Spent& spent, std::size_t target_samples);
 #ifdef __EMSCRIPTEN__
     // Ogg goes to the browser, which decodes it off this thread; what is left
     // on this one is a copy, sliced to the budget like everything else.
     bool decode_browser(std::chrono::nanoseconds budget,
                         std::size_t target_samples);
+    bool decode_streamed(std::chrono::nanoseconds budget,
+                         std::size_t target_samples);
 #endif
     struct State;
     std::unique_ptr<State> state_;

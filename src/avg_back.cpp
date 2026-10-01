@@ -78,6 +78,7 @@ void AvgBack::control_back_change()
 
     if (back_.fd_cnt >= back_max) {
         back_.fd_flag = 0;
+        set_draw_flag_on();   // MainWindow.draw_flag = 1;
 
         for (int i = 1; i < 4; ++i) {
             display_.reset_graph(grp_back + i);
@@ -919,6 +920,7 @@ void AvgBack::set_fade(int r, int g, int b, int disp, int fade)
     fade_.disp = disp;
     fade_.flash = 0;
     fade_.fade = fade;
+    set_draw_flag_on();   // MainWindow.draw_flag = 1;
     // The rest of AVG_SetFade freezes the screen: DSP_GetDispBmp captures it
     // into BMP_DISP, GRP_DISP draws that at LAY_BACK, and every graph
     // without DSP_GetGraphBrightFlag is hidden for the duration.  Ours tints

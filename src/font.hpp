@@ -34,6 +34,9 @@ public:
     };
     static std::span<const BundledFont> bundled_fonts();
     float text_width(std::string_view text) const;
+    // Changes whenever configure() changes the face or size, so a caller
+    // can remember measurements and know when they went stale.
+    std::uint64_t generation() const { return generation_; }
     // Cumulative width at every glyph boundary of a line, measured once and
     // remembered.  Drawing a partially revealed line needs the left and right
     // edge of each glyph, and asking text_width() for a prefix per glyph
@@ -84,15 +87,17 @@ public:
     void set_exact_blend(GlExactBlend* blend);
 
 private:
+    std::uint64_t generation_ = 0;
     struct Modern;
     struct ExactGlyphs;
     std::unique_ptr<ExactGlyphs> exact_;
     // Returns false when the mask could not be composited, in which case the
-    // caller plots it.
+    // caller plots it.  `alpha` (0..255) stands in for a missing alpha_256
+    // on a layer target - see the definition.
     bool draw_mask_exact(
         SDL_Renderer* renderer, float x, float y, int width, int height,
         const std::uint8_t* bitmap, int red, int green, int blue,
-        int alpha_256) const;
+        int alpha_256, int alpha = -1) const;
     static constexpr int size = 24;
     static constexpr int width = 12;
     std::vector<std::uint8_t> data_;

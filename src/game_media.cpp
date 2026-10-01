@@ -582,11 +582,25 @@ void Game::play_voice(const th2::Event& event)
     } else if (vi_event_voice_no_ >= 0) {
         scenario = scenario / 100 * 100 + vi_event_voice_no_;
     }
+    // if(test==0) SetNovelMessageVoice1( sno, vno, cno, a_cut ): the log
+    // entry the next message makes remembers this voice, whether or not it
+    // turns out to play.  VC is the a_cut form.
+    msg().set_novel_message_voice1(
+        scenario, voice, character, event.instruction.name == "VC" ? 1 : 0);
     const auto standard_name = std::format(
         "K{:09d}_{:03d}{:03d}.OGG", scenario, voice, character);
     auto name = standard_name;
     auto& voice_channel = voice_channels_[channel];
     voice_channel.stop();
+    //     if( skip_voice || Avg.voice==0
+    //         || (AVG_GetMesCut() && Avg.demo==0 && test==0) ) return;
+    // A line being skipped is not voiced at all - AVG_StopVoice above has
+    // already cut whatever was playing, and nothing new starts.
+    if (message_cut() && !demo_mode_) {
+        voice_sound_[channel] = -1;
+        voice_loop_[channel] = false;
+        return;
+    }
     if (runtime_.flag(5) == 0) {
         const auto alternate_name = std::format(
             "K{:09d}_{:03d}{:03d}A.OGG",
@@ -617,6 +631,44 @@ void Game::play_voice(const th2::Event& event)
     voice_scenario_[channel] = scenario;
     voice_volume_[channel] = volume;
     voice_loop_[channel] = loop;
+}
+
+void Game::play_log_voice(int character, int scenario, int voice, bool a_cut)
+{
+    // AVG_PlayVoice( 0, cno, sno, vno, 255, 0, a_cut, 1 ), from a click on a
+    // voiced line in the engine's log.  test==1, so nothing is logged again.
+    trace_note_audio("voice", 0, character, scenario, voice);
+    auto& voice_channel = voice_channels_[0];
+    voice_channel.stop();
+    const auto standard_name = std::format(
+        "K{:09d}_{:03d}{:03d}.OGG", scenario, voice, character);
+    auto name = standard_name;
+    if (runtime_.flag(5) == 0) {
+        const auto alternate_name = std::format(
+            "K{:09d}_{:03d}{:03d}A.OGG", scenario, voice, character);
+        if (voice_archive_.find(alternate_name)) {
+            name = alternate_name;
+        } else if (a_cut) {
+            voice_sound_[0] = -1;
+            voice_loop_[0] = false;
+            return;
+        }
+    }
+    const auto* voice_entry = voice_archive_.find(name);
+    if (!voice_entry) {
+        voice_sound_[0] = -1;
+        voice_loop_[0] = false;
+        return;
+    }
+    trace_note_audio("voicefile", 0, 0, 255, 0, name.c_str());
+    voice_channel.play_streaming(
+        ready_audio_decoder(voice_archive_, voice_entry->name), false,
+        voice_gain(255, character));
+    voice_sound_[0] = voice;
+    voice_character_[0] = character;
+    voice_scenario_[0] = scenario;
+    voice_volume_[0] = 255;
+    voice_loop_[0] = false;
 }
 
 void Game::replay_backlog_voice(const Game::BacklogVoice& voice)
@@ -885,9 +937,12 @@ void Game::set_background(const th2::Event& event, bool keep_characters)
         std::filesystem::path(name).replace_extension(".amp").string();
     background_tone_curve_ =
         graphics_.find(curve_name) ? curve_name : std::string{};
+    // Decoded ahead if the scan saw it coming - the LZS unpack of an 800x600
+    // background was a 10-25 ms frame at every scene change.
     load_background_bitmap(load_toned_texture(
         renderer_, backgrounds_, name, graphics_,
-        background_tone_curves()));
+        background_tone_curves(), nullptr,
+        take_predecoded_image(true, name)));
     if (keep_characters) {
         reload_character_textures();
     }
@@ -910,9 +965,10 @@ void Game::set_cg(
     };
     background_scroll_.reset();
     update_background_sakura(visual, false);
+    const auto cg = std::format("{}{:06d}.tga", prefix, visual);
     load_background_bitmap(load_toned_texture(
-        renderer_, graphics_, std::format("{}{:06d}.tga", prefix, visual),
-        graphics_, background_tone_curves()));
+        renderer_, graphics_, cg, graphics_, background_tone_curves(),
+        nullptr, take_predecoded_image(false, cg)));
     auto& unlocked = kind == BackgroundKind::visual
         ? unlocked_visual_cgs_ : unlocked_h_cgs_;
     if (unlocked.emplace(visual).second) {

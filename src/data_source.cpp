@@ -85,8 +85,12 @@ EM_JS(void, th2InitPrefetchStore, (), {
         const store = {entries: new Map(), bytes: 0, queue: [], active: 0,
                        counter: 0};
         // Prefetches are guesses, and a wrong guess must not be able to push
-        // the tab out of memory.
-        store.budget = 256 * 1024 * 1024;
+        // the tab out of memory - least of all on a phone, where the tab's
+        // whole allowance can be less than this plus the engine's heap.
+        // navigator.deviceMemory is the device's RAM in GB, rounded and
+        // capped at 8; a browser that does not say gets the full budget.
+        const ram = navigator.deviceMemory || 8;
+        store.budget = (ram <= 2 ? 64 : ram <= 4 ? 128 : 256) * 1024 * 1024;
         // Speculative requests in flight at once.  A browser keeps six
         // connections per origin on HTTP/1.1 and queues the rest itself, in
         // an order nothing can change afterwards; holding the guesses here
@@ -98,8 +102,7 @@ EM_JS(void, th2InitPrefetchStore, (), {
         // in one path out of four is how a budget quietly becomes unusable,
         // so there is only one path.
         store.release = (entry) => {
-            const key = entry.path + ":" + entry.offset + ":" + entry.size;
-            if (!store.entries.delete(key)) {
+            if (!store.entries.delete(entry.key)) {
                 return;  // Already gone; do not refund twice.
             }
             store.bytes -= entry.size;
@@ -117,8 +120,8 @@ EM_JS(void, th2InitPrefetchStore, (), {
                 // has been let go.  Cancelling on the first would throw away
                 // bytes the others are still waiting for.
                 const run = entry.run || [entry];
-                const wanted = run.some((member) => store.entries.has(
-                    member.path + ":" + member.offset + ":" + member.size));
+                const wanted = run.some(
+                    (member) => store.entries.has(member.key));
                 if (!wanted) {
                     try {
                         entry.abort.abort();
@@ -388,26 +391,31 @@ EM_JS(void, submit_prefetch, (const char* text), {
     const budget = store.budget;
     store.round = (store.round || 0) + 1;
     const lines = UTF8ToString(text);
-    const named = new Set();
 
+    // One line per range, "path:offset:size<TAB>depth", so the store's key is
+    // a slice of the line and nothing else is built for a range the store
+    // already holds - the common case, scan after scan.  Splitting each line
+    // into fields and joining a key back up made this the largest source of
+    // JS garbage in a session: half of everything allocated, and the major
+    // GCs that came with it.  Whether a range was named this round is the
+    // round stamp below, not a set of keys.
     let at = 0;
     while (at < lines.length) {
-        const stop = lines.indexOf("\n", at);
-        const line = lines.slice(at, stop < 0 ? lines.length : stop);
-        at = (stop < 0 ? lines.length : stop) + 1;
-        if (!line) {
+        let stop = lines.indexOf("\n", at);
+        if (stop < 0) {
+            stop = lines.length;
+        }
+        const tab = lines.indexOf("\t", at);
+        if (tab < 0 || tab >= stop) {
+            at = stop + 1;
             continue;
         }
-        const parts = line.split("\t");
-        if (parts.length < 4) {
-            continue;
+        const key = lines.slice(at, tab);
+        let depth = 0;
+        for (let i = tab + 1; i < stop; ++i) {
+            depth = depth * 10 + (lines.charCodeAt(i) - 48);
         }
-        const path = parts[0];
-        const offset = Number(parts[1]);
-        const size = Number(parts[2]);
-        const depth = parseInt(parts[3], 10);
-            const key = path + ":" + offset + ":" + size;
-        named.add(key);
+        at = stop + 1;
 
         const held = store.entries.get(key);
         if (held) {
@@ -417,6 +425,12 @@ EM_JS(void, submit_prefetch, (const char* text), {
             held.round = store.round;
             continue;
         }
+
+        const sizeColon = key.lastIndexOf(":");
+        const offsetColon = key.lastIndexOf(":", sizeColon - 1);
+        const path = key.slice(0, offsetColon);
+        const offset = Number(key.slice(offsetColon + 1, sizeColon));
+        const size = Number(key.slice(sizeColon + 1));
 
         // Make room, but only from ranges the script wants later than this
         // one.  Least urgent first; among equals the one whose generation has
@@ -450,8 +464,8 @@ EM_JS(void, submit_prefetch, (const char* text), {
         // let in against the same free space.
         store.bytes += size;
         store.counter = (store.counter || 0) + 1;
-        const entry = {body: null, path: path, offset: offset, size: size,
-                       keep: false, rank: depth, round: store.round,
+        const entry = {body: null, key: key, path: path, offset: offset,
+                       size: size, keep: false, rank: depth, round: store.round,
                        order: store.counter, started: false};
         entry.promise = new Promise((resolve) => { entry.settle = resolve; });
         store.entries.set(key, entry);
@@ -464,8 +478,7 @@ EM_JS(void, submit_prefetch, (const char* text), {
     // may still be useful if the player goes back.
     for (let i = store.queue.length - 1; i >= 0; --i) {
         const entry = store.queue[i];
-        const key = entry.path + ":" + entry.offset + ":" + entry.size;
-        if (entry.keep || entry.started || named.has(key)) {
+        if (entry.keep || entry.started || entry.round === store.round) {
             continue;
         }
         store.queue.splice(i, 1);
@@ -491,8 +504,8 @@ EM_JS(void, pin_prefetch,
     }
     store.bytes += size;
     store.counter = (store.counter || 0) + 1;
-    const entry = {body: null, path: path, offset: offset, size: size,
-                   keep: keep != 0, rank: 0, round: store.round,
+    const entry = {body: null, key: key, path: path, offset: offset,
+                   size: size, keep: keep != 0, rank: 0, round: store.round,
                    order: store.counter, started: false};
     entry.promise = new Promise((resolve) => { entry.settle = resolve; });
     store.entries.set(key, entry);

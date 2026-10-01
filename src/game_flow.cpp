@@ -122,6 +122,7 @@ bool Game::load_scheduled_script()
         "EV_{:02d}{:02d}{}.SDT", month, day, periods[time]));
     if (show_calendar) {
         begin_calendar(-1, -1);
+        calendar_state_->step = true;
     }
     return true;
 }
@@ -427,9 +428,29 @@ std::vector<std::string> Game::display_lines(std::string_view source) const
 {
     // The script's own line breaks are left exactly as written; this only
     // decides where a line too long for the area has to be broken.
-    return th2app::display_lines(
-        source, message_text_width(),
+    const float width = message_text_width();
+    const auto generation = font_.generation();
+    for (std::size_t i = 0; i < wrapped_text_.size(); ++i) {
+        auto& held = wrapped_text_[i];
+        if (held.generation == generation && held.width == width
+            && held.source == source) {
+            // Most recent first, so the message being typed out stays put.
+            std::rotate(wrapped_text_.begin(), wrapped_text_.begin() + i,
+                        wrapped_text_.begin() + i + 1);
+            return wrapped_text_.front().lines;
+        }
+    }
+    auto lines = th2app::display_lines(
+        source, width,
         [this](std::string_view text) { return font_.text_width(text); });
+    constexpr std::size_t remembered = 8;
+    if (wrapped_text_.size() >= remembered) {
+        wrapped_text_.pop_back();
+    }
+    wrapped_text_.insert(wrapped_text_.begin(),
+                         WrappedText{std::string(source), width, generation,
+                                     lines});
+    return lines;
 }
 
 float Game::message_text_x() const
@@ -554,22 +575,63 @@ void Game::control_select_window()
     // case 0 is where a key is read, and that is the next frame's switch.
     // Typing and answering in one pass took the number key a frame early -
     // hidden for as long as the options were one character too long.
+    const int options = static_cast<int>(choices_.size());
     if (!choice_reveal_finished()) {
+        th2::set_draw_flag_on();   // case 1: MainWindow.draw_flag=1;
         for (int step = 0; step < control_steps_; ++step) {
             choice_reveal_cnt_ += message_count_step();
         }
+        if (msg().engine_bar() && choice_reveal_finished()) {
+            // ...and on that same frame each option becomes a mouse rect on
+            // layer 0, slot 16+i:
+            //     len = min( 26, TXT_GetTextCount(SelectWindow.mes[i],0) );
+            //     MUS_SetMouseRect( 0, 16+i, 32, py + SYS_FONT*2 + 13*i+h,
+            //                       len*SYS_FONT, DSP_GetTextDispH(..), ON );
+            for (int i = 0; i < options; ++i) {
+                const auto counted = th2::txt_count_text(choice_engine_text(i));
+                const int len =
+                    std::min(26, th2::txt_get_text_count(counted, 0));
+                msg().set_mouse_rect(
+                    0, 16 + i, 32, static_cast<int>(choice_row_y(i)),
+                    len * th2::message_text_box.font,
+                    static_cast<int>(choice_row_height(i)), true);
+            }
+        }
         return;
     }
-    const int options = static_cast<int>(choices_.size());
+    // case 0.  With the engine bar the option under the pointer is the
+    // selection - lit in FCT_NORMAL, the rest FCT_GLAY - and a click
+    // answers it; a number key answers outright either way:
+    //     select = MUS_GetMouseNoEx( -1, 0 )-16;  click = GameKey.click;
+    //     for(j=0;j<mnum+1;j++) if(GameKey.num[j]){ select = j-1; click = 1; }
+    int select = -1;
+    bool click = false;
+    if (msg().engine_bar()) {
+        select = msg().mouse_no_ex(th2::mouse_any, 0) - 16;
+        if (select >= options) {
+            select = -1;
+        }
+        click = game_key_.click != 0;
+    }
     for (int j = 0; j <= options && j < 10; ++j) {
-        if (!game_key_.num[j]) {
-            continue;
+        if (game_key_.num[j]) {
+            select = j - 1;
+            click = true;
         }
-        const int select = j - 1;
-        if (select >= 0 && select < options) {
-            answer_choice(select);
+    }
+    if (msg().engine_bar()) {
+        choice_highlight_ = select;
+    }
+    if (click && select >= 0 && select < options) {
+        if (msg().engine_bar()) {
+            // AVG_ResetSelectWindow's MUS_ResetMouseRect( 0, 16+i ), and
+            //     Avg.msg_cut = OFF;
+            for (int i = 0; i < 10; ++i) {
+                msg().set_mouse_rect(0, 16 + i, 0, 0, 0, 0, false);
+            }
+            skip_held_ = false;
         }
-        break;
+        answer_choice(select);
     }
 }
 
@@ -598,6 +660,10 @@ void Game::enable_trace(
     std::uint64_t ticks, std::uint64_t first, std::uint64_t lead)
 {
     trace_mode_ = true;
+    // The engine's history bar and log in place of the port's: a trace is
+    // compared against the reference, and a recorded run that works the bar
+    // only means anything if the bar is the engine's.
+    msg().set_engine_bar(true);
     // The audio channels' own clock, so a fade advances with the tick
     // counter rather than with however fast this machine replays.  See
     // AudioChannel::set_clock: AVG_WaitBGM asks whether a fade has finished,
@@ -673,11 +739,14 @@ void Game::enable_trace(
     config_.se_volume = 256;
     config_.voice_volume = 256;
     config_.bgm_volume = 0;
-    // Avg.msg_cut_optin stays 0, which is where the reference's starts: a
-    // trace script never holds the skip key, and the setting is not only a
-    // key gate - it also picks the column the sidebar's skip button is drawn
-    // from, so raising it here put a lit icon where the reference has a dead
-    // one.
+    // Avg.msg_cut_optin 1, "skip unread text", which run/CONFIG.ini gives
+    // the reference too.  A trace starts from a fresh profile where nothing
+    // has been read, so with it off holding Ctrl did nothing at all - and a
+    // hand-recorded run wants to hurry through the scenes it is not about.
+    // The setting is not only a key gate: it also picks the column the
+    // sidebar's skip button is drawn from (lit rather than dead on an unread
+    // line), so the two sides have to agree on it, not merely both allow it.
+    config_.skip_unread = true;
     // Avg.side_option 0, which is what the reference runs: the bar fades by
     // 24 a frame toward 64 while the pointer is left of DISP_X-24 and back up
     // to 256 when it is not (GM_AvgMsg.cpp's GRP_HISTORY block).  Ours
@@ -722,7 +791,19 @@ std::string Game::trace_glyph_alpha() const
     // reached and no glyph goes by.  Ours has to agree about *when* there is
     // text as well as about what it looks like.
     if (!avg_msg_ || !message_visible_ || msg().state().disp == 0
-        || ui_mode_ != UiMode::game || message_.empty()) {
+        || ui_mode_ != UiMode::game || message_.empty()
+        // The engine's log hides TXT_WINDOW while an older entry is up.
+        || (msg().engine_bar() && !msg().main_text_disp())) {
+        return "-";
+    }
+    return trace_glyph_string();
+}
+
+std::string Game::trace_glyph_string() const
+{
+    // TXT_WINDOW's glyphs whether or not it is on screen: what a pass
+    // through DrawGraphText would report of it.
+    if (!avg_msg_ || message_.empty()) {
         return "-";
     }
     const auto shown = msg().visible_glyphs();
@@ -737,6 +818,22 @@ std::string Game::trace_glyph_alpha() const
         out.push_back(static_cast<char>(v < 10 ? '0' + v : 'a' + (v - 10)));
     }
     return out;
+}
+
+void Game::enable_recording(const std::filesystem::path& path,
+                            std::uint64_t from)
+{
+    if (!trace_mode_) {
+        throw std::runtime_error("--record needs trace mode");
+    }
+    if (from > 0 && trace_script_.size() == 0) {
+        throw std::runtime_error(
+            "--record-from needs a --trace-input to play up to it");
+    }
+    record_from_ = from;
+    recorder_.begin(path, from > 0 ? &trace_script_ : nullptr, from);
+    SDL_Log("record: writing %s, live from tick %llu", path.string().c_str(),
+            static_cast<unsigned long long>(from));
 }
 
 void Game::set_trace_hold(std::uint64_t tick, int seconds)
@@ -912,6 +1009,61 @@ void Game::trace_checkpoint_save()
         write_state_i32(file, static_cast<int>(visible.size()));
         file.write(visible.data(),
                    static_cast<std::streamsize>(visible.size()));
+        // The engine's log, its mouse rects and the bar's fade.  bmax alone
+        // decides where the log handle is drawn, so a resume without it put
+        // the handle at the bottom of an empty track.
+        msg().write_history(file);
+        // The map, the clock and the calendar.  load_body brings back the
+        // map's destinations but not the screen: a checkpoint that landed on
+        // a map resumed with the script let go past it, into the next scene.
+        // The steady route never hit this - it leaves every map within a few
+        // ticks - but a held skip key sits on one until something clicks.
+        write_state_i32(file, 0x5350414d);   // "MAPS"
+        write_state_i32(file, ui_mode_ == UiMode::map ? 1 : 0);
+        write_state_i32(file, script_ended_ ? 1 : 0);
+        write_state_i32(file, clock_state_ ? 1 : 0);
+        if (clock_state_) {
+            for (const int field : {clock_state_->target,
+                                    clock_state_->start_minutes,
+                                    clock_state_->target_minutes,
+                                    clock_state_->travel_frames,
+                                    clock_state_->frame}) {
+                write_state_i32(file, field);
+            }
+        }
+        write_state_i32(file, calendar_state_ ? 1 : 0);
+        if (calendar_state_) {
+            for (const int field : {calendar_state_->month,
+                                    calendar_state_->day,
+                                    calendar_state_->weekday,
+                                    calendar_state_->holiday,
+                                    calendar_state_->dismissing ? 1 : 0,
+                                    calendar_state_->frame,
+                                    calendar_state_->step ? 1 : 0}) {
+                write_state_i32(file, field);
+            }
+        }
+        for (const int field : {map_field_, map_previous_field_, map_hover_,
+                                map_slide_ticks_, map_arrow_pressed_,
+                                map_anim_frames_, map_sprite_start_,
+                                static_cast<int>(map_pointer_x_),
+                                static_cast<int>(map_pointer_y_),
+                                map_fade_ticks_, map_selected_,
+                                map_finish_pending_ ? 1 : 0,
+                                map_enter_ticks_,
+                                map_enter_finished_this_frame_ ? 1 : 0}) {
+            write_state_i32(file, field);
+        }
+        for (const bool on : map_rect_on_) {
+            write_state_i32(file, on ? 1 : 0);
+        }
+        // The settings the engine bar can change mid-run.  The rest of the
+        // config is pinned by enable_trace and the same on every run, but
+        // Avg.half_tone moves with the slider, and a resume that put it back
+        // to 64 darkened every scene after it by the wrong amount.
+        write_state_i32(file, 0x464e4f43);   // "CONF"
+        write_state_i32(file, config_.message_half_tone);
+        write_state_i32(file, th2::engine_draw_flag);
     }
     file.close();
     std::ofstream meta(checkpoint_meta(trace_save_file_));
@@ -1051,6 +1203,78 @@ void Game::trace_checkpoint_resume()
                 : std::nullopt;
             pending_sound_ages_ = std::move(sound_ages);
         }
+        // Appended last.  A checkpoint from before it was carried has the
+        // count the port's own backlog kept, which is all the handle needs.
+        if (!file || !msg().read_history(file)) {
+            msg().seed_history_depth(novel_log_depth());
+        }
+        if (file && read_state_i32(file) == 0x5350414d) {
+            const bool in_map = read_state_i32(file) != 0;
+            const bool ended = read_state_i32(file) != 0;
+            std::optional<ClockState> clock;
+            if (read_state_i32(file) != 0) {
+                ClockState c;
+                c.target = read_state_i32(file);
+                c.start_minutes = read_state_i32(file);
+                c.target_minutes = read_state_i32(file);
+                c.travel_frames = read_state_i32(file);
+                c.frame = read_state_i32(file);
+                clock = c;
+            }
+            std::optional<CalendarState> calendar;
+            if (read_state_i32(file) != 0) {
+                CalendarState c;
+                c.month = read_state_i32(file);
+                c.day = read_state_i32(file);
+                c.weekday = read_state_i32(file);
+                c.holiday = read_state_i32(file);
+                c.dismissing = read_state_i32(file) != 0;
+                c.frame = read_state_i32(file);
+                c.step = read_state_i32(file) != 0;
+                calendar = c;
+            }
+            std::array<int, 14> m{};
+            for (auto& field : m) {
+                field = read_state_i32(file);
+            }
+            std::array<bool, 16> rects{};
+            for (auto& on : rects) {
+                on = read_state_i32(file) != 0;
+            }
+            if (file) {
+                if (in_map) {
+                    // Textures and the screen, from the saved destinations;
+                    // then everything begin_map starts afresh, as it was.
+                    begin_map();
+                    map_field_ = m[0];
+                    map_previous_field_ = m[1];
+                    map_hover_ = m[2];
+                    map_slide_ticks_ = m[3];
+                    map_arrow_pressed_ = m[4];
+                    map_anim_frames_ = m[5];
+                    map_sprite_start_ = m[6];
+                    map_pointer_x_ = static_cast<float>(m[7]);
+                    map_pointer_y_ = static_cast<float>(m[8]);
+                    map_fade_ticks_ = m[9];
+                    map_selected_ = m[10];
+                    map_finish_pending_ = m[11] != 0;
+                    map_enter_ticks_ = m[12];
+                    map_enter_finished_this_frame_ = m[13] != 0;
+                    map_rect_on_ = rects;
+                }
+                script_ended_ = ended;
+                clock_state_ = clock;
+                calendar_state_ = calendar;
+            }
+        }
+        if (file && read_state_i32(file) == 0x464e4f43) {
+            const int half_tone = read_state_i32(file);
+            const int draw_flag = read_state_i32(file);
+            if (file) {
+                config_.message_half_tone = half_tone;
+                th2::engine_draw_flag = draw_flag;
+            }
+        }
     }
     global_count_ = global;
     trace_tick_ = tick;
@@ -1102,7 +1326,16 @@ void Game::trace_dump_state()
     // On the frame a choice is answered the glyphs were drawn and only then
     // hidden, which is what the reference records.  Every other frame
     // computes the string here as usual.
-    std::string glyphs = trace_glyph_alpha();
+    std::string glyphs = frame_undrawn_ ? std::string("-")
+                                        : trace_glyph_alpha();
+    // Not drawn, but measured: MSG_WAIT runs DSP_GetTextDispPos every frame
+    // for the click indicator, and the reference's probe sees that pass as
+    // a draw.  On the frame a click on the bar hides the window the measure
+    // has already happened, so the reference records the line anyway.
+    if (glyphs == "-" && !trace_glyph_measured_.empty()) {
+        glyphs = trace_glyph_measured_;
+    }
+    trace_glyph_measured_.clear();
     if (trace_choice_answered_) {
         if (glyphs == "-" && !trace_glyph_drawn_.empty()) {
             glyphs = trace_glyph_drawn_;
@@ -1160,7 +1393,11 @@ void Game::trace_apply_input()
     // The script is the only input.  Same file, same semantics as the
     // reference's th2ref_input.cpp: trg on the first tick of a press, btn
     // for its whole duration.
-    const auto state = trace_script_.at(trace_tick_);
+    // Recording: the player's hands, sampled for this tick and written out,
+    // so the file replays exactly what was played.  Before the hand-over,
+    // and always when replaying, the script.
+    const auto state = record_live() ? recorder_.sample(trace_tick_)
+                                     : trace_script_.at(trace_tick_);
     key_cond_ = {};
     key_cond_.trg_enter   = state.is_pressed("enter");
     key_cond_.btn_enter   = state.is_held("enter");
@@ -1182,6 +1419,9 @@ void Game::trace_apply_input()
     }
     trace_mouse_x_ = state.mouse_x;
     trace_mouse_y_ = state.mouse_y;
+    // MUS_RenewMouse, for the history bar and AVG_GetHitKey's rect test:
+    // the engine bar takes its rects, edges and repeats from this.
+    msg().renew_mouse(trace_mouse_x_, trace_mouse_y_, state.click_held);
     key_cond_.mouse_trg_left  = state.click;
     key_cond_.mouse_btn_left  = state.click_held;
     key_cond_.mouse_trg_right = state.cancel;
@@ -1235,6 +1475,16 @@ void Game::get_game_key()
 
 void Game::control_system2()
 {
+    // Not in AVG_CALENDER: AVG_Main runs only AVG_SetCalender there, and
+    // not on the frame the page goes up either (AVG_GAME's map==2 arm).  The
+    // skip key's latch stays as it was - measured over a day change
+    // mid-skip, where the reference kept Avg.msg_cut set for the ten ticks
+    // of the page after the key came up.  The frame ours releases the page
+    // on is already the engine's first AVG_GAME frame again, and by then
+    // calendar_state_ is gone.
+    if (calendar_state_ && calendar_state_->step) {
+        return;
+    }
     // void AVG_ControlSystem2( void ), the part that matters:
     //
     //     Avg.msg_cut = GameKey.mes_cut;
@@ -1261,13 +1511,21 @@ void Game::control_system2()
     if (game_key_.cansel || game_key_.diswin || game_key_.pup) {
         auto_mode_ = false;
     }
+    //     if( cansel && AVG_ConfigCheck() ){ ... AVG_GoConfig(0); }
+    // The engine's system menu, for the engine bar; normal play opens ours
+    // from the input handler instead.
+    if (msg().engine_bar() && game_key_.cansel && !engine_config_step_
+        && ui_mode_ == UiMode::game && engine_config_check()) {
+        engine_go_config(0);
+    }
 }
 
 void Game::play_system_se(int number, int volume)
 {
-    // AVG_PlaySE3( sno, volume ): the two sounds AVG_ControlNovelMessage
-    // makes - 9104 for a button and 9012 for the log.
-    play_se(0, number, false, volume);
+    // AVG_PlaySE3( sno, volume ): the sounds AVG_ControlNovelMessage and the
+    // system menu make - 9104 for a button and 9012 for the log.  It is
+    // AVG_PlaySE underneath, the unchannelled one, not AVG_PlaySE2's slot 0.
+    play_se(-1, number, false, volume);
 }
 
 void Game::skip(bool force_unread)

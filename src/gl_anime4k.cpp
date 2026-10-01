@@ -255,10 +255,10 @@ bool GlAnime4K::draw(
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glUniform1i(impl_->source_location, 0);
 
-    const GLboolean blend_was_on = glIsEnabled(GL_BLEND);
-    const GLboolean scissor_was_on = glIsEnabled(GL_SCISSOR_TEST);
-    GLint viewport[4] = {0, 0, 0, 0};
-    glGetIntegerv(GL_VIEWPORT, viewport);
+    // Nothing is saved to put back.  The SDL_FlushRenderer above marks SDL's
+    // cached GL state invalid, so it sets blend, scissor, viewport, program
+    // and textures again before its next draw - and a query per frame here,
+    // or a glGetError, is a round trip to the GPU process in WebGL.
     glDisable(GL_BLEND);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, output_width, output_height);
@@ -268,20 +268,10 @@ bool GlAnime4K::draw(
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindVertexArray(0);
-    if (blend_was_on) {
-        glEnable(GL_BLEND);
-    }
-    if (scissor_was_on) {
-        glEnable(GL_SCISSOR_TEST);
-    }
-    glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
-
-    // Put back what SDL expects to find; it caches this state rather than
-    // setting it per draw.
     glActiveTexture(GL_TEXTURE0);
     glUseProgram(0);
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-    return glGetError() == GL_NO_ERROR;
+    return true;
 }
 
 #else   // no GLES headers: a stub that is never available

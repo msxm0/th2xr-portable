@@ -4,12 +4,15 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/dict.h>
 #include <libavutil/samplefmt.h>
 #include <libswresample/swresample.h>
 }
 
 #include <algorithm>
 #include <cstring>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -17,99 +20,9 @@ extern "C" {
 #include <vector>
 
 #ifdef __EMSCRIPTEN__
-#include <emscripten.h>
+#include "audio_browser.hpp"
 
 namespace {
-
-// Ogg Vorbis decoded by the browser instead of by ffmpeg.
-//
-// ffmpeg builds a stream's Huffman tables on open - about six milliseconds,
-// atomic, and three times a frame's whole allowance for work nobody is
-// waiting on.  Across a playthrough that is thirty seconds of rebuilding the
-// same tables, because every voice line carries the same codebooks.
-// decodeAudioData does the whole job on a thread of the browser's choosing,
-// so none of it lands on the frame at all; what is left here is a memcpy,
-// which can be sliced.
-EM_JS(void, th2_audio_init, (), {
-    if (Module.__th2Audio) {
-        return;
-    }
-    var Context = window.AudioContext || window.webkitAudioContext;
-    Module.__th2Audio = {
-        context: Context ? new Context() : null,
-        next: 1,
-        pending: new Map(),
-    };
-});
-
-// The context's rate, which everything is resampled to on the way out, so the
-// engine can know a clip's rate before a sample of it has been decoded.
-EM_JS(int, th2_audio_rate, (), {
-    var audio = Module.__th2Audio;
-    return (audio && audio.context) ? audio.context.sampleRate | 0 : 0;
-});
-
-// Starts a decode and returns a handle, or 0 if the browser cannot take it.
-EM_JS(int, th2_audio_start, (const unsigned char* bytes, int size), {
-    var audio = Module.__th2Audio;
-    if (!audio || !audio.context) {
-        return 0;
-    }
-    // decodeAudioData detaches the buffer it is given, and this one is a view
-    // on the wasm heap, so it has to be a copy.
-    var copy = new Uint8Array(size);
-    copy.set(HEAPU8.subarray(bytes, bytes + size));
-    var handle = audio.next++;
-    var record = {state: 0, buffer: null};
-    audio.pending.set(handle, record);
-    audio.context.decodeAudioData(copy.buffer,
-        function (decoded) { record.buffer = decoded; record.state = 1; },
-        function () { record.state = -1; });
-    return handle;
-});
-
-// 0 still working, 1 ready, -1 failed.
-EM_JS(int, th2_audio_poll, (int handle, int* frames, int* channels), {
-    var audio = Module.__th2Audio;
-    var record = audio && audio.pending.get(handle);
-    if (!record) {
-        return -1;
-    }
-    if (record.state === 1) {
-        HEAP32[frames >> 2] = record.buffer.length;
-        HEAP32[channels >> 2] = record.buffer.numberOfChannels;
-    }
-    return record.state;
-});
-
-// Interleaves [first, first + count) into dest, which is float samples in the
-// wasm heap.
-EM_JS(void, th2_audio_copy,
-      (int handle, float* dest, int first, int count), {
-    var audio = Module.__th2Audio;
-    var record = audio && audio.pending.get(handle);
-    if (!record || record.state !== 1) {
-        return;
-    }
-    var buffer = record.buffer;
-    var channels = buffer.numberOfChannels;
-    var out = dest >> 2;
-    for (var c = 0; c < channels; ++c) {
-        var data = buffer.getChannelData(c);
-        var at = out + c;
-        for (var i = 0; i < count; ++i) {
-            HEAPF32[at] = data[first + i];
-            at += channels;
-        }
-    }
-});
-
-EM_JS(void, th2_audio_release, (int handle), {
-    var audio = Module.__th2Audio;
-    if (audio) {
-        audio.pending.delete(handle);
-    }
-});
 
 // Channels, from the Vorbis identification header, so the format is known
 // before the browser has finished.  The first packet of an Ogg stream is the
@@ -181,6 +94,70 @@ std::int64_t seek_packet(void* opaque, std::int64_t offset, int whence)
     return next;
 }
 
+// A RIFF/WAVE file whose audio is plain integer PCM: where the samples are
+// and how to read them.
+struct PlainPcm {
+    std::size_t offset = 0;
+    std::size_t size = 0;
+    int rate = 0;
+    int channels = 0;
+    int bits = 0;
+};
+
+std::uint32_t little32(const std::uint8_t* at)
+{
+    return static_cast<std::uint32_t>(at[0])
+        | static_cast<std::uint32_t>(at[1]) << 8
+        | static_cast<std::uint32_t>(at[2]) << 16
+        | static_cast<std::uint32_t>(at[3]) << 24;
+}
+
+std::optional<PlainPcm> plain_pcm(std::span<const std::uint8_t> bytes)
+{
+    if (bytes.size() < 12 || std::memcmp(bytes.data(), "RIFF", 4) != 0
+        || std::memcmp(bytes.data() + 8, "WAVE", 4) != 0) {
+        return std::nullopt;
+    }
+    PlainPcm pcm;
+    bool have_format = false;
+    std::size_t at = 12;
+    while (at + 8 <= bytes.size()) {
+        const auto* chunk = bytes.data() + at;
+        const std::size_t size = little32(chunk + 4);
+        const std::size_t body = at + 8;
+        if (std::memcmp(chunk, "fmt ", 4) == 0 && size >= 16
+            && body + 16 <= bytes.size()) {
+            const auto* f = bytes.data() + body;
+            const int tag = f[0] | f[1] << 8;
+            pcm.channels = f[2] | f[3] << 8;
+            pcm.rate = static_cast<int>(little32(f + 4));
+            const int align = f[12] | f[13] << 8;
+            pcm.bits = f[14] | f[15] << 8;
+            // Integer PCM, 8 or 16 bit, in the one layout the raw demuxers
+            // read; anything else keeps the wav demuxer.
+            if (tag != 1 || (pcm.bits != 8 && pcm.bits != 16)
+                || pcm.channels < 1 || pcm.channels > 2 || pcm.rate <= 0
+                || align != pcm.channels * pcm.bits / 8) {
+                return std::nullopt;
+            }
+            have_format = true;
+        } else if (std::memcmp(chunk, "data", 4) == 0) {
+            if (!have_format) {
+                return std::nullopt;
+            }
+            // As declared: decode_pcm() clamps it to the file, as the wav
+            // demuxer clamps a size that runs past the end, and a trailing
+            // chunk after the data stays out of the samples.  Not clamped
+            // here, because a head is parsed before the rest has arrived.
+            pcm.offset = body;
+            pcm.size = size;
+            return pcm;
+        }
+        at = body + size + (size & 1);  // chunks are word aligned
+    }
+    return std::nullopt;
+}
+
 AVCodecContext* open_codec(AVFormatContext* format, int stream)
 {
     const auto* parameters = format->streams[stream]->codecpar;
@@ -240,10 +217,28 @@ struct AudioDecoder::State {
     SwrContext* resampler = nullptr;
     int stream_index = -1;
     bool drained = false;
+    // Set for plain PCM, which is converted here and never opens ffmpeg.
+    std::optional<PlainPcm> pcm;
+    std::size_t pcm_at = 0;     // bytes into the data chunk
 #ifdef __EMSCRIPTEN__
     // Non-zero when the browser is decoding this one; ffmpeg is then untouched
     // and its fields stay null.
     int browser_handle = 0;
+    int browser_method = 0;     // th2_audio_method_of: 1 WebCodecs, 2 decodeAudioData
+    // Where a WebCodecs decode writes its samples, interleaved; null for
+    // decodeAudioData, whose samples are fetched with th2_audio_copy.  Not
+    // zero-filled: a track is tens of megabytes and the decoder writes every
+    // frame that is read back.
+    std::unique_ptr<float[]> browser_pcm;
+    std::size_t browser_pcm_frames = 0;   // room in browser_pcm
+
+    // A new handle starts with no buffer: decode_streamed() sizes it to what
+    // has been asked for.
+    void attach_browser_buffer(int)
+    {
+        browser_pcm.reset();
+        browser_pcm_frames = 0;
+    }
     int browser_frames = 0;
     int browser_copied = 0;
 #endif
@@ -304,17 +299,18 @@ AudioDecoder::AudioDecoder(std::vector<std::uint8_t> bytes, std::size_t ready)
     // below, so this is an optimisation rather than a dependency.
     if (looks_like_ogg(std::span(state.bytes).first(ready_))) {
         th2_audio_init();
-        const int rate = th2_audio_rate();
         const int channels =
             ogg_channels(std::span(state.bytes).first(ready_));
-        if (rate > 0 && channels > 0) {
+        if (channels > 0) {
             const int handle = th2_audio_start(
-                state.bytes.data(), static_cast<int>(ready_));
+                state.bytes.data(), static_cast<int>(ready_), 0);
             if (handle != 0) {
                 state.browser_handle = handle;
-                // The context resamples everything to its own rate on the way
-                // out, so that is the clip's rate whatever the file says.
-                clip_.sample_rate = rate;
+                state.browser_method = th2_audio_method_of(handle);
+                state.attach_browser_buffer(channels);
+                // WebCodecs keeps the file's rate; decodeAudioData resamples
+                // to the context's.  Either is known before any sample is.
+                clip_.sample_rate = th2_audio_rate_of(handle);
                 clip_.channels = channels;
                 return;
             }
@@ -323,10 +319,19 @@ AudioDecoder::AudioDecoder(std::vector<std::uint8_t> bytes, std::size_t ready)
 #endif
 
     if (head_only_) {
-        // The browser would not take it and ffmpeg cannot be given a
-        // truncated file, so there is nothing to start from yet.  The clip
-        // stays empty and supply_rest() opens it properly once the whole
-        // file is here.
+        // Plain PCM needs no container to be whole: what has arrived plays,
+        // and supply_rest() lets the conversion carry on.
+        if (const auto pcm = plain_pcm(std::span(state.bytes).first(ready_))) {
+            state.pcm = *pcm;
+            state.pcm_at = 0;
+            clip_.sample_rate = pcm->rate;
+            clip_.channels = pcm->channels;
+            return;
+        }
+        // Otherwise the browser would not take it and ffmpeg cannot be
+        // given a truncated file, so there is nothing to start from yet.  The
+        // clip stays empty and supply_rest() opens it properly once the
+        // whole file is here.
         return;
     }
     open_stream();
@@ -353,6 +358,9 @@ void AudioDecoder::supply_rest()
     const std::size_t head_samples = clip_.samples.size();
     ready_ = state.bytes.size();
     head_only_ = false;
+    if (state.pcm) {
+        return;     // decode_pcm() simply carries on past the head
+    }
     state.input.bytes = state.bytes;
 #ifdef __EMSCRIPTEN__
     if (state.browser_handle != 0) {
@@ -360,10 +368,13 @@ void AudioDecoder::supply_rest()
         state.browser_handle = 0;
     }
     if (looks_like_ogg(state.bytes)) {
+        // The decoder the head used, so the two halves share a rate.
         const int handle = th2_audio_start(
-            state.bytes.data(), static_cast<int>(state.bytes.size()));
+            state.bytes.data(), static_cast<int>(state.bytes.size()),
+            state.browser_method);
         if (handle != 0) {
             state.browser_handle = handle;
+            state.attach_browser_buffer(clip_.channels);
             // Start the copy where the head stopped rather than at zero.
             // The two decodes agree sample for sample over the bytes they
             // share, so what has already been handed to the device stays
@@ -389,6 +400,10 @@ void AudioDecoder::supply_rest()
 void AudioDecoder::open_stream()
 {
     auto& state = *state_;
+    // From the whole buffer, from the start: this also rebuilds a decoder
+    // whose input an earlier open narrowed or read part of.
+    state.input.bytes = state.bytes;
+    state.input.position = 0;
     state.frame = av_frame_alloc();
     state.packet = av_packet_alloc();
     if (!state.frame || !state.packet) {
@@ -408,7 +423,32 @@ void AudioDecoder::open_stream()
     state.format->pb = state.io;
     state.format->flags |= AVFMT_FLAG_CUSTOM_IO;
 
-    int result = avformat_open_input(&state.format, nullptr, nullptr, nullptr);
+    // Plain integer PCM never reaches ffmpeg.  Its wav demuxer asks
+    // find_stream_info to probe up to 32 packets of 16 bit PCM in case they
+    // are really AC-3 or DTS (handle_stream_probing in wavdec.c), and
+    // set_spdif reads another 64 KB for the same reason - 9-20 ms on
+    // whichever frame opened a sound effect.  The samples need no decoding:
+    // decode_pcm() does swresample's own conversion, exactly.
+    if (const auto pcm = plain_pcm(state.bytes)) {
+        state.pcm = *pcm;
+        state.pcm_at = 0;
+        clip_.sample_rate = pcm->rate;
+        clip_.channels = pcm->channels;
+        return;
+    }
+    // Otherwise the container is known from its first bytes, so ffmpeg is
+    // told rather than left to guess: an open with no format runs every
+    // demuxer's probe over the data, mp3 and mpegts among them.
+    const AVInputFormat* container = nullptr;
+    if (state.bytes.size() >= 4
+        && std::memcmp(state.bytes.data(), "OggS", 4) == 0) {
+        container = av_find_input_format("ogg");
+    } else if (state.bytes.size() >= 4
+               && std::memcmp(state.bytes.data(), "RIFF", 4) == 0) {
+        container = av_find_input_format("wav");
+    }
+    int result = avformat_open_input(
+        &state.format, nullptr, container, nullptr);
     if (result < 0) {
         throw ffmpeg_error("open audio", result);
     }
@@ -461,6 +501,9 @@ bool AudioDecoder::decode_browser(std::chrono::nanoseconds budget,
     if (budget <= std::chrono::nanoseconds::zero()) {
         return false;
     }
+    if (state.browser_method == 1) {
+        return decode_streamed(budget, target_samples);
+    }
     if (state.browser_frames == 0) {
         int frames = 0;
         int channels = 0;
@@ -475,6 +518,7 @@ bool AudioDecoder::decode_browser(std::chrono::nanoseconds budget,
             // which are still here.
             th2_audio_release(state.browser_handle);
             state.browser_handle = 0;
+            state.browser_pcm.reset();
             open_stream();
             return decode(budget, target_samples);
         }
@@ -505,9 +549,18 @@ bool AudioDecoder::decode_browser(std::chrono::nanoseconds budget,
         // and the slices already copied stay where they are.
         clip_.samples.resize(
             filled + static_cast<std::size_t>(count) * clip_.channels);
-        th2_audio_copy(
-            state.browser_handle, clip_.samples.data() + filled,
-            state.browser_copied, count);
+        if (state.browser_pcm) {
+            std::copy_n(
+                state.browser_pcm.get()
+                    + static_cast<std::size_t>(state.browser_copied)
+                        * clip_.channels,
+                static_cast<std::size_t>(count) * clip_.channels,
+                clip_.samples.data() + filled);
+        } else {
+            th2_audio_copy(
+                state.browser_handle, clip_.samples.data() + filled,
+                state.browser_copied, count);
+        }
         state.browser_copied += count;
         if (target_samples != 0
             && clip_.samples.size() >= target_samples
@@ -520,6 +573,7 @@ bool AudioDecoder::decode_browser(std::chrono::nanoseconds budget,
     }
     th2_audio_release(state.browser_handle);
     state.browser_handle = 0;
+    state.browser_pcm.reset();
     // A head that has been copied out in full is not a finished track: the
     // rest of the file is still coming.  Saying otherwise would let the
     // channel treat two and a half seconds as the whole thing and loop.
@@ -527,6 +581,157 @@ bool AudioDecoder::decode_browser(std::chrono::nanoseconds budget,
     return true;
 }
 #endif
+
+#ifdef __EMSCRIPTEN__
+// WebCodecs: decoded only as far as asked for, into browser_pcm, and copied
+// out as it arrives rather than once the whole stream is done.
+bool AudioDecoder::decode_streamed(std::chrono::nanoseconds budget,
+                                   std::size_t target_samples)
+{
+    auto& state = *state_;
+    const int channels_known = std::max(1, clip_.channels);
+    const int want = target_samples == 0
+        ? -1
+        : static_cast<int>((target_samples + channels_known - 1)
+                           / channels_known);
+    int frames = 0;
+    int channels = 0;
+    const int status = th2_audio_poll(state.browser_handle, &frames, &channels);
+    if (status < 0 || channels <= 0) {
+        // The browser would not take it after all; ffmpeg decodes the same
+        // stream at the same rate, from the bytes, which are still here.
+        th2_audio_release(state.browser_handle);
+        state.browser_handle = 0;
+        state.browser_method = 0;
+        state.browser_pcm.reset();
+        state.browser_pcm_frames = 0;
+        clip_.samples.clear();
+        state.browser_copied = 0;
+        open_stream();
+        return decode(budget, target_samples);
+    }
+    clip_.channels = channels;
+
+    // Room for what has been asked, not for the whole track: read-ahead
+    // wants two seconds, and a whole-track buffer and reservation for every
+    // decoder it holds - thirty megabytes each for a music track - grew the
+    // heap by hundreds of megabytes over a session.  Once most of a track
+    // is wanted, room for all of it at once, so it moves only the once.
+    const auto capacity = static_cast<std::size_t>(
+        std::max(0, th2_audio_capacity(state.browser_handle)));
+    constexpr std::size_t headroom = 65536;     // frames past the ask
+    std::size_t need = want < 0
+        ? capacity
+        : std::min(capacity, static_cast<std::size_t>(want) + headroom);
+    if (need > capacity / 4) {
+        need = capacity;
+    }
+    if (need > state.browser_pcm_frames) {
+        std::unique_ptr<float[]> grown(new float[need * channels]);
+        if (state.browser_pcm) {
+            std::copy_n(state.browser_pcm.get(),
+                        static_cast<std::size_t>(frames) * channels,
+                        grown.get());
+        }
+        state.browser_pcm = std::move(grown);
+        state.browser_pcm_frames = need;
+        th2_audio_attach(state.browser_handle, state.browser_pcm.get(),
+                         static_cast<int>(need));
+    }
+    if (clip_.samples.capacity() < need * channels) {
+        clip_.samples.reserve(need * channels);
+    }
+    th2_audio_want(state.browser_handle, want);
+    const auto started = std::chrono::steady_clock::now();
+    constexpr int slice = 8192;
+    while (state.browser_copied < frames) {
+        const int count = std::min(slice, frames - state.browser_copied);
+        const auto filled =
+            static_cast<std::size_t>(state.browser_copied) * channels;
+        clip_.samples.resize(
+            filled + static_cast<std::size_t>(count) * channels);
+        std::copy_n(state.browser_pcm.get() + filled,
+                    static_cast<std::size_t>(count) * channels,
+                    clip_.samples.data() + filled);
+        state.browser_copied += count;
+        if (target_samples != 0 && clip_.samples.size() >= target_samples
+            && !(status == 1 && state.browser_copied >= frames)) {
+            return true;
+        }
+        if (std::chrono::steady_clock::now() - started >= budget) {
+            break;
+        }
+    }
+    if (status != 1 || state.browser_copied < frames) {
+        // More to come, or more to copy: enough in hand counts as done for
+        // now, as it does for every other decoder.
+        return target_samples != 0 && clip_.samples.size() >= target_samples;
+    }
+    th2_audio_release(state.browser_handle);
+    state.browser_handle = 0;
+    state.browser_pcm.reset();
+    // A head copied out in full is not a finished track; see below.
+    done_ = !head_only_;
+    return true;
+}
+#endif
+
+template <typename Spent>
+bool AudioDecoder::decode_pcm(const Spent& spent, std::size_t target_samples)
+{
+    auto& state = *state_;
+    const auto& pcm = *state.pcm;
+    const std::size_t sample_bytes = static_cast<std::size_t>(pcm.bits) / 8;
+    const std::size_t frame_bytes = sample_bytes * pcm.channels;
+    // Whole frames only, as the PCM decoder takes them.
+    const std::size_t whole = std::min(
+        pcm.size, state.bytes.size() - std::min(pcm.offset, state.bytes.size()));
+    const std::size_t total = whole / frame_bytes * frame_bytes;
+    // A head plays as far as it has arrived; supply_rest() lets it go on.
+    const std::size_t arrived = ready_ > pcm.offset
+        ? std::min(total, (ready_ - pcm.offset) / frame_bytes * frame_bytes)
+        : 0;
+    const std::uint8_t* data = state.bytes.data() + pcm.offset;
+    constexpr std::size_t step_frames = 16384;
+    while (state.pcm_at < arrived) {
+        const std::size_t bytes =
+            std::min(arrived - state.pcm_at, step_frames * frame_bytes);
+        const std::uint8_t* at = data + state.pcm_at;
+        const std::size_t samples = bytes / sample_bytes;
+        const std::size_t base = clip_.samples.size();
+        clip_.samples.resize(base + samples);
+        float* out = clip_.samples.data() + base;
+        // swresample's conversions (audioconvert.c), which is what the
+        // ffmpeg route produced: s16 times 1/2^15, u8 less 0x80 times 1/2^7.
+        if (pcm.bits == 16) {
+            for (std::size_t i = 0; i < samples; ++i) {
+                const auto value = static_cast<std::int16_t>(
+                    at[2 * i] | at[2 * i + 1] << 8);
+                out[i] = value * (1.0f / (1 << 15));
+            }
+        } else {
+            for (std::size_t i = 0; i < samples; ++i) {
+                out[i] = (at[i] - 0x80) * (1.0f / (1 << 7));
+            }
+        }
+        state.pcm_at += bytes;
+        if (target_samples != 0 && clip_.samples.size() >= target_samples
+            && state.pcm_at < total) {
+            return true;
+        }
+        if (state.pcm_at < total && spent()) {
+            return false;
+        }
+    }
+    if (state.pcm_at < total) {
+        return false;   // the rest of the file is still coming
+    }
+    done_ = true;
+    if (clip_.samples.empty()) {
+        throw std::runtime_error("empty decoded audio");
+    }
+    return true;
+}
 
 bool AudioDecoder::decode(std::chrono::nanoseconds budget,
                           std::size_t target_samples)
@@ -551,6 +756,15 @@ bool AudioDecoder::decode(std::chrono::nanoseconds budget,
     const auto spent = [&] {
         return std::chrono::steady_clock::now() - started >= budget;
     };
+    if (state.pcm) {
+        return decode_pcm(spent, target_samples);
+    }
+    if (!state.format) {
+        // A head ffmpeg cannot open (not Ogg, not plain PCM) waits for the
+        // rest; reading packets from no stream was a crash, reached by
+        // playing a large effect before its bytes had all arrived.
+        return false;
+    }
 
     while (!state.drained) {
         if (av_read_frame(state.format, state.packet) < 0) {
@@ -561,9 +775,6 @@ bool AudioDecoder::decode(std::chrono::nanoseconds budget,
             int result = avcodec_send_packet(state.codec, state.packet);
             if (result < 0 && result != AVERROR(EAGAIN)) {
                 av_packet_unref(state.packet);
-        if (target_samples != 0 && clip_.samples.size() >= target_samples) {
-            return true;
-        }
                 throw ffmpeg_error("send audio packet", result);
             }
             while (result >= 0) {
@@ -580,6 +791,12 @@ bool AudioDecoder::decode(std::chrono::nanoseconds budget,
             }
         }
         av_packet_unref(state.packet);
+        // Enough in hand is not finished: read-ahead asks for two seconds,
+        // and the rest is decoded while it plays.  This check had slipped
+        // into the error branch above, where it never ran.
+        if (target_samples != 0 && clip_.samples.size() >= target_samples) {
+            return true;
+        }
         if (spent()) {
             return false;
         }

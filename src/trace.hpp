@@ -11,8 +11,10 @@
 // because neither side is allowed to look at a clock.
 
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace th2app {
@@ -24,6 +26,8 @@ namespace th2app {
 //     320 enter            a single-tick key press
 //     420 ctrl 90          a key held ninety ticks
 //     30 every 30 lclick 3 that click, repeated every thirty ticks forever
+//
+//     30 every 30 lclick 3 until 9000   ...but only on ticks before 9000
 //
 // `every` exists because a route is not a window.  Clicking through one takes
 // hundreds of thousands of ticks, and spelling that out one line per click
@@ -41,6 +45,10 @@ struct TraceEvent {
     // 0 is a one-shot.  Otherwise the event repeats every `period` ticks from
     // `tick` onwards, holding for `hold` out of every `period`.
     std::uint64_t period = 0;
+    // A repeat stops being in effect on this tick (0: never).  What a
+    // recording made on top of a scripted lead-in needs: the lead-in's
+    // clicking has to end where the player's hands take over.
+    std::uint64_t until = 0;
 };
 
 // What the script says is true on a given tick.
@@ -72,9 +80,68 @@ public:
     void load(const std::filesystem::path& path);
     TraceInputState at(std::uint64_t tick) const;
     std::size_t size() const { return events_.size(); }
+    const std::vector<TraceEvent>& events() const { return events_; }
 
 private:
+    // Sorted and split once, so a tick costs a binary search and the events
+    // actually in effect rather than a scan of every line.  A recorded run
+    // is thousands of pointer moves, and scanning all of them on every tick
+    // of a long replay is quadratic in its length.
+    void index();
     std::vector<TraceEvent> events_;
+    std::vector<TraceEvent> moves_;      // by tick
+    std::vector<TraceEvent> one_shots_;  // by tick
+    std::vector<TraceEvent> repeats_;
+    std::uint64_t longest_hold_ = 1;
+};
+
+// The script line an event is written as - the inverse of TraceScript::load.
+std::string format_trace_event(const TraceEvent& event);
+
+// Records live input as a script.  The game asks it, once a tick, what the
+// player's hands are doing (sample), and plays exactly that - so replaying
+// the file it writes gives the engine the same input on the same ticks.
+//
+// Per tick, a key or button is "pressed" if it went down since the last
+// tick and "held" if it is down now or went down since - the same two things
+// TraceScript::at reports for a "<tick> <key> <hold>" line, which is what a
+// press becomes once it is released.  The pointer is written as a move on
+// every tick it has changed since the last one.
+class TraceRecorder {
+public:
+    // Opens `path` and writes the events of `base` that fall before `from`,
+    // clipped there: the scripted lead-in the recording is made on top of.
+    // `from` 0 means no lead-in.
+    void begin(const std::filesystem::path& path, const TraceScript* base,
+               std::uint64_t from);
+    bool active() const { return file_ != nullptr; }
+
+    // Device changes between samples, in the 800x600 game space.
+    void pointer(int x, int y);
+    void key(std::string_view name, bool down);
+
+    TraceInputState sample(std::uint64_t tick);
+    // The pointer as the device events have left it, without sampling.
+    int x() const { return x_; }
+    int y() const { return y_; }
+    // Closes whatever is still held and the file.
+    void finish(std::uint64_t tick);
+    ~TraceRecorder();
+
+private:
+    void write(const TraceEvent& event);
+    struct Held {
+        std::string name;
+        std::uint64_t since = 0;
+    };
+    std::FILE* file_ = nullptr;
+    int x_ = 0, y_ = 0;
+    bool pointer_written_ = false;
+    int written_x_ = 0, written_y_ = 0;
+    std::vector<std::string> down_;      // physically down now
+    std::vector<std::string> went_down_; // pressed since the last sample
+    std::vector<Held> open_;             // recorded presses not yet released
+    std::uint64_t events_ = 0;
 };
 
 // Writes one frame in the reference's format: a text header line

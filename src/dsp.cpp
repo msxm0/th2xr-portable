@@ -752,6 +752,27 @@ void Display::get_disp_bmp(int bno)
 
 // --- graphs ------------------------------------------------------------
 
+void Display::set_graph_str(int gno, int bno, int lno, bool disp, int nuki,
+                            std::string str)
+{
+    // void DSP_SetGraphStr( int gno, int bno, int lno, int disp, int nuki,
+    // char *str ): set_graph's fields, PRM_STR, and a cell of the sheet as
+    // the size - dw = size.x/16, sw = size.x, dh = sh = size.y/4.
+    if (gno < 0 || gno >= graph_max) {
+        return;
+    }
+    set_graph(gno, bno, lno, disp, nuki);
+    Graph& graph = at(gno);
+    graph.type = GraphType::str;
+    int width = 0;
+    int height = 0;
+    get_bmp_size(bno, &width, &height);
+    graph.dw = width / 16;
+    graph.sw = width;
+    graph.dh = graph.sh = height / 4;
+    graph.str = std::move(str);
+}
+
 void Display::set_graph(int gno, int bno, int lno, bool disp, int nuki)
 {
     if (gno < 0 || gno >= graph_max) {
@@ -1745,10 +1766,34 @@ void Display::draw_one(
     case GraphType::bmp:
         draw_graph_bmp(graph, dest, global_x, global_y);
         break;
+    case GraphType::str: {
+        // DrawGraphStr: one blit per character, at dx + dw*i - the index
+        // counts every character, drawn or not - from cell j of the sheet.
+        Graph cell = graph;
+        cell.type = GraphType::bmp;
+        cell.poly = Poly::rect;
+        cell.zoom = 0;
+        const int cell_w = graph.sw / 16;
+        for (std::size_t i = 0; i < graph.str.size(); ++i) {
+            const char ch = graph.str[i];
+            if (ch < '!' || ch > '_') {
+                continue;
+            }
+            const int j = ch - ('!' - 1);
+            cell.dx = graph.dx + graph.dw * static_cast<int>(i);
+            cell.dw = graph.dw;
+            cell.dh = graph.dh;
+            cell.sx = graph.sx + cell_w * (j % 16);
+            cell.sy = graph.sy + graph.sh * (j / 16);
+            cell.sw = cell_w;
+            cell.sh = graph.sh;
+            draw_graph_bmp(cell, dest, global_x, global_y);
+        }
+        break;
+    }
     case GraphType::spr:
     case GraphType::dgt:
-    case GraphType::str:
-        // Sprites, digits and strings keep their existing paths.
+        // Sprites and digits keep their existing paths.
         break;
     default:
         draw_graph_prim(graph, dest, global_x, global_y);

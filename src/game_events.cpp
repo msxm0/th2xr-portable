@@ -75,6 +75,7 @@ bool Game::handle(const th2::Event& event)
             // through a background change.
             reset_half_tone();
             msg().set_novel_message_disp(false);
+            th2::set_draw_flag_on();   // AVG_ResetBackHalfTone: MainWindow.draw_flag = 1;
         }
         if (!split || opcode_phase_ == 2) {
             if (unchanged_direct) {
@@ -111,6 +112,7 @@ bool Game::handle(const th2::Event& event)
                 }
                 reset_half_tone();
                 msg().set_novel_message_disp(false);
+                th2::set_draw_flag_on();   // AVG_ResetBackHalfTone: MainWindow.draw_flag = 1;
             }
             if (!split || opcode_phase_ == 2) {
                 if (unchanged_direct) {
@@ -155,6 +157,7 @@ bool Game::handle(const th2::Event& event)
             }
             reset_half_tone();
             msg().set_novel_message_disp(false);
+            th2::set_draw_flag_on();   // AVG_ResetBackHalfTone: MainWindow.draw_flag = 1;
         }
         if (!split || opcode_phase_ == 2) {
             if (unchanged_direct) {
@@ -204,19 +207,25 @@ bool Game::handle(const th2::Event& event)
         // zero count SHAKE_SIN becomes SHAKE_SIN_SET and SHAKE_ALL_SIN
         // becomes SHAKE_ALL_SIN_SET, neither of which is in the list, so
         // neither hides anything.
-        if ((number(event, 0) == 0 || number(event, 0) == 6)
-            && number(event, 2) != 0) {
-            msg().set_novel_message_disp(false);
-        }
+        //
+        // Only once the shake has started, though: AVG_SetShake opens with
+        //     if(Avg.msg_cut) return FALSE;
+        // so under a held skip key there is no shake and the message stays
+        // up.  Hidden first regardless, it went for a frame mid-skip.
+        //
         // BOOL AVG_SetShake( type, pich, speed, dir, swing ).  The speed
         // stays the raw number the script wrote; AVG_EffCnt4 is re-asked on
         // every pass of AVG_ControlShake, so zero is an endless shake and a
         // held skip key ends any of them on the next pass.
-        avgback().set_shake(
+        const bool shaking = avgback().set_shake(
             number(event, 0), number(event, 1), std::max(0, number(event, 2)),
             number(event, 3),
             event.arguments.size() > 4 && number(event, 4) >= 0
                 ? number(event, 4) : 256);
+        if (shaking && (number(event, 0) == 0 || number(event, 0) == 6)
+            && number(event, 2) != 0) {
+            msg().set_novel_message_disp(false);
+        }
     } else if (name == "S") {
         begin_background_scroll(
             number(event, 0), number(event, 1), 800.0f, 600.0f,
@@ -307,6 +316,8 @@ bool Game::handle(const th2::Event& event)
     } else if (name == "SetWeatherMode") {
         weather_ = std::max<std::int32_t>(0, number(event, 0));
     } else if (name == "SetBmpEx") {
+        // AVG_LoadBmp ends with MainWindow.draw_flag=ON.
+        th2::set_draw_flag_on();
         if (const auto slot = overlay_index(number(event, 0))) {
             load_overlay(
                 *slot, text(event, 2), text(event, 6),
@@ -587,6 +598,9 @@ bool Game::handle(const th2::Event& event)
         waiting_for_input_ = true;
         message_ends_block_ = true;
         auto_next_time_.reset();
+    } else if (name == "Run") {
+        // EXEC_OprRun: ESC_SetDrawFlag(), MainWindow.draw_flag=ON.
+        th2::set_draw_flag_on();
     } else if (name == "W") {
         // Explicit no-op in the original.
     } else if (name == "M") {
@@ -924,6 +938,14 @@ bool Game::avg_wait_frame()
         // Recomputed every frame, not cached at set-up: that is what lets a
         // skip key taken mid-wait collapse AVG_EffCnt4 to zero and end it.
         const int wait_max = effect_frames4(wait_frame_.max);
+        //     if( WaitStruct.max==1 && AVG_GetMesCut() ){
+        //         if(MainWindow.draw_flag<0){ }else{ MainWindow.draw_flag=-10; }
+        //     }
+        // A one-frame wait skipped over stops the screen for ten frames.
+        if (wait_frame_.max == 1 && message_cut()
+            && th2::engine_draw_flag >= 0) {
+            th2::engine_draw_flag = -10;
+        }
         ++wait_frame_.count;
         if (wait_frame_.count >= wait_max) {
             wait_frame_.flag = 0;
@@ -1220,14 +1242,32 @@ void Game::exec_control_lang(bool skipping)
                 continue;
             }
 
+            const bool waiting =
+                latch < phases || opcode_waiting(kind, step.event);
+            // The cut belongs to the wait that asked for it, on this frame:
+            // AVG_WaitSe stops the sound from inside the check.  Applied on
+            // the next pass instead, the stop landed a tick after the
+            // reference's.
             if (se_cut_pending_) {
                 se_cut_pending_ = false;
                 if (audio_wait_) {
+                    // AVG_StopSE2( sno, 0 ), all of it: the stop is logged
+                    // like any other, and the channel is free again - the
+                    // engine clears SeStruct[sno].flag, so a later SEW on it
+                    // finds nothing playing.
+                    const auto channel = audio_wait_->channel;
+                    if (audio_wait_->kind == AudioWaitKind::sound_effect
+                        && channel < se_channels_.size()) {
+                        trace_note_audio(
+                            "sestop", static_cast<int>(channel), -1, 0, 0);
+                        se_sound_[channel] = -1;
+                        trace_sound_started_.erase(channel);
+                    }
                     waited_audio_channel().stop();
                     audio_wait_.reset();
                 }
             }
-            if (latch >= phases && !opcode_waiting(kind, step.event)) {
+            if (!waiting) {
                 latch = 0;            // EXEC_AddPC: run() already moved it
                 if (goto_title_pending_) {
                     // The engine never runs the End after a SetTitle - the

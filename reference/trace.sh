@@ -89,6 +89,9 @@ cd "$HERE/run" || exit 1
 # regenerated every run - not anybody's saved game.
 rm -f "$HERE/run/Sys.sav"
 stop_ref || exit 1
+# Whoever parks a reference says which one it is (window.sh); a fresh start
+# from here is nobody's until they do.
+rm -f /tmp/claude-1000/th2ref.running
 setsid wine th2ref.exe > /tmp/claude-1000/ref.log 2>&1 < /dev/null &
 disown
 

@@ -1,6 +1,7 @@
 #include "font.hpp"
 
 #include "dsp.hpp"
+#include "image.hpp"
 #include "texture.hpp"
 
 #include <SDL3_ttf/SDL_ttf.h>
@@ -475,6 +476,7 @@ void GameFont::configure(
     framebuffer_scale_ = scale;
     // Every cached measurement was taken with the old face and size.
     boundary_cache_.clear();
+    ++generation_;
 }
 
 namespace {
@@ -845,8 +847,18 @@ void GameFont::set_exact_blend(GlExactBlend* blend)
 bool GameFont::draw_mask_exact(
     SDL_Renderer* renderer, float x, float y, int width, int height,
     const std::uint8_t* bitmap, int red, int green, int blue,
-    int alpha_256) const
+    int alpha_256, int alpha) const
 {
+    // A caller with no engine alpha - the backlog, the save screens - used
+    // to plot the mask a point at a time instead: 16% of backlog frames
+    // over 8 ms with the bitmap font, every glyph and shadow a few hundred
+    // SDL_RenderPoint calls.  On a layer, which is normal play's text and
+    // is never compared, its 0..255 alpha stands in on the engine's scale.
+    // Into the picture nothing changes: that is what a trace reads.
+    if (alpha_256 < 0 && alpha >= 0
+        && th2::texture_is_premultiplied_layer(SDL_GetRenderTarget(renderer))) {
+        alpha_256 = (std::min(alpha, 255) * 256 + 127) / 255;
+    }
     if (!exact_ || !exact_->blend || !exact_->blend->available()
         || alpha_256 < 0 || width <= 0 || height <= 0) {
         return false;
@@ -860,14 +872,11 @@ bool GameFont::draw_mask_exact(
                            static_cast<float>(height)};
     const SDL_FRect destination{x, y, static_cast<float>(width),
                                 static_cast<float>(height)};
-    // A whole-target copy, deliberately.  Copying only the glyph's box is
-    // the obvious optimisation and it is wrong here in a way that is worth
-    // recording: with it the text composites to a solid block, because the
-    // fixed point of dst*(256-eff)/256 + ink*eff/256 is the ink and the
-    // shader was reading a destination that already held the glyph.  The
-    // full copy measured 400 of 400 ticks inside the gate where the sub-rect
-    // one failed 214.  Correct first; if this ever costs too much, the thing
-    // to fix is what the partial copy leaves stale, not this call.
+    // draw() copies only the glyph's box of the destination.  An earlier
+    // sub-rect copy composited the text to solid blocks - the fixed point of
+    // dst*(256-eff)/256 + ink*eff/256 is the ink - because it flipped the
+    // rows and so read a band of last frame's scratch that already held the
+    // glyph.  See GlExactBlend::Impl::copy_destination.
     return exact_->blend->capture_destination(renderer)
         && exact_->blend->draw(renderer, texture, source, destination,
                                false, false, 2, alpha_256, red, green, blue);
@@ -933,7 +942,7 @@ void GameFont::draw_bitmap_face(
             // is unavailable, which is every non-GLES build.
             if (!draw_mask_exact(
                     renderer, x, y, half_width, font_size, bitmap,
-                    red, green, blue, alpha_256)) {
+                    red, green, blue, alpha_256, alpha)) {
                 draw_glyph(
                     renderer, x, y, font_size, half_width, bitmap,
                     red, green, blue, alpha, alpha_256);
@@ -966,7 +975,7 @@ void GameFont::draw_bitmap_face(
                 // is unavailable, which is every non-GLES build.
                 if (!draw_mask_exact(
                         renderer, x, y, font_size, font_size, bitmap,
-                        red, green, blue, alpha_256)) {
+                        red, green, blue, alpha_256, alpha)) {
                     draw_glyph(
                         renderer, x, y, font_size, font_size, bitmap,
                         red, green, blue, alpha, alpha_256);
@@ -991,7 +1000,7 @@ void GameFont::draw_bitmap_face(
                 // is unavailable, which is every non-GLES build.
                 if (!draw_mask_exact(
                         renderer, x, y, half_width, font_size, bitmap,
-                        red, green, blue, alpha_256)) {
+                        red, green, blue, alpha_256, alpha)) {
                     draw_glyph(
                         renderer, x, y, font_size, half_width, bitmap,
                         red, green, blue, alpha, alpha_256);
@@ -1124,7 +1133,7 @@ void GameFont::draw_authentic_shadow(
                         size + shadow_width_ * 2, size + shadow_width_ * 2,
                         shadow_data_.data() + 4
                         + index * shadow_full_bytes,
-                        0, 0, 0, alpha_256)) {
+                        0, 0, 0, alpha_256, alpha)) {
                     draw_shadow_mask(
                         renderer, x - shadow_width_ + 1.0f, y - shadow_width_ + 1.0f,
                         size + shadow_width_ * 2, size + shadow_width_ * 2,
@@ -1145,7 +1154,7 @@ void GameFont::draw_authentic_shadow(
                         width + shadow_width_ * 2, size + shadow_width_ * 2,
                         shadow_data_.data() + shadow_ascii_offset
                         + index * shadow_half_bytes,
-                        0, 0, 0, alpha_256)) {
+                        0, 0, 0, alpha_256, alpha)) {
                     draw_shadow_mask(
                         renderer, x - shadow_width_ + 1.0f, y - shadow_width_ + 1.0f,
                         width + shadow_width_ * 2, size + shadow_width_ * 2,

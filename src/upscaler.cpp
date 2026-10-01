@@ -1,6 +1,7 @@
 #include "upscaler.hpp"
 
 #include "gl_anime4k.hpp"
+#include "image.hpp"
 
 #include <string_view>
 
@@ -72,7 +73,7 @@ public:
         if (!authentic_text_) {
             throw std::runtime_error(SDL_GetError());
         }
-        SDL_SetTextureBlendMode(authentic_text_.get(), SDL_BLENDMODE_BLEND);
+        th2::make_premultiplied_layer(authentic_text_.get());
         SDL_SetTextureScaleMode(authentic_text_.get(), SDL_SCALEMODE_LINEAR);
     }
 
@@ -123,10 +124,14 @@ public:
         if (!(anime4k_ && anime4k_->draw(renderer_, art_.get(), destination))) {
             SDL_RenderTexture(renderer_, art_.get(), nullptr, &destination);
         }
-        SDL_RenderTexture(
-            renderer_, authentic_text_.get(), nullptr, &destination);
+        if (authentic_text_content_) {
+            SDL_RenderTexture(
+                renderer_, authentic_text_.get(), nullptr, &destination);
+        }
         SDL_RenderTexture(renderer_, overlay_.get(), nullptr, &destination);
-        SDL_RenderTexture(renderer_, sidebar_.get(), nullptr, &destination);
+        if (sidebar_content_) {
+            SDL_RenderTexture(renderer_, sidebar_.get(), nullptr, &destination);
+        }
     }
 
 private:
@@ -151,7 +156,7 @@ private:
         if (!overlay_) {
             throw std::runtime_error(SDL_GetError());
         }
-        SDL_SetTextureBlendMode(overlay_.get(), SDL_BLENDMODE_BLEND);
+        th2::make_premultiplied_layer(overlay_.get());
         SDL_SetTextureScaleMode(overlay_.get(), SDL_SCALEMODE_LINEAR);
         sidebar_.reset(SDL_CreateTexture(
             renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET,
@@ -159,7 +164,7 @@ private:
         if (!sidebar_) {
             throw std::runtime_error(SDL_GetError());
         }
-        SDL_SetTextureBlendMode(sidebar_.get(), SDL_BLENDMODE_BLEND);
+        th2::make_premultiplied_layer(sidebar_.get());
         SDL_SetTextureScaleMode(sidebar_.get(), SDL_SCALEMODE_LINEAR);
         overlay_width_ = width;
         overlay_height_ = height;

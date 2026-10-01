@@ -1,5 +1,7 @@
 #include "anime4k.hpp"
 
+#include "image.hpp"
+
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -109,6 +111,7 @@ struct Anime4K::Impl {
         const auto formats = SDL_GetGPUShaderFormats(device);
         art = target(800, 600);
         authentic_text = target(800, 600);
+        th2::make_premultiplied_layer(authentic_text.get());
         if (formats & SDL_GPU_SHADERFORMAT_SPIRV) {
             make_state(load_shader(
                 shader_dir / "apply.frag.spv",
@@ -179,7 +182,7 @@ struct Anime4K::Impl {
         if (!overlay) {
             throw std::runtime_error(SDL_GetError());
         }
-        SDL_SetTextureBlendMode(overlay.get(), SDL_BLENDMODE_BLEND);
+        th2::make_premultiplied_layer(overlay.get());
         SDL_SetTextureScaleMode(overlay.get(), SDL_SCALEMODE_LINEAR);
         sidebar.reset(SDL_CreateTexture(
             renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET,
@@ -187,13 +190,13 @@ struct Anime4K::Impl {
         if (!sidebar) {
             throw std::runtime_error(SDL_GetError());
         }
-        SDL_SetTextureBlendMode(sidebar.get(), SDL_BLENDMODE_BLEND);
+        th2::make_premultiplied_layer(sidebar.get());
         SDL_SetTextureScaleMode(sidebar.get(), SDL_SCALEMODE_LINEAR);
         overlay_width = width;
         overlay_height = height;
     }
 
-    void present()
+    void present(bool text_content, bool sidebar_content)
     {
         ensure_overlay();
         int output_width = 0;
@@ -218,10 +221,14 @@ struct Anime4K::Impl {
         SDL_SetGPURenderState(renderer, states[0]);
         SDL_RenderTexture(renderer, art.get(), nullptr, &destination);
         SDL_SetGPURenderState(renderer, nullptr);
-        SDL_RenderTexture(
-            renderer, authentic_text.get(), nullptr, &destination);
+        if (text_content) {
+            SDL_RenderTexture(
+                renderer, authentic_text.get(), nullptr, &destination);
+        }
         SDL_RenderTexture(renderer, overlay.get(), nullptr, &destination);
-        SDL_RenderTexture(renderer, sidebar.get(), nullptr, &destination);
+        if (sidebar_content) {
+            SDL_RenderTexture(renderer, sidebar.get(), nullptr, &destination);
+        }
     }
 };
 
@@ -266,7 +273,7 @@ SDL_Texture* Anime4K::sidebar_target()
 
 void Anime4K::present()
 {
-    impl_->present();
+    impl_->present(authentic_text_content_, sidebar_content_);
 }
 
 void Anime4K::reset()

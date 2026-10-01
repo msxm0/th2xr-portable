@@ -2,6 +2,13 @@
 # Compare one window at a time against a reference that is never restarted.
 #
 #   reference/window.sh [--window N] [--stride N] [--at TICK] [--to TICK]
+#                       [--out DIR] [--pair NAME]
+#
+# --pair picks the input scripts, scripts/NAME-ours.txt and NAME-ref.txt.
+# The default, "opening", is the steady auto-click route and is regenerated
+# by make_pair.py on every run; any other pair is used as it stands - a
+# recording (reference/record.sh) is one.  Give each pair its own --out: the
+# checkpoints and the parked reference belong to one script.
 #
 # The reference is started once and left running, held at a window boundary by
 # shim/th2ref_state.cpp's pause_at_window().  It is never resumed from a save,
@@ -19,6 +26,7 @@ STRIDE=3000
 AT=
 LAST=2000000
 OUT=/home/msx/Dokumenty/th2wasm/traces
+PAIR=opening
 while [ $# -gt 0 ]; do
     case "$1" in
         --window) WINDOW="$2"; shift 2;;
@@ -26,6 +34,7 @@ while [ $# -gt 0 ]; do
         --at)     AT="$2"; shift 2;;
         --to)     LAST="$2"; shift 2;;
         --out)    OUT="$2"; shift 2;;
+        --pair)   PAIR="$2"; shift 2;;
         *) echo "window.sh: unknown option $1" >&2; exit 2;;
     esac
 done
@@ -46,18 +55,44 @@ STOP=$((AT + WINDOW - 1))
 [ "$STOP" -gt "$LAST" ] && STOP=$LAST
 if [ "$AT" = 0 ]; then CMP_FROM=0; else CMP_FROM=$((AT + STRIDE)); fi
 
-python3 "$HERE/scripts/make_pair.py" opening --repeat >/dev/null || exit 2
+OURS_SCRIPT="$HERE/scripts/$PAIR-ours.txt"
+REF_SCRIPT="$HERE/scripts/$PAIR-ref.txt"
+if [ "$PAIR" = opening ]; then
+    python3 "$HERE/scripts/make_pair.py" opening --repeat >/dev/null || exit 2
+fi
+[ -f "$OURS_SCRIPT" ] && [ -f "$REF_SCRIPT" ] || {
+    echo "window.sh: no $PAIR-ours.txt / $PAIR-ref.txt in scripts/" >&2; exit 2; }
+
+# A parked reference belongs to one script and one output directory - it
+# reads its pause file and writes its trace there.  Released under another
+# pair it would run the wrong input, and under another --out it would never
+# see the pause file at all; either way the wait below stalls or, worse,
+# compares against the wrong run.  So it is only reused if it was started
+# for exactly this pair into exactly this directory.
+MARK=/tmp/claude-1000/th2ref.running    # "<ref script>|<out dir>", see trace.sh
+WANT="$REF_SCRIPT|$OUT"
+if pgrep -x th2ref.exe >/dev/null && [ "$(cat "$MARK" 2>/dev/null)" != "$WANT" ]; then
+    echo "== the running reference is for another pair or directory; restarting"
+    pkill -x th2ref.exe
+    for _ in $(seq 1 50); do pgrep -x th2ref.exe >/dev/null || break; sleep 0.1; done
+    pkill -9 -x th2ref.exe 2>/dev/null
+    sleep 0.5
+fi
 
 # The reference, started once and thereafter only released.
 if ! pgrep -x th2ref.exe >/dev/null; then
+    # trace.sh takes the reference's last tick: ours plus its lead-in.
     echo "== starting the reference (once)"
     rm -f "$OUT/ref/state.txt"
     echo $((STOP + OFFSET + 2)) > "$PAUSE"
     TH2REF_PAUSE_FILE="Z:${PAUSE//\//\\}" TH2REF_PAUSE_AT=$((STOP + OFFSET + 2)) \
     TH2REF_FROM="${TH2REF_FROM:-999999999}" \
-        setsid nohup bash "$HERE/trace.sh" "$HERE/scripts/opening-ref.txt" \
-        "$OUT/ref" "$LAST" 99999 >/tmp/claude-1000/window-ref.log 2>&1 &
+        setsid nohup bash "$HERE/trace.sh" "$REF_SCRIPT" \
+        "$OUT/ref" "$((LAST + OFFSET + 2))" 99999 >/tmp/claude-1000/window-ref.log 2>&1 &
     disown
+    # trace.sh clears the marker as it starts wine; written once it has.
+    for _ in $(seq 1 100); do pgrep -x th2ref.exe >/dev/null && break; sleep 0.1; done
+    mkdir -p /tmp/claude-1000 && echo "$WANT" > "$MARK"
 else
     echo "== reference already running; releasing to $((STOP + OFFSET + 2))"
     echo $((STOP + OFFSET + 2)) > "$PAUSE"
@@ -94,7 +129,7 @@ rm -rf "$OUT/ours" "$OUT/profile"; mkdir -p "$OUT/ours" "$OUT/profile"
 cd "$ROOT" || exit 2
 XDG_DATA_HOME="$OUT/profile" "$OURS" --trace "$OUT/ours" \
     --trace-from "${TH2_TRACE_FROM:-999999999}" --trace-lead "$OFFSET" \
-    --trace-input "$HERE/scripts/opening-ours.txt" --trace-ticks "$STOP" \
+    --trace-input "$OURS_SCRIPT" --trace-ticks "$STOP" \
     "${our_args[@]}" \
     >/tmp/claude-1000/window-ours.log 2>&1 || {
         echo "window.sh: our engine failed - see /tmp/claude-1000/window-ours.log" >&2

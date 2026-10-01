@@ -157,6 +157,57 @@ void Game::reset_half_tone()
     msg().reset_half_tone();
 }
 
+void Game::draw_engine_text(const th2::EngineText& text)
+{
+    // A TEXT_STRUCT the way DrawGraphText draws one: laid out in the message
+    // box, every character at once (cnt and step are -1), and TXT_DrawText's
+    // two passes - every shadow, then every glyph - in FCT[color].
+    if (!text.flag || !text.disp || text.str.empty()) {
+        return;
+    }
+    // text.cpp's FCT, the colours DSP_SetTextColor indexes - RGB32, which
+    // is {b, g, r, a}: FCT[10], the log, is orange and FCT[11] a sea green.
+    static constexpr std::array<std::array<std::uint8_t, 3>, 18> fct{{
+        {255, 255, 255}, {192, 192, 192}, {80, 80, 80}, {0, 0, 0},
+        {0, 0, 255}, {0, 255, 0}, {255, 0, 0}, {0, 255, 255},
+        {255, 255, 0}, {255, 0, 255}, {0, 128, 255}, {128, 255, 0},
+        {255, 0, 128}, {0, 255, 128}, {255, 128, 0}, {128, 0, 255},
+        {223, 230, 172}, {255, 225, 197},
+    }};
+    const auto& rgb = fct[static_cast<std::size_t>(
+        std::clamp(text.color, 0, static_cast<int>(fct.size()) - 1))];
+    auto box = th2::message_text_box;
+    box.sx = text.x;
+    box.sy = text.y;
+    const auto layout = th2::txt_count_text(text.str, box);
+    if (font_.authentic()) {
+        begin_authentic_text();
+    }
+    const std::string_view source = text.str;
+    for (int pass = 0; pass < 2; ++pass) {
+        for (std::size_t i = 0;
+             i < layout.glyph_x.size() && i < layout.glyph_off.size(); ++i) {
+            const auto begin = static_cast<std::size_t>(layout.glyph_off[i]);
+            if (begin >= source.size()) {
+                break;
+            }
+            const auto glyph =
+                source.substr(begin, utf8_prefix_bytes(source.substr(begin), 1));
+            const auto gx = static_cast<float>(layout.glyph_x[i]);
+            const auto gy = static_cast<float>(layout.glyph_y[i]);
+            if (pass == 0) {
+                font_.draw_authentic_shadow(renderer_, gx, gy, glyph, 255, 256);
+            } else {
+                font_.draw(renderer_, gx, gy, glyph, rgb[2], rgb[1], rgb[0],
+                           255, 256);
+            }
+        }
+    }
+    if (font_.authentic()) {
+        select_overlay();
+    }
+}
+
 void Game::raise_half_tone()
 {
     // AVG_SetHalfTone(), in avg_msg.cpp.
@@ -177,7 +228,7 @@ void Game::update_half_tone()
 
 bool Game::handle_message_scroll_press(float x, float y)
 {
-    if (ui_mode_ != UiMode::game || !message_visible_ || message_.empty()
+    if (ui_mode_ != UiMode::game || !message_shown() || message_.empty()
         || !on_scrollbar(x, y)
         || message_scroll_limit(
                display_lines(message_.visible()).size()) <= 0) {
@@ -211,6 +262,46 @@ bool Game::handle_backlog_scroll_press(float x, float y)
 // directly on the message plate, so every one of those edge pixels was a
 // level or two bright - and because it lands just past the end of the text
 // it looked for a long time like a glyph problem.
+std::vector<std::size_t> Game::engine_glyph_map(std::string_view visible) const
+{
+    const auto& counted = msg().counted();
+    const std::string_view raw = msg().raw();
+    const std::size_t glyphs = counted.glyph_off.size();
+    const auto glyph_text = [&](std::size_t k) {
+        const auto off = static_cast<std::size_t>(counted.glyph_off[k]);
+        if (off >= raw.size()) {
+            return std::string_view{};
+        }
+        return raw.substr(off, utf8_prefix_bytes(raw.substr(off), 1));
+    };
+    std::vector<std::size_t> map(visible.size(), glyphs);
+    std::size_t next = 0;
+    for (std::size_t at = 0; at < visible.size();) {
+        const auto bytes = std::max<std::size_t>(
+            1, utf8_prefix_bytes(visible.substr(at), 1));
+        const auto character = visible.substr(at, bytes);
+        // The engine's next glyph, or one a little further on if the two
+        // renderings disagree about a character or two in between.
+        std::size_t match = glyphs;
+        for (std::size_t k = next; k < std::min(glyphs, next + 4); ++k) {
+            if (glyph_text(k) == character) {
+                match = k;
+                break;
+            }
+        }
+        if (match < glyphs) {
+            map[at] = match;
+            next = match + 1;
+        } else {
+            // Not a glyph to the engine - a line break, say: it goes with
+            // the next one that is.
+            map[at] = next;
+        }
+        at += bytes;
+    }
+    return map;
+}
+
 bool Game::draw_keywait_sprite(
     SDL_Texture* texture, const SDL_FRect& source, const SDL_FRect& destination)
 {
@@ -250,7 +341,7 @@ void Game::draw_click_indicator()
     // GRP_KEYWAIT.  AVG_ControlNovelMessage puts it up in MSG_WAIT and
     // MSG_STOP and takes it down everywhere else, so this only has to say
     // where it goes.
-    if (!keywait_visible_ || !message_visible_ || message_.empty()) {
+    if (!keywait_visible_ || !message_shown() || message_.empty()) {
         return;
     }
     const bool end_of_block = keywait_page_end_;
@@ -286,9 +377,19 @@ void Game::draw_click_indicator()
     // would be drawn, which is the end of what has actually been revealed -
     // not the end of the string.  Taking it from the whole string left the
     // indicator floating past the text whenever the two disagreed.
-    const auto revealed = utf8_prefix_bytes(
-        message_.visible(), msg().visible_glyphs());
-    const auto lines = display_lines(message_.visible().substr(0, revealed));
+    const std::string_view visible_text = message_.visible();
+    const auto glyph_of = engine_glyph_map(visible_text);
+    const auto shown_glyphs = msg().visible_glyphs();
+    std::size_t revealed = 0;
+    for (std::size_t at = 0; at < visible_text.size();) {
+        const auto bytes = std::max<std::size_t>(
+            1, utf8_prefix_bytes(visible_text.substr(at), 1));
+        if (glyph_of[at] < shown_glyphs) {
+            revealed = at + bytes;
+        }
+        at += bytes;
+    }
+    const auto lines = display_lines(visible_text.substr(0, revealed));
     if (lines.empty()) return;
 
     // Sits on the row the last line actually occupies, which is not the last
@@ -385,6 +486,13 @@ void Game::select_sidebar()
 
 void Game::clear_sidebar()
 {
+    // In a trace the bar is drawn into the art buffer, which must keep the
+    // last frame like the engine's framebuffer; clearing it here was only
+    // ever hidden by the previous-frame copy that used to follow.
+    if (trace_mode_ || !sidebar_layer_used_) {
+        return;     // nothing there to clear
+    }
+    sidebar_layer_used_ = false;
     select_sidebar();
     SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
     SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 0);
@@ -394,6 +502,10 @@ void Game::clear_sidebar()
 
 void Game::clear_authentic_text()
 {
+    if (!text_layer_used_) {
+        return;     // nothing there to clear
+    }
+    text_layer_used_ = false;
     SDL_SetRenderTarget(renderer_, upscaler_->authentic_text_target());
     SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
     SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
@@ -415,6 +527,7 @@ void Game::begin_authentic_text()
         apply_text_shake();
         return;
     }
+    text_layer_used_ = true;
     SDL_SetRenderTarget(renderer_, upscaler_->authentic_text_target());
     SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
     apply_text_shake();
@@ -585,16 +698,6 @@ void Game::trace_dump_frame()
 
 void Game::present_frame()
 {
-    // Kept every frame, not only during a shake: the first frame of one has
-    // to find the frame before it already there.  One 800x600 blit, entirely
-    // on the GPU.
-    //
-    // The art layer only.  The engine's buffer holds the composited screen
-    // including its text, but ours keeps text on a separate monitor-
-    // resolution layer, and the uncovered region is at the screen edges
-    // where the text is redrawn in place every frame regardless.
-    capture_previous_frame(upscaler_->art_target());
-
     // The art layer is 800x600, which is exactly what the reference build
     // dumps out of MAIN_DrawGraph - so the two are directly comparable with
     // no scaling in between.  Text is deliberately left out: ours renders at
@@ -614,6 +717,7 @@ void Game::present_frame()
         // run can go is not a trade worth making.
     }
 
+    upscaler_->set_layer_content(text_layer_used_, sidebar_layer_used_);
     upscaler_->present();
 
     // ImGui is rendered directly to the window backbuffer using a capped
@@ -624,7 +728,21 @@ void Game::present_frame()
     SDL_SetRenderScale(renderer_, display_scale, display_scale);
     imgui_->render();
 
+#ifdef __EMSCRIPTEN__
+    // SDL's Emscripten swap yields to the browser with emscripten_sleep(0)
+    // on every present, "for screen refresh" - but this loop yields already,
+    // at the requestAnimationFrame wait straight after drawing, so that was a
+    // second hop per frame: a setTimeout task and a promise between one
+    // frame's present and the next one's wait.  Off for the present only:
+    // the same hint is what makes SDL_Delay sleep cooperatively, and off for
+    // good it turned SDL's own waits - the audio device's shutdown among
+    // them - into busy loops on the main thread.
+    SDL_SetHint(SDL_HINT_EMSCRIPTEN_ASYNCIFY, "0");
+#endif
     SDL_RenderPresent(renderer_);
+#ifdef __EMSCRIPTEN__
+    SDL_SetHint(SDL_HINT_EMSCRIPTEN_ASYNCIFY, "1");
+#endif
 }
 
 void Game::reset_render_state()
@@ -636,8 +754,10 @@ void Game::reset_render_state()
     shake_target_.reset();
     display().release_bmp(th2::bmp_back);
     background_baked_dirty_ = true;
-    previous_frame_.reset();
-    previous_frame_valid_ = false;
+    art_cleared_for_ = nullptr;
+    // New targets: whatever was on them is gone, so they get a first clear.
+    text_layer_used_ = true;
+    sidebar_layer_used_ = true;
     display().release_bmp(th2::bmp_backhalf);
     title_masked_.reset();
     if (imgui_) {
@@ -711,59 +831,6 @@ bool Game::ensure_pose_blend_target()
         pose_blend_target_.get(), SDL_BLENDMODE_BLEND_PREMULTIPLIED);
 }
 
-void Game::ensure_previous_frame()
-{
-    // Sized from the art target rather than from 800x600: both upscalers
-    // happen to author the scene at that size and magnify at present time,
-    // so the two agree today - but a capture that did not match would
-    // quietly resample the frame twice every frame, and that is not a
-    // failure anyone would see coming.
-    SDL_Texture* const art = upscaler_ ? upscaler_->art_target() : nullptr;
-    float width = 800.0f;
-    float height = 600.0f;
-    if (art) {
-        SDL_GetTextureSize(art, &width, &height);
-    }
-    if (previous_frame_) {
-        float held_width = 0.0f;
-        float held_height = 0.0f;
-        SDL_GetTextureSize(previous_frame_.get(), &held_width, &held_height);
-        if (held_width == width && held_height == height) {
-            return;
-        }
-        previous_frame_valid_ = false;
-    }
-    previous_frame_.reset(SDL_CreateTexture(
-        renderer_, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET,
-        static_cast<int>(width), static_cast<int>(height)));
-    if (previous_frame_) {
-        SDL_SetTextureBlendMode(previous_frame_.get(), SDL_BLENDMODE_NONE);
-        SDL_SetTextureScaleMode(previous_frame_.get(), SDL_SCALEMODE_NEAREST);
-    }
-    previous_frame_valid_ = false;
-}
-
-void Game::capture_previous_frame(SDL_Texture* art_target)
-{
-    ensure_previous_frame();
-    if (!previous_frame_ || !art_target) {
-        return;
-    }
-    // Called from present_frame(), where the scale is whatever the overlay
-    // pass left behind - and a scaled copy would capture a magnified corner
-    // of the frame rather than the frame.
-    float scale_x = 1.0f;
-    float scale_y = 1.0f;
-    SDL_GetRenderScale(renderer_, &scale_x, &scale_y);
-    SDL_SetRenderTarget(renderer_, previous_frame_.get());
-    SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
-    SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
-    SDL_RenderTexture(renderer_, art_target, nullptr, nullptr);
-    SDL_SetRenderScale(renderer_, scale_x, scale_y);
-    SDL_SetRenderTarget(renderer_, art_target);
-    previous_frame_valid_ = true;
-}
-
 void Game::ensure_shake_target()
 {
     if (shake_target_) {
@@ -827,9 +894,18 @@ void Game::rebuild_baked_background()
     // stayed hidden in its favour, and the screen went black under the text.
     // Taken now, from the plate with its characters in, as AVG_SetHalfTone
     // takes it; the graphs as that function leaves them for the step.
+    //
+    // Not under a calendar, though.  AVG_SetCalender's case 0 is
+    // AVG_ResetBack( 0 ): every background graph reset and every bitmap from
+    // BMP_BACK up released, while HalfTone.tstep is left saying "shown".
+    // Rebuilt from a plate that is not there, the wash came back as a black
+    // screen under the page - and the page fades in with DRW_BLD over
+    // whatever the last frame left, so over black it came up at 3/4
+    // brightness on its twelfth frame where the reference's was all but
+    // solid.
     const int tone_step = msg().check_half_tone_step();
     if ((tone_step == th2::tone_disp || tone_step == th2::tone_fadeout)
-        && !display().bmp_flag(th2::bmp_backhalf)) {
+        && !display().bmp_flag(th2::bmp_backhalf) && !calendar_state_) {
         build_half_tone_background();
         if (display().bmp_flag(th2::bmp_backhalf)) {
             const bool shown = tone_step == th2::tone_disp;
@@ -846,6 +922,7 @@ void Game::rebuild_baked_background()
 
 void Game::draw_frame()
 {
+
     // present() composites these two layers over the art on every path, so
     // they have to start empty here rather than in the game-mode branch
     // below: otherwise the last message and sidebar stay on screen after
@@ -907,12 +984,19 @@ void Game::draw_frame()
     // Done for every frame rather than only for shakes, because that is what
     // the engine does - the background simply covers the screen the rest of
     // the time, which is why it gets away with it.
-    if (previous_frame_valid_ && previous_frame_) {
-        SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
-        SDL_RenderTexture(renderer_, previous_frame_.get(), nullptr, nullptr);
-    } else {
+    //
+    // The art target already is that framebuffer.  A render target keeps
+    // its contents from one frame to the next, and nothing draws into it
+    // between one present and the next frame's drawing - everything else
+    // that touches it in between only reads - so it is simply drawn over.
+    // Copying it out at present and back here, as this once did, was two
+    // full-screen passes a frame for an identical picture: the largest GPU
+    // cost of a frame, which a phone pays in fill rate.  Only a target that
+    // has never been drawn is cleared, to the engine's black.
+    if (art_cleared_for_ != art_target) {
         SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
         SDL_RenderClear(renderer_);
+        art_cleared_for_ = art_target;
     }
     if (movie_) {
         movie_->draw();
@@ -987,7 +1071,14 @@ void Game::draw_frame()
     // GRP_BACK at LAY_BACK, with the shake's transform on it, and the
     // darkened copy next door at LAY_BACK+2 with the same transform.
     setup_background_graphs(shake, shake_background, shake_characters);
-    if (!display().bmp_flag(th2::bmp_back2) && bg_scene_ == 0) {
+    // Not under a calendar: AVG_SetCalender's AVG_ResetBack( 0 ) leaves no
+    // background at all, and the engine draws nothing where there is none -
+    // its framebuffer keeps the last frame, which is what the page's
+    // DRW_BLD( count*16 ) fade-in builds up on.  Painted black here instead,
+    // every frame of the fade was the page over black: 3/4 brightness on its
+    // twelfth frame, where the reference's was all but solid.
+    if (!display().bmp_flag(th2::bmp_back2) && bg_scene_ == 0
+        && !calendar_state_) {
         SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
         const SDL_FRect game_area{0.0f, 0.0f, 800.0f, 600.0f};
         SDL_RenderFillRect(renderer_, &game_area);
@@ -1033,7 +1124,10 @@ void Game::draw_frame()
         apply_text_shake();
     }
     if (ui_mode_ == UiMode::game
-        && message_visible_ && !message_.empty()) {
+        && message_shown() && !message_.empty()
+        // DSP_SetTextDisp( TXT_WINDOW, ... ), which the engine's log turns
+        // off while an older entry is up in its place.
+        && (!msg().engine_bar() || msg().main_text_disp())) {
         // The engine's layout goes with the engine's font: the box, the
         // wrap and the overflow clip are all in units of SYS_FONT, so they
         // only mean anything at that size.
@@ -1117,6 +1211,7 @@ void Game::draw_frame()
         float y = message_text_y();
         std::size_t source_cursor = 0;
         const auto lines = display_lines(visible);
+        const auto glyph_of = engine_glyph_map(visible);
         // A page taller than the screen scrolls; it follows the newest text
         // unless the reader has dragged the bar away from the bottom.
         const int scroll_limit = message_scroll_limit(lines.size());
@@ -1149,12 +1244,45 @@ void Game::draw_frame()
             // glyph per frame.
             const auto& boundaries = font_.glyph_boundaries(line);
             std::size_t glyph_index_in_line = 0;
+            // Neighbouring glyphs at the same alpha share one clip and one
+            // pair of draws.  A clip per glyph made a message 130-160 draw
+            // calls a frame long after it had finished revealing - each one
+            // breaking SDL's batch, which on a phone's WebGL is most of a
+            // frame's CPU.  Every pixel still gets the same shadow-then-text
+            // pair; the runs only stop a pixel column between two rounded
+            // glyph boxes being blended twice.
+            struct Run {
+                float left = 0.0f;
+                float right = 0.0f;
+                std::uint8_t alpha = 0;
+                bool open = false;
+            } run;
+            const auto flush_run = [&] {
+                if (!run.open) {
+                    return;
+                }
+                const SDL_Rect clip{
+                    static_cast<int>(std::floor(run.left)),
+                    static_cast<int>(std::floor(y)),
+                    std::max(1, static_cast<int>(
+                                    std::ceil(run.right - run.left))),
+                    // Tall enough for the glyph and its shadow: a fixed
+                    // height clipped the bottom off large fonts.
+                    static_cast<int>(std::ceil(text_line_height())) + 4};
+                SDL_SetRenderClipRect(renderer_, &clip);
+                font_.draw(renderer_, x + 2.0f, y + 2.0f, line, 0, 0, 0,
+                           run.alpha);
+                font_.draw(renderer_, x, y, line, 255, 255, 255, run.alpha);
+                SDL_SetRenderClipRect(renderer_, nullptr);
+                run.open = false;
+            };
             while (glyph_offset < line.size()) {
                 const auto glyph_bytes = utf8_prefix_bytes(
                     std::string_view(line).substr(glyph_offset), 1);
                 const auto source_offset = line_start + glyph_offset;
-                const auto glyph_index =
-                    utf8_character_count(visible.substr(0, source_offset));
+                const auto glyph_index = source_offset < glyph_of.size()
+                    ? glyph_of[source_offset]
+                    : std::numeric_limits<std::size_t>::max();
                 float glyph_alpha = glyph_index < shown
                     ? static_cast<float>(msg().glyph_alpha(glyph_index))
                           / 256.0f
@@ -1184,28 +1312,19 @@ void Game::draw_frame()
                     const float glyph_right =
                         x + boundaries[std::min(glyph_index_in_line + 1,
                                                 boundaries.size() - 1)];
-                    const SDL_Rect clip{
-                        static_cast<int>(std::floor(glyph_left)),
-                        static_cast<int>(std::floor(y)),
-                        std::max(
-                            1, static_cast<int>(
-                                std::ceil(glyph_right - glyph_left))),
-                        // Tall enough for the glyph and its shadow: a fixed
-                        // height clipped the bottom off large fonts.
-                        static_cast<int>(
-                            std::ceil(text_line_height())) + 4};
-                    SDL_SetRenderClipRect(renderer_, &clip);
-                    font_.draw(
-                        renderer_, x + 2.0f, y + 2.0f,
-                        line, 0, 0, 0, alpha);
-                    font_.draw(
-                        renderer_, x, y, line,
-                        255, 255, 255, alpha);
-                    SDL_SetRenderClipRect(renderer_, nullptr);
+                    if (run.open && run.alpha == alpha) {
+                        run.right = glyph_right;
+                    } else {
+                        flush_run();
+                        run = {glyph_left, glyph_right, alpha, true};
+                    }
+                } else {
+                    flush_run();    // a gap: nothing drawn here
                 }
                 glyph_offset += glyph_bytes;
                 ++glyph_index_in_line;
             }
+            flush_run();
             // Every shadow in the line, then every glyph - TXT_DrawText's
             // two calls.  A glyph drawn before the next one's shadow keeps
             // its edge; one drawn after loses a level of it.
@@ -1231,8 +1350,15 @@ void Game::draw_frame()
             lines.size(), message_scroll_, message_scroll_dragging_);
         }
     }
+    if (ui_mode_ == UiMode::game && msg().engine_bar()) {
+        // The engine's log: TXT_WINDOW+1 at LAY_WINDOW+1, the entry being
+        // read, and TXT_WINDOW+2 at LAY_WINDOW+2, the voiced line under the
+        // pointer drawn over it in another colour.
+        draw_engine_text(msg().log_text());
+        draw_engine_text(msg().log_voice_text());
+    }
     if (ui_mode_ == UiMode::game
-        && message_visible_ && choosing_ && !choices_.empty()) {
+        && message_shown() && choosing_ && !choices_.empty()) {
         float y = choice_y_start();
         const bool typed = choice_reveal_finished();
         for (int i = 0; font_.authentic()
@@ -1325,8 +1451,12 @@ void Game::draw_frame()
     select_sidebar();
     // ControlHistorySystem: if( NovelMessage.disp && !Avg.demo ) - the bar
     // is not put up while a demo (SetDemoFlag) is running the scene.
-    if ((ui_mode_ == UiMode::game || ui_mode_ == UiMode::backlog)
-        && message_visible_ && !demo_mode_) {
+    if (msg().engine_bar()) {
+        if (ui_mode_ == UiMode::game && msg().history_bar().shown) {
+            draw_sidebar();
+        }
+    } else if ((ui_mode_ == UiMode::game || ui_mode_ == UiMode::backlog)
+               && message_shown() && !demo_mode_) {
         draw_sidebar();
     }
     select_overlay();

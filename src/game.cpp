@@ -20,6 +20,10 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <sstream>
+#include <fstream>
+#include <format>
+#include <limits>
 #include <cstdlib>
 #include <cstdio>
 #include <chrono>
@@ -123,9 +127,22 @@ Game::Game(
     for (std::size_t i = 0; i < persistent_game_flags_.size(); ++i) {
         runtime_.set_game_flag(i, persistent_game_flags_[i]);
     }
+    SDL_WindowFlags window_flags =
+        SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#ifdef __EMSCRIPTEN__
+    // WebGL 2, asked for as such.  Every shader here is #version 300 es, and
+    // SDL's GLES2 renderer otherwise asks for ES 2.0 - WebGL 1 - which this
+    // build cannot create (MIN_WEBGL_VERSION is 2), so the page logged a
+    // warning and was upgraded anyway.  The renderer keeps a context that is
+    // already ES 2.0 or newer.
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    window_flags |= SDL_WINDOW_OPENGL;
+#endif
     window_ = SDL_CreateWindow(
         "ToHeart2 XRATED", config_.window_width, config_.window_height,
-        SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+        window_flags);
     window_holder_.reset(window_);
     if (window_ && config_.window_x >= 0 && config_.window_y >= 0) {
         SDL_SetWindowPosition(window_, config_.window_x, config_.window_y);
@@ -308,14 +325,33 @@ Game::Game(
         SDL_Log("Starting opening movie");
         start_movie(3, 0, false);
     }
+    // One playback device held open for the whole run, unused.  Every
+    // channel opens its own stream, and SDL closes the physical device when
+    // the last of them goes - which happens between any two sound effects -
+    // and its shutdown waits up to a hundred milliseconds for the audio to
+    // drain.  On the web that wait is on the main thread, where SDL also
+    // feeds the device: a frame hitch whenever the sounds stopped, and the
+    // next sound's opening stuttering while the device came back up.
+    if (!suppress_audio_output_) {
+        audio_keepalive_ =
+            SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, nullptr);
+    }
     SDL_Log("Game constructor finished");
 }
 
 Game::~Game()
 {
+    // A recording that ends any way but a closed window - --trace-ticks
+    // running out, an error - still gets its open presses written.
+    if (recorder_.active()) {
+        recorder_.finish(trace_tick_);
+    }
     // The trace clock captures `this`, and it lives in a static, so it has
     // to go before this object does.
     th2::AudioChannel::set_clock(nullptr);
+    if (audio_keepalive_ != 0) {
+        SDL_CloseAudioDevice(audio_keepalive_);
+    }
     // All SDL resources are owned by members declared after
     // window_holder_/renderer_holder_, so they are destroyed before the
     // renderer/window and before SDL_Quit().  Only the config needs an
@@ -667,6 +703,16 @@ void Game::iterate()
     audio_opens_this_frame_ = 0;
     report_prefetch_trace();
     update_image_decode();
+    // Once each time the title comes up: nothing advances the script there,
+    // and the new game's opening is worth having ready before the click.
+    if (ui_mode_ == UiMode::title) {
+        if (!title_scanned_) {
+            title_scanned_ = true;
+            prefetch_scan_pending_ = true;
+        }
+    } else {
+        title_scanned_ = false;
+    }
     if (prefetch_scan_pending_ || prefetch_follow_pending_) {
         const auto now = std::chrono::steady_clock::now();
         if (now - last_prefetch_scan_ >= std::chrono::milliseconds(50)
@@ -679,10 +725,54 @@ void Game::iterate()
     int window_width = 800;
     int window_height = 600;
     SDL_GetWindowSize(window_, &window_width, &window_height);
+    // TH2_RECORD_FEED: device events for a recording, from a file instead
+    // of a person - "<tick> move X Y", "<tick> down NAME", "<tick> up NAME"
+    // in game coordinates and the recorder's names.  Only for checking that
+    // a recording replays as it was played; it goes in where SDL's input
+    // would, past the coordinate conversion.
+    if (recorder_.active()) {
+        static std::vector<std::pair<std::uint64_t, std::string>> feed = [] {
+            std::vector<std::pair<std::uint64_t, std::string>> lines;
+            const char* path = std::getenv("TH2_RECORD_FEED");
+            std::ifstream file(path ? path : "");
+            std::string line;
+            while (std::getline(file, line)) {
+                std::istringstream parts(line);
+                std::uint64_t tick = 0;
+                std::string rest;
+                if (parts >> tick && std::getline(parts, rest)) {
+                    lines.emplace_back(tick, rest);
+                }
+            }
+            return lines;
+        }();
+        static std::size_t fed = 0;
+        while (fed < feed.size() && feed[fed].first <= trace_tick_) {
+            std::istringstream parts(feed[fed].second);
+            std::string what;
+            parts >> what;
+            if (what == "move") {
+                int x = 0;
+                int y = 0;
+                parts >> x >> y;
+                recorder_.pointer(x, y);
+            } else {
+                std::string name;
+                parts >> name;
+                recorder_.key(name, what == "down");
+            }
+            ++fed;
+        }
+    }
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         if (event.type == SDL_EVENT_QUIT) {
             running_ = false;
+            if (recorder_.active()) {
+                recorder_.finish(trace_tick_);
+                SDL_Log("record: finished at tick %llu",
+                        static_cast<unsigned long long>(trace_tick_));
+            }
             continue;
         }
         if (touch_clear_event_ != 0 && event.type == touch_clear_event_) {
@@ -767,6 +857,15 @@ void Game::iterate()
         }
         convert_event_to_logical_coordinates(
             event, window_width, window_height);
+        // Recording: the player's input goes to the recorder and nowhere
+        // else.  The game gets it back through trace_apply_input, sampled
+        // once a tick, exactly as a replay of the file will hand it over -
+        // letting it through here as well would play every click twice and
+        // record a run that no replay could reproduce.
+        if (recorder_.active()) {
+            record_input_event(event);
+            continue;
+        }
         if (config_.show_script_position
             && imgui_->wants_mouse()
             && (event.type == SDL_EVENT_MOUSE_MOTION
@@ -877,10 +976,10 @@ void Game::iterate()
         }
 
         // Message window hidden - any input restores it
-        if (!message_visible_) {
+        if (window_hidden_) {
             if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN
                 || event.type == SDL_EVENT_KEY_DOWN) {
-                message_visible_ = true;
+                window_hidden_ = false;
             }
             continue;
         }
@@ -923,7 +1022,7 @@ void Game::iterate()
                     if (auto_mode_) skip_mode_ = false;
                 } else if (event.key.key == SDLK_F10
                            && gamepad_input_.last_event_was_gamepad()) {
-                    message_visible_ = !message_visible_;
+                    window_hidden_ = !window_hidden_;
                 } else if (event.key.key == SDLK_F5
                            && !replay_mode_) {
                     save_snapshot_ = capture_frame_thumbnail(
@@ -1089,6 +1188,7 @@ void Game::iterate()
     }
     update_audio();
     update_movie();
+    trace_peek_map_pointer();
     update_map();
     update_playback_modes();
     update_title();
@@ -1190,6 +1290,17 @@ void Game::iterate()
     if (trace_mode_) {
         trace_glyph_drawn_ = trace_glyph_alpha();
     }
+    if (engine_config_step_) {
+        // AVG_Main's AVG_CONFIG step: the system menu and the half tone, and
+        // nothing else of the AVG_GAME chain - the characters, the weather
+        // and the message all stand still underneath it.
+        for (int i = 0; i < control_steps_; ++i) {
+            control_engine_config();
+            msg().control_half_tone();
+        }
+        update_audio_decode();
+        update_half_tone();
+    } else {
     control_system2();
     for (int i = 0; i < control_steps_; ++i) {
         msg().control_novel_message(game_key_);
@@ -1200,17 +1311,59 @@ void Game::iterate()
     update_half_tone();
     update_screen_flash();
     update_character_animations(control_steps_);
+    if (control_steps_ > 0) {
+        // AVG_ControlWeather sets every petal's graph up again.
+        weather_disp_ = true;
+    }
     update_sakura(control_steps_);
     // AVG_System runs AVG_ControlSelectWindow late, after AVG_ControlChar and
     // the weather and warp passes rather than with the message control.
     control_select_window();
+    // AVG_ControlSystem, the last of the chain: the system menu opened this
+    // frame gets its first step on the frame it opened.
+    for (int i = 0; engine_config_.flag && i < control_steps_; ++i) {
+        control_engine_config();
+    }
+    }
+    // AVG_RenewSetp: a step change made during the frame takes effect for
+    // the next one.
+    if (engine_config_step_next_) {
+        engine_config_step_ = *engine_config_step_next_;
+        engine_config_step_next_.reset();
+    }
     // main.cpp runs EXEC_ControlLang, then MAIN_GameControl - the AVG_
     // Control* chain - and only then MAIN_DrawGraph.  Drawing before the
     // control pass meant anything the script had just set up was put on
     // screen once with whatever DSP_SetGraph left on it: a character
     // arriving showed at full opacity for a frame before AVG_ControlChar
     // gave it DRW_BLD(0) and started the fade.
-    draw();
+    //
+    // MAIN_Loop's MainWindow.draw_flag, in a trace:
+    //     if( draw_flag == 2 ) draw_flag = 0;
+    //     if( draw_flag == 1 ){ draw_flag = 2; ... }
+    //     if( draw_flag < 0 ){ draw_flag++; if( draw_flag==0 ) MAIN_DrawControl(); }
+    //     else MAIN_DrawControl();
+    // so a skipped one-frame wait (AVG_WaitFrame's -10) leaves the screen,
+    // and the reference's frame dump, standing still until something sets
+    // the flag again.  Not in normal play: nothing there is compared, and a
+    // window that stops presenting for a sixth of a second is only a stutter.
+    frame_undrawn_ = false;
+    if (trace_mode_) {
+        int& flag = th2::engine_draw_flag;
+        if (flag == 2) {
+            flag = 0;
+        }
+        if (flag == 1) {
+            flag = 2;
+        }
+        if (flag < 0) {
+            ++flag;
+            frame_undrawn_ = flag != 0;
+        }
+    }
+    if (!frame_undrawn_) {
+        draw();
+    }
     // After the whole tick, not before it - which is where the reference
     // writes its line, at the end of MAIN_Loop's tick body.  Taken at the
     // top instead, our line for tick N described the state after tick N-1
@@ -1245,7 +1398,18 @@ void Game::iterate()
     // Sleeping here would pace the replay at sixty ticks a second, which is
     // the whole cost of getting to a divergence - the engine itself computes
     // a tick in well under a millisecond.
-    if (!trace_mode_) {
+    // A recording is played by a person, so from the hand-over it runs at
+    // the engine's own sixty ticks a second.  Only the pacing reads the
+    // clock; the tick is still the only thing the engine sees.
+    if (!trace_mode_ || record_live()) {
+        if (record_live() && trace_tick_ == record_from_) {
+            next_frame_ = std::chrono::steady_clock::now();
+        }
+        if (record_live() && trace_tick_ % 30 == 0) {
+            const auto title = std::format(
+                "ToHeart2 - recording, tick {}", trace_tick_);
+            SDL_SetWindowTitle(window_, title.c_str());
+        }
         constexpr auto frame_duration = std::chrono::nanoseconds(
             1'000'000'000 / 60);
         next_frame_ += frame_duration;
@@ -1257,6 +1421,71 @@ void Game::iterate()
         }
     }
 #endif
+}
+
+// SDL input, in the 800x600 game space, as the script's vocabulary: the
+// keys th2ref_input.cpp knows, and the two mouse buttons.  Arrows, the
+// wheel and the middle button have no script name on the reference's side,
+// so they are not recorded - a recording that used them could not be
+// replayed there.
+void Game::record_input_event(const SDL_Event& event)
+{
+    switch (event.type) {
+    case SDL_EVENT_MOUSE_MOTION:
+        recorder_.pointer(static_cast<int>(event.motion.x),
+                          static_cast<int>(event.motion.y));
+        return;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP: {
+        recorder_.pointer(static_cast<int>(event.button.x),
+                          static_cast<int>(event.button.y));
+        const bool down = event.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+        if (event.button.button == SDL_BUTTON_LEFT) {
+            recorder_.key("lclick", down);
+        } else if (event.button.button == SDL_BUTTON_RIGHT) {
+            recorder_.key("rclick", down);
+        }
+        return;
+    }
+    case SDL_EVENT_KEY_DOWN:
+    case SDL_EVENT_KEY_UP: {
+        if (event.key.repeat) {
+            return;
+        }
+        const bool down = event.type == SDL_EVENT_KEY_DOWN;
+        const char* name = nullptr;
+        switch (event.key.key) {
+        case SDLK_RETURN: case SDLK_KP_ENTER: name = "enter"; break;
+        case SDLK_SPACE: name = "space"; break;
+        case SDLK_ESCAPE: name = "esc"; break;
+        case SDLK_BACKSPACE: name = "bs"; break;
+        case SDLK_LCTRL: case SDLK_RCTRL: name = "ctrl"; break;
+        case SDLK_LSHIFT: case SDLK_RSHIFT: name = "shift"; break;
+        case SDLK_LALT: case SDLK_RALT: name = "alt"; break;
+        case SDLK_HOME: name = "home"; break;
+        case SDLK_END: name = "end"; break;
+        case SDLK_PAGEUP: name = "pup"; break;
+        case SDLK_PAGEDOWN: name = "pdown"; break;
+        default: break;
+        }
+        static constexpr const char* digits[10] = {
+            "num0", "num1", "num2", "num3", "num4",
+            "num5", "num6", "num7", "num8", "num9"};
+        if (event.key.key >= SDLK_0 && event.key.key <= SDLK_9) {
+            name = digits[event.key.key - SDLK_0];
+        } else if (event.key.key >= SDLK_KP_1 && event.key.key <= SDLK_KP_9) {
+            name = digits[event.key.key - SDLK_KP_1 + 1];
+        } else if (event.key.key == SDLK_KP_0) {
+            name = digits[0];
+        }
+        if (name) {
+            recorder_.key(name, down);
+        }
+        return;
+    }
+    default:
+        return;
+    }
 }
 
 void Game::draw()
@@ -1296,6 +1525,10 @@ int main(int argc, char** argv)
         std::uint64_t trace_save_at = 0;
         std::filesystem::path trace_resume_file;
         std::uint64_t trace_resume_trigger = 0;
+        std::optional<std::filesystem::path> record_path;
+        std::uint64_t record_from = 0;
+        bool trace_first_set = false;
+        bool trace_lead_set = false;
         bool data_set = false;
         for (int index = 1; index < argc; ++index) {
             const std::string_view argument = argv[index];
@@ -1334,6 +1567,7 @@ int main(int argc, char** argv)
                     throw std::runtime_error("--trace-lead requires a tick");
                 }
                 trace_lead = std::stoull(argv[index]);
+                trace_lead_set = true;
             } else if (argument == "--trace-save-file") {
                 if (++index >= argc) {
                     throw std::runtime_error(
@@ -1362,6 +1596,17 @@ int main(int argc, char** argv)
                     throw std::runtime_error("--trace-from requires a tick");
                 }
                 trace_first = std::stoull(argv[index]);
+                trace_first_set = true;
+            } else if (argument == "--record") {
+                if (++index >= argc) {
+                    throw std::runtime_error("--record requires a path");
+                }
+                record_path = argv[index];
+            } else if (argument == "--record-from") {
+                if (++index >= argc) {
+                    throw std::runtime_error("--record-from requires a tick");
+                }
+                record_from = std::stoull(argv[index]);
             } else if (argument == "--cpu-transitions") {
                 th2app::force_cpu_transitions = true;
             } else if (argument == "--trace-prefetch") {
@@ -1393,6 +1638,24 @@ int main(int argc, char** argv)
                     "[--scenario FILE.SDT] [--cpu-transitions] [--soak] "
                     "[--soak-state DIRECTORY] [--soak-runs COUNT]");
             }
+        }
+        // --record is a trace run with live input.  It has to be the same
+        // run the harness will replay, so it takes the harness's defaults:
+        // the reference's lead-in for GlobalCount (make_pair.py's
+        // REFERENCE_LEAD_IN) and no frame dumps unless asked for.
+        if (record_path) {
+            if (!trace_directory) {
+                trace_directory = record_path->parent_path()
+                    / (record_path->stem().string() + ".trace");
+            }
+            if (!trace_first_set) {
+                trace_first = std::numeric_limits<std::uint64_t>::max();
+            }
+            if (!trace_lead_set) {
+                trace_lead = 235;
+            }
+        } else if (record_from) {
+            throw std::runtime_error("--record-from needs --record");
         }
         if (scenario && soak_directory) {
             throw std::runtime_error(
@@ -1451,6 +1714,9 @@ int main(int argc, char** argv)
             game.set_trace_hold(trace_hold, trace_hold_seconds);
             game.set_trace_checkpoint(trace_save_file, trace_save_at,
                                       trace_resume_file, trace_resume_trigger);
+            if (record_path) {
+                game.enable_recording(*record_path, record_from);
+            }
         }
         return game.run();
     } catch (const std::exception& error) {

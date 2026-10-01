@@ -306,8 +306,15 @@ struct VideoPlayer::Impl {
         const double elapsed = elapsed_offset
             + std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - started).count() * speed;
-        while (!eof && (decoded_time < 0.0
-                        || decoded_time < elapsed + 0.10)) {
+        // Whatever is overdue, then one frame more towards the tenth of a
+        // second ahead.  Topping the read-ahead up in one go decoded and
+        // converted several frames on a single display frame - 46 ms at the
+        // start of the opening movie - where one a frame keeps up with a 30
+        // fps movie with room to spare at any refresh rate.
+        const auto frames_before = decoded_frames;
+        while (!eof && (decoded_time < 0.0 || decoded_time < elapsed
+                        || (decoded_time < elapsed + 0.10
+                            && decoded_frames == frames_before))) {
             const int result = av_read_frame(format, packet);
             if (result < 0) {
                 eof = true;

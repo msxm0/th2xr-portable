@@ -16,6 +16,11 @@ mkdir -p "$LOG"
 STEP=${STEP:-60}
 WINDOW=${WINDOW:-6000}
 STRIDE=${STRIDE:-3000}
+# Which input pair (scripts/<PAIR>-ours.txt, -ref.txt; see window.sh) and
+# where the walk ends.  A recording is finite: make_pair.py --recording
+# prints its last tick, and the walk stops once a window starts past it.
+PAIR=${TH2_PAIR:-opening}
+LAST=${TH2_LAST:-2000000}
 
 # NOTEXT stays OFF: in a trace run our overlay IS the art layer (see
 # Game::select_overlay), so our dump already has the text composited in at
@@ -35,7 +40,16 @@ i=0
 while :; do
     i=$((i + 1))
     AT=$(cat "$OUT/window.at" 2>/dev/null || echo 0)
+    # Each window compares its last STRIDE ticks, so the walk is done once
+    # the next window's compared range would start at the end or past it -
+    # LAST is the recording's end marker, where no input happens, and a
+    # window comparing that one tick has nothing in it to compare.
+    if [ "$AT" != 0 ] && [ $((AT + STRIDE)) -ge "$LAST" ]; then
+        echo "   reached the end of $PAIR (tick $LAST): every window agrees"
+        exit 0
+    fi
     STOP=$((AT + WINDOW - 1))
+    [ "$STOP" -gt "$LAST" ] && STOP=$LAST
     if [ "$AT" = 0 ]; then CMP=0; else CMP=$((AT + STRIDE)); fi
     echo "### attempt $i, window $AT..$STOP (frames+audio from $CMP) $(date +%H:%M:%S)"
 
@@ -43,15 +57,22 @@ while :; do
     # windows overlap, so a kept log would double-count the shared ticks.
     : > "$LOG/our-audio.log"
 
-    bash "$HERE/window.sh" --window "$WINDOW" --stride "$STRIDE" >>"$LOG/mediawalk.log" 2>&1
+    bash "$HERE/window.sh" --window "$WINDOW" --stride "$STRIDE" \
+        --out "$OUT" --pair "$PAIR" --to "$LAST" >>"$LOG/mediawalk.log" 2>&1
     rc=$?
     if [ $rc -ne 0 ]; then
         echo "STOP: state mismatch in window $AT"; tail -3 "$LOG/mediawalk.log"; exit 1
     fi
 
+    # window.sh has already moved window.at on, because the state agreed.
+    # A window that then fails on audio or pixels has to be tried again, not
+    # skipped: left moved, the next attempt started past it - and past the
+    # end, for a recording shorter than a window, which then reported "every
+    # window agrees" having compared nothing at all.
     if ! python3 "$HERE/mediadiff.py" --our-audio "$LOG/our-audio.log" \
             --ref-audio "$LOG/ref-audio.log" --from "$CMP" --to "$STOP" \
             >>"$LOG/mediawalk.log" 2>&1; then
+        echo "$AT" > "$OUT/window.at"
         echo "STOP: audio mismatch in window $AT"
         python3 "$HERE/mediadiff.py" --our-audio "$LOG/our-audio.log" \
             --ref-audio "$LOG/ref-audio.log" --from "$CMP" --to "$STOP" --show 4
@@ -61,6 +82,7 @@ while :; do
     if ! "$ROOT/build/release/th2-trace-diff" "$OUT/ours" "$OUT/ref" \
             --offset 235 --step 1 --from "$CMP" --to "$STOP" \
             --psnr 0 --max-delta 0 >>"$LOG/mediawalk.log" 2>&1; then
+        echo "$AT" > "$OUT/window.at"
         echo "STOP: pixel mismatch in window $AT"
         "$ROOT/build/release/th2-trace-diff" "$OUT/ours" "$OUT/ref" \
             --offset 235 --step 1 --from "$CMP" --to "$STOP" \

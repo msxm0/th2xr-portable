@@ -1,0 +1,10 @@
+# SKIP1: SKIP1-rec.txt, as recorded - scenario ticks.
+# Synthetic: the steady route, with Ctrl held from 300 to 6300 and no clicks
+# while it is, then the steady route again.
+1 move 400 403
+30 every 30 lclick 3 until 300
+30 every 1 num1
+30 every 1 mappick
+300 ctrl 6000
+6330 every 30 lclick 3
+# End of recording at tick 9000.

@@ -8,6 +8,17 @@
 
 namespace th2 {
 
+// MainWindow.draw_flag, which MAIN_Loop reads to decide whether this frame is
+// drawn at all.  1 (ON) is set wherever something changes on screen; MAIN_Loop
+// turns it into 2 and then 0.  AVG_WaitFrame parks it at -10 when a one-frame
+// wait is skipped (Avg.msg_cut), and from there MAIN_Loop draws nothing for
+// ten frames - the screen, and the harness's frame dump with it, stands still
+// - unless something sets it back to 1 first.  Only a trace acts on it; see
+// Game::iterate.
+inline int engine_draw_flag = 0;
+inline void set_draw_flag_on() { engine_draw_flag = 1; }
+
+
 inline constexpr int max_char = 8;  // MAX_CHAR
 
 // GRP_/BMP_/LAY_ from GM_avg.h, worked through rather than guessed:

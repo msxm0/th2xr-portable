@@ -244,7 +244,7 @@ void Game::handle_touch_actions()
         if (ui_mode_ == UiMode::backlog) {
             close_backlog();
         } else if (ui_mode_ == UiMode::game) {
-            message_visible_ = false;
+            window_hidden_ = true;
         }
         break;
     case Action::MenuToggle:
@@ -323,7 +323,7 @@ void Game::execute_menu_item(int index)
     case 1:
         if (!replay_mode_) open_save_load(UiMode::load);
         break;
-    case 2: message_visible_ = !message_visible_; break;
+    case 2: window_hidden_ = !window_hidden_; break;
     case 3: open_config(); break;
     case 4: break;
     }
@@ -511,10 +511,14 @@ struct MapLevels {
 
 int Game::map_marker_level(int field) const
 {
-    if (map_slide_ticks_ == 0) {
+    // The roll as the engine's marker pass saw it: before this frame's step
+    // took one off (map_marker_roll_), or, on a frame that ran no roll step,
+    // as it stands - 16 on the frame a page turn starts, 0 at rest.
+    const int roll = map_marker_roll_ != 0 ? map_marker_roll_
+                                           : std::abs(map_slide_ticks_);
+    if (roll == 0) {
         return field == map_field_ ? 256 : 0;
     }
-    const int roll = std::abs(map_slide_ticks_);
     const int cnt = field == map_field_ ? 8 - roll
         : field == map_previous_field_ ? roll - 8 : -1;
     return std::clamp(cnt * 32, 0, 256);   // DRW_BLD clamps to 0..256

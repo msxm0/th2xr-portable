@@ -9,6 +9,11 @@ described once, in *scenario* ticks, and written out twice - shifted by the
 reference's lead-in, with the title click prepended to the reference's copy.
 
     make_pair.py <name> [--offset N] [--first N] [--period N] [--count N]
+    make_pair.py <name> --recording FILE
+
+--recording turns a recorded run (reference/record.sh) into the pair: our
+copy is the recording itself, the reference's is every tick of it - repeat
+ends included - shifted by the lead-in, after the title click.
 
 Writes <name>-ours.txt and <name>-ref.txt next to this script, and prints the
 offset to pass to th2-trace-diff.
@@ -47,12 +52,17 @@ def main():
     p.add_argument("--period", type=int, default=30,
                    help="scenario ticks between clicks")
     p.add_argument("--count", type=int, default=40)
+    p.add_argument("--recording", type=pathlib.Path,
+                   help="a script written by toheart2 --record")
     p.add_argument("--repeat", action="store_true",
                    help="one repeating click instead of --count of them, "
                         "plus the number key that answers a choice")
     args = p.parse_args()
 
     here = pathlib.Path(__file__).resolve().parent
+
+    if args.recording:
+        return from_recording(here, args)
 
     # Extra events in scenario ticks, one per line, same syntax as the script
     # itself.  This is where the map screen lives: it is answered by the
@@ -122,6 +132,57 @@ def main():
           f"(ours -> ref)")
     print(f"ticks: ours 0..{clicks[-1] + args.period}, "
           f"ref {args.offset}..{clicks[-1] + args.period + args.offset}")
+
+
+def shift_line(body, offset):
+    """One script line with its tick and any `until` tick moved by offset."""
+    words = body.split()
+    words[0] = str(int(words[0]) + offset)
+    for i, word in enumerate(words[:-1]):
+        if word.lower() == "until":
+            words[i + 1] = str(int(words[i + 1]) + offset)
+    return " ".join(words)
+
+
+def last_tick(lines):
+    """Where a recording's input stops mattering: its end marker if it has
+    one, else the end of its latest event."""
+    end = 0
+    for line in lines:
+        if line.startswith("# End of recording at tick"):
+            return int(line.rsplit(None, 1)[-1].rstrip("."))
+        body = line.split("#", 1)[0].split()
+        if not body:
+            continue
+        tick = int(body[0])
+        hold = 1
+        if len(body) >= 3 and body[1].lower() not in ("move", "every"):
+            try:
+                hold = int(body[2])
+            except ValueError:
+                pass
+        end = max(end, tick + hold)
+    return end
+
+
+def from_recording(here, args):
+    lines = args.recording.read_text().splitlines()
+    ours = [f"# {args.name}: {args.recording.name}, as recorded - scenario ticks."]
+    ref = [TITLE_CLICK.rstrip(),
+           f"# {args.name}: {args.recording.name}, shifted by {args.offset}."]
+    for line in lines:
+        ours.append(line)
+        body = line.split("#", 1)[0].strip()
+        if body:
+            ref.append(shift_line(body, args.offset))
+    (here / f"{args.name}-ours.txt").write_text("\n".join(ours) + "\n")
+    (here / f"{args.name}-ref.txt").write_text("\n".join(ref) + "\n")
+    end = last_tick(lines)
+    print(f"wrote {args.name}-ours.txt and {args.name}-ref.txt from "
+          f"{args.recording}")
+    print(f"offset: pass --offset {args.offset} to th2-trace-diff "
+          f"(ours -> ref)")
+    print(f"last tick: {end}  (TH2_LAST={end} for mediawalk.sh)")
 
 
 if __name__ == "__main__":

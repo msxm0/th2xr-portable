@@ -28,7 +28,16 @@ endif()
 # zlib: the trace dump is delta-coded and deflated, so a long comparison
 # window fits on the disk.  Both the engine (which writes frames) and
 # th2-trace-diff (which reads them) need it.
-find_package(ZLIB REQUIRED)
+if(EMSCRIPTEN)
+    # Emscripten ships zlib as a port rather than as something
+    # find_package can see: -sUSE_ZLIB=1 puts its headers on the include
+    # path and the library on the link line.
+    add_library(ZLIB::ZLIB INTERFACE IMPORTED)
+    target_compile_options(ZLIB::ZLIB INTERFACE -sUSE_ZLIB=1)
+    target_link_options(ZLIB::ZLIB INTERFACE -sUSE_ZLIB=1)
+else()
+    find_package(ZLIB REQUIRED)
+endif()
 find_package(SDL3 CONFIG REQUIRED)
 find_package(PkgConfig REQUIRED)
 if(ANDROID)
@@ -152,6 +161,7 @@ target_link_libraries(th2_runtime PUBLIC th2_archive th2_scenario th2_bytecode)
 
 add_library(th2_audio
     src/audio.cpp
+    src/audio_browser.cpp
 )
 target_include_directories(th2_audio PUBLIC src)
 target_compile_options(th2_audio PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>)
@@ -330,6 +340,13 @@ if(BUILD_TESTING AND NOT EMSCRIPTEN)
     target_link_libraries(th2-tone-curve-test PRIVATE SDL3::SDL3)
     add_test(NAME tone-curve COMMAND th2-tone-curve-test)
 
+    add_executable(th2-trace-record-test
+        src/trace_record_test.cpp
+        src/trace.cpp
+    )
+    target_link_libraries(th2-trace-record-test PRIVATE ZLIB::ZLIB)
+    add_test(NAME trace-record COMMAND th2-trace-record-test)
+
     add_executable(th2-soak-test
         src/soak_test.cpp
     )
@@ -362,6 +379,7 @@ if(ANDROID)
         src/font.cpp
         src/game.cpp
         src/game_backlog_touch.cpp
+        src/game_engine_config.cpp
         src/game_config_ui.cpp
         src/game_events.cpp
         src/game_flow.cpp
@@ -406,6 +424,7 @@ else()
         src/font.cpp
         src/game.cpp
         src/game_backlog_touch.cpp
+        src/game_engine_config.cpp
         src/game_config_ui.cpp
         src/game_events.cpp
         src/game_flow.cpp

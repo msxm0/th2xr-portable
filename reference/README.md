@@ -187,6 +187,76 @@ both sides the same whole number of ticks.  Anything still reading the real
 clock shows up in the state diff as a divergence that moves when the machine
 is busy.
 
+### Recorded runs
+
+The steady route - a click every 30 ticks, `num1` every tick, the pointer
+parked at (400,403) - only ever feeds the engine one kind of input.  To test
+anything else, play it yourself and record it:
+
+    reference/record.sh NAME [--from TICK] [--base PAIR] [--resume CK]
+
+That starts the port in trace mode with your mouse and keyboard as the
+input, at sixty ticks a second, and writes what you do to
+`scripts/NAME-rec.txt` as you do it.  Close the window to finish; it then
+writes the pair `scripts/NAME-ours.txt` / `NAME-ref.txt` and prints the
+command that walks it:
+
+    mkdir -p ../traces-NAME && echo 0 > ../traces-NAME/window.at
+    TH2_PAIR=NAME TH2_LAST=<last tick> TH2_TRACES=$(realpath ../traces-NAME) \
+        TH2_WALK_LOG=/tmp/claude-1000 bash reference/mediawalk.sh
+
+`--from TICK` gets you to a late scene without playing to it: the base
+pair's script (default `opening`, the steady route) runs unpaced up to TICK
+and hands over to you there.  The recording keeps that lead-in, with every
+repeat ended at TICK by `until`.  `--resume traces/ck-N.sav` starts the
+lead-in from a checkpoint of the base route for a TICK past N - our side
+only; the reference always replays the lead-in, so start the walk's
+`window.at` a window before TICK rather than at 0.
+
+What makes a recording replay exactly:
+
+  - **It is a trace run.** Recording is `--record`, which is `--trace` with
+    live input: one tick a frame, nothing read off a clock except the pacing,
+    the same pinned config, the same `--trace-lead` (235), a fresh profile.
+    Your input goes to the recorder and nowhere else - the game gets it back
+    from the recorder once a tick, exactly as a replay hands it over.
+  - **Presses become held events.** A key or button down since the last tick
+    is a press on this tick; when it comes up, the line `<tick> <key> <hold>`
+    is written.  The pointer is a `move` on each tick it changed.
+  - **Mouse buttons keep a gap.** The reference derives a click from the
+    button's level, so a re-press inside one tick is held back a tick -
+    back-to-back `lclick` lines would be one long press over there.  Keys
+    carry their edge explicitly and need no gap.
+  - **Only the reference's vocabulary.** Left/right button, the pointer,
+    Enter, Space, Esc, Backspace, Ctrl, Shift, Alt, Home, End, PageUp,
+    PageDown, 0-9.  The wheel, the middle button and the arrow keys have no
+    script name in `shim/th2ref_input.cpp`, so they are not recorded.
+
+What a recording can do on screen is the engine's, not the port's: in a
+trace run (recording included) the side bar, the log and the right-click
+system menu are the engine's own, transcribed - `AvgMsg::set_engine_bar`,
+and `game_engine_config.cpp` for the menu.  The bar's buttons are mouse
+rects on layer 0 answered from `MSG_WAIT`/`MSG_STOP` (and `MSG_NEXT` under
+a choice), paging back is `MSG_UP`/`MSG_LOG`/`MSG_DOWN`/`MSG_DRAG` over the
+engine's 256-entry `NovelBuf`, and the menu is `sys0100` fading in at
+`LAY_SYSTEM` with the script, characters and weather stopped underneath.
+Normal play keeps the port's own UI for all of it.  Not transcribed yet:
+the save, load and side-bar settings screens behind the bar's buttons 3, 4
+and 8 and the menu's first, second and fourth buttons.  A click on one is
+logged (`engine config: ...`) and the run will diverge from there.
+
+`window.sh --pair NAME --out DIR` and `mediawalk.sh`'s `TH2_PAIR`,
+`TH2_TRACES`, `TH2_LAST` take any pair.  Give each its own traces directory:
+checkpoints belong to one script, and so does the parked reference -
+`window.sh` restarts it when `/tmp/claude-1000/th2ref.running` names another
+pair or directory.
+
+`src/trace_record_test.cpp` checks the recorder's round trip; for a check
+of the whole path without a person at the keyboard, `TH2_RECORD_FEED=FILE`
+feeds it device events (`<tick> move X Y`, `<tick> down NAME`,
+`<tick> up NAME`) - record with it, replay the recording with
+`--trace-input`, and the two `state.txt` files must be identical.
+
 ### Two things that have to match, and one that never will
 
 **`run/CONFIG.ini` must exist.**  `AVG_ReadConfigParam` has a typo in the
@@ -199,7 +269,11 @@ With no ini to read, the first line leaves `Avg.frame`'s 60 in `Avg.wait` and
 the second keeps it.  `AVG_EffCnt` multiplies every effect length by
 `Avg.wait`, so a 10-frame wipe becomes a 600-frame one and nothing in a trace
 ever finishes.  `CONFIG.ini` pins it to 2, alongside the rest of the settings
-`Game::enable_trace` pins on our side.
+`Game::enable_trace` pins on our side.  One of those is `msg_cut_optin=1`,
+"skip unread text", so that holding Ctrl skips in a recording made from a
+fresh profile; it is the port's `skip_unread`, and it has to agree on both
+sides because it also picks the column the side bar's skip button is drawn
+from.
 
 **Text is ON, and has to be.**  It was off for a while - the reference
 composites text into the same buffer as the art, ours keeps it on a separate

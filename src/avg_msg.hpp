@@ -29,8 +29,11 @@
 #include "dsp.hpp"
 #include "text_count.hpp"
 
+#include <array>
 #include <functional>
+#include <iosfwd>
 #include <string>
+#include <vector>
 
 namespace th2 {
 
@@ -58,9 +61,8 @@ enum ToneStep {
     tone_fadeout,
 };
 
-// NOVEL_MESSEGE, minus str[] and the history buffer: the text itself lives
-// in Message and the log in the backlog, which are the two places the
-// original keeps char arrays we already have better homes for.
+// NOVEL_MESSEGE, minus str[]: the text itself lives in raw_ below.  The
+// history buffer is NovelBufState.
 struct NovelMessageState {
     int flag = 0;
     int add_flag = 0;
@@ -78,6 +80,98 @@ struct HalfToneState {
     int tcount = 0;
 };
 
+// GM_AvgMsg.h's NLOG_MAX and NLOG_V_MAX, and mouse.h's MOUSE_REST_MAX.
+inline constexpr int nlog_max = 256;
+inline constexpr int nlog_v_max = 32;
+inline constexpr int mouse_rest_max = 64;
+// The mouse layers in use: 0 for the history bar and the log, 1 for the
+// system menu (MOUSE_LAYER_MAX is 48; nothing a trace reaches uses more).
+inline constexpr int mouse_layers = 2;
+// MUS_GetMouseNo's button argument.
+inline constexpr int mouse_any = -1;
+inline constexpr int mouse_lbutton = 0;
+inline constexpr int mouse_lbtrigger = 8;
+
+// MOUSE_STRUCT, the part the message machine reads: my_inc2/mouse.cpp's
+// MUS_RenewMouse, run once at the top of a frame.
+struct EngineMouse {
+    int x = 0;
+    int y = 0;
+    bool bl = false;    // the button, as a level
+    bool tl = false;    // bl's rising edge
+    bool btl = false;   // (lcnt==15) || (lcnt==1): the edge, then every
+                        // frame from the fifteenth held one on
+    int lcnt = 0;
+    int no = -1;        // the rect under the pointer, or -1
+};
+
+// MOUSE_CHECK, layer 0.
+struct MouseRect {
+    bool flag = false;
+    int sx = 0;
+    int sy = 0;
+    int w = 0;
+    int h = 0;
+    int rect_no = 0;
+};
+
+// NOVEL_VOICE, one voice of one log entry.  vstcount is where in the entry's
+// text the voiced line starts - a byte offset into our UTF-8 copy rather than
+// the engine's CP932 one, which is only ever used to index that same string.
+struct NovelVoice {
+    int sno = 0;
+    int vno = 0;
+    int cno = 0;
+    int a_cut = 0;
+    int vstcount = 0;
+    int px = 0;
+    int py = 0;
+};
+
+// NOVEL_BUF: the engine's own log, a ring of NLOG_MAX entries.  Every
+// AVG_SetNovelMessage adds one and AVG_AddNovelMessage extends the newest, so
+// the line on screen is always already in it - bmax counts it, and bcount
+// is how many entries back the reader is looking.
+struct NovelBufState {
+    std::array<std::string, nlog_max> buf{};
+    std::array<std::vector<NovelVoice>, nlog_max> nv{};
+    std::array<std::string, nlog_v_max> vv_mes{};
+    int sno = 0;        // SetNovelMessageVoice1's pending voice
+    int vno = 0;
+    int cno = 0;
+    int a_cut = 0;
+    int bmax = 0;
+    int bpoint = 0;
+    int bcount = 0;
+};
+
+// A TEXT_STRUCT the log puts up: TXT_WINDOW+1, the entry being read, and
+// TXT_WINDOW+2, the voiced line under the pointer drawn over it.
+struct EngineText {
+    bool flag = false;
+    bool disp = false;
+    std::string str;
+    int x = 0;
+    int y = 0;
+    int color = 0;      // the FCT index
+};
+
+// GRP_HISTORY+0..10 as ControlHistorySystem leaves them: +0 the backing,
+// +1 the log handle, +2..+9 the buttons, +10 the half-tone handle.
+struct HistoryGraph {
+    int dx = 0;
+    int dy = 0;
+    int sx = 0;
+    int sy = 0;
+    int w = 0;
+    int h = 0;
+};
+struct HistoryBar {
+    bool shown = false;
+    int fade = 0;       // DRW_BLD(fade), all eleven planes
+    std::array<HistoryGraph, 11> g{};
+};
+
 class AvgMsg {
 public:
     struct Hooks {
@@ -91,9 +185,9 @@ public:
         std::function<bool()> mes_cut;             // AVG_GetMesCut
         std::function<int()> msg_cnt;              // AVG_MsgCnt
         std::function<int()> eff_cnt_puls;         // AVG_EffCntPuls
-        // AVG_NovelLogStart: page up into the backlog.  Ours is a UI mode
-        // rather than MSG_UP/MSG_LOG/MSG_DRAG, so this is what replaces
-        // those four states of the machine.
+        // Paging up into the backlog without the engine bar: the port's own
+        // UI, which stands in for AVG_NovelLogStart and the four states of
+        // the machine it leads to.
         std::function<void()> log_start;
         // DSP_SetTextDisp( TXT_WINDOW, disp ) - hides the text without
         // closing the window, which is what lets AVG_ControlChar put it back
@@ -124,6 +218,35 @@ public:
         // reads at a fixed rate and turns its own pages.
         std::function<bool()> demo;
         std::function<int()> demo_max;
+
+        // --- the history bar, used only with set_engine_bar(true) --------
+        // AVG_GetSelectMessageFlag / AVG_OpenSelectWindow /
+        // AVG_CloseSelectWindow: a choice is up under the message.
+        std::function<bool()> select_message_flag;
+        std::function<void()> open_select_window;
+        std::function<void()> close_select_window;
+        // AVG_GoConfig( 1 save, 2 load, 3 config ).
+        std::function<void(int)> go_config;
+        // Avg.auto_flag = !Avg.auto_flag, and Avg.msg_cut_mode.
+        std::function<void()> toggle_auto_flag;
+        std::function<bool()> msg_cut_mode;
+        std::function<void(bool)> set_msg_cut_mode;
+        // (Avg.msg_cut_optin&1) || AVG_CheckScenarioFlag(): whether skipping
+        // is offered on this line at all.
+        std::function<bool()> msg_cut_offered;
+        // Avg.side_option: 0 fades to 64, 1 always up, 2 fades out, 3 off.
+        std::function<int()> side_option;
+        std::function<bool()> omake;
+        // Avg.half_tone = ..., from the slider.
+        std::function<void(int)> set_half_tone_depth;
+        // AVG_PlayVoice( 0, cno, sno, vno, 255, 0, a_cut, 1 ): a voice
+        // clicked in the log.
+        std::function<void(int cno, int sno, int vno, int a_cut)> log_voice;
+        // DSP_GetTextDispPos( TXT_WINDOW, ... ): where the click indicator
+        // goes, measured by running the text through DrawGraphText without a
+        // destination.  Only the trace cares - the reference's glyph probe
+        // sees that pass as a draw.
+        std::function<void()> measure_text;
     };
 
     AvgMsg(Display& display, BackStruct& back, Hooks hooks)
@@ -153,6 +276,57 @@ public:
     // AVG_WaitAutoMode / AVG_ResetAutoMode.
     bool wait_auto_mode();
     void reset_auto_mode() { auto_count_ = 0; }
+
+    // --- the history bar and the log ------------------------------------
+    //
+    // The engine's side bar is part of this machine: its buttons are mouse
+    // rects on layer 0, AVG_ControlNovelMessage answers them from MSG_WAIT,
+    // MSG_STOP and MSG_NEXT, and paging back through the log is four more
+    // states of step1 (MSG_UP, MSG_LOG, MSG_DOWN, MSG_DRAG) with the text
+    // drawn from NovelBuf.  The port has a UI of its own for all of that,
+    // which is what normal play still uses; set_engine_bar(true) - a trace
+    // run - puts the engine's in charge instead, so a recorded run that
+    // works the bar replays against the reference at all.
+    void set_engine_bar(bool on) { engine_bar_ = on; }
+    bool engine_bar() const { return engine_bar_; }
+    // MUS_RenewMouse: the pointer and the left button for this frame.
+    void renew_mouse(int x, int y, bool left);
+    const EngineMouse& mouse() const { return mouse_; }
+    // MUS_GetMouseNoEx( button, lno ): the rect under the pointer on layer
+    // lno, if that is the current layer and `button` has its edge this
+    // frame (mouse_any asks for no edge at all).
+    int mouse_no_ex(int button, int lno) const;
+    // MUS_GetMouseNo( -1 ): the rect under the pointer on the current layer.
+    int mouse_no() const { return mouse_.no; }
+    // MUS_SetMouseLayer / MUS_GetMouseLayer / MUS_SetMouseRect /
+    // MUS_SetMouseRectFlag / MUS_ResetMouseRect_Layer.
+    void set_mouse_layer(int lno) { mouse_layer_ = lno; }
+    int mouse_layer() const { return mouse_layer_; }
+    void set_mouse_rect(int lno, int no, int sx, int sy, int w, int h,
+                        bool flag);
+    void set_mouse_rect_flag(int lno, int no, bool flag);
+    void reset_mouse_rect_layer(int lno);
+    // AVG_CloseWindow( 1 ) / AVG_OpenWindow( ON, 1 ) as AVG_GoConfig and
+    // AVG_EndConfig call them - verbatim, which unlike close_window() and
+    // open_window() leaves the window's own state (Message.wstep) alone.
+    void close_window_for_config();
+    void open_window_for_config();
+    // SetNovelMessageVoice1, from AVG_PlayVoice when test==0: the voice the
+    // next message will be logged with.
+    void set_novel_message_voice1(int sno, int vno, int cno, int a_cut);
+    // What the renderer draws.  TXT_WINDOW's display flag is separate from
+    // NovelMessage.disp: the log hides the line without taking the bar down.
+    bool main_text_disp() const { return main_text_disp_; }
+    const EngineText& log_text() const { return log_text_; }
+    const EngineText& log_voice_text() const { return log_voice_text_; }
+    const HistoryBar& history_bar() const { return history_bar_; }
+    const NovelBufState& novel_buf() const { return novel_buf_; }
+    // A trace checkpoint carries all of it: bmax alone moves the handle.
+    void write_history(std::ostream& out) const;
+    bool read_history(std::istream& in);
+    // Seed bmax for a checkpoint written before the log was carried: the
+    // handle only needs the count, and the texts are not there to restore.
+    void seed_history_depth(int bmax);
 
     // --- the half tone, also GM_AvgMsg.cpp ------------------------------
     void set_half_tone();          // AVG_SetHalfTone
@@ -271,10 +445,49 @@ private:
     int wstep_ = 0;
     int demo_cnt_ = 0;   // Avg.demo_cnt
 
+    bool engine_bar_ = false;
+    EngineMouse mouse_{};
+    // MouseCheck[lno][no], and MouseStruct.lno.
+    std::array<std::array<MouseRect, mouse_rest_max>, mouse_layers> rects_{};
+    int mouse_layer_ = 0;
+    NovelBufState novel_buf_{};
+    bool main_text_disp_ = false;   // DSP_SetTextDisp( TXT_WINDOW, ... )
+    EngineText log_text_{};         // TXT_WINDOW+1
+    EngineText log_voice_text_{};   // TXT_WINDOW+2
+    HistoryBar history_bar_{};      // GRP_HISTORY, and its static fade
+
     // TXT_GetTextCount( DSP_GetTextStr(TXT_WINDOW), step ).
     int text_count(int step) const { return txt_get_text_count(counted_, step); }
     // The MSG_WAIT / MSG_STOP body.
     void control_wait(const GameKey& key);
+    // AVG_GetHitKey(): GameKey.click && (MUS_GetMouseNo(-1)==-1).
+    bool hit_key() const;
+    // MUS_GetMouseNoEx( MOUSE_LBTRIGGER / MOUSE_LBUTTON / -1, 0 ).
+    int mouse_no_btrg() const;
+    int mouse_no_trg() const;
+    bool mouse_in_window() const;
+    // The bar's buttons below the log ones, shared by MSG_NEXT (under a
+    // choice) and MSG_WAIT / MSG_STOP: 3/4 save and load, 5 auto, 6 skip,
+    // 8 config, 9 the half-tone slider.
+    void bar_buttons(int command_trg, int command_btrg);
+    void set_half_tone_from_slider();
+    // The log itself.
+    void novel_log_start();                 // AVG_NovelLogStart
+    void set_novel_message_history(const std::string& str);
+    void set_novel_message_voice2(bool top);
+    void set_history_system_mouse_rect();   // SetHistorySystemMouseRect
+    void reset_history_system_mouse_rect();
+    void set_history_voice_mouse_rect();    // SetHistoryVoiceMouseRect
+    void reset_history_voice_mouse_rect();
+    // Layer 0, by slot and rect number (MUS_SetMouseRectAdd).
+    void set_mouse_rect(int no, int sx, int sy, int w, int h, bool flag,
+                        int rect_no);
+    void reset_mouse_rect(int no) { rects_[0][static_cast<std::size_t>(no)] = {}; }
+    // DSP_SetText( TXT_WINDOW+1, ..., buf ) with the log's settings.
+    void set_log_text(bool disp, const std::string& str);
+    void leave_log();                       // back to step2, bcount 0
+    void control_log(const GameKey& key);   // MSG_LOG
+    void control_history_system();          // ControlHistorySystem
     // Shared tail of every "the reader is ready" branch.
     void advance_step();
     int half_tone_depth() const {

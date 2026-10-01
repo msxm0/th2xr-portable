@@ -256,6 +256,9 @@ private:
     const TransitionMask& transition_mask(int type);
     void prepare_pending_transition_mask();
 
+    // Render targets from finished transitions, for the next one.
+    std::vector<Texture> spare_frame_targets_;
+    void end_transition();
     struct Transition {
         Texture previous;
         Surface previous_pixels;
@@ -272,6 +275,10 @@ private:
         std::uint64_t debug_id = 0;
         int last_dumped_frame = -1;
         bool debug_metadata_written = false;
+        // AVG_SetBack takes its snapshot only `if(back_max)`, and back_max is
+        // AVG_EffCnt(fd_max) as it stands at that moment - zero under a held
+        // skip key.  See begin_transition.
+        bool no_snapshot = false;
     };
     struct BackgroundFade {
         std::array<float, 3> from{128.0f, 128.0f, 128.0f};
@@ -391,6 +398,12 @@ private:
         int holiday = -1;
         bool dismissing = false;
         int frame = 0;
+        // AVG_CALENDER: the day-change calendar AVG_ToHertDaySinkou puts up
+        // runs as a step of AVG_Main of its own, which calls nothing but
+        // AVG_SetCalender - not AVG_ControlSystem2, so Avg.msg_cut stays
+        // what it was.  ViewCalender, the opcode, shows the same page from
+        // inside AVG_GAME and is not one.
+        bool step = false;
     };
     struct SakuraPetal {
         bool active = false;
@@ -439,6 +452,7 @@ private:
     std::unordered_set<int> unlocked_h_cgs_;
     std::unordered_set<int> unlocked_replays_;
     const bool suppress_audio_output_;
+    SDL_AudioDeviceID audio_keepalive_ = 0;  // see the constructor's end
     std::unique_ptr<th2::SoakGameDriver<Game>> soak_;
     std::size_t soak_renderer_ticks_ = 0;
     // Window/renderer holders are declared before every other SDL-dependent
@@ -863,12 +877,21 @@ private:
     // disp 0 with the glyphs still on screen and ours reported no glyphs at
     // all.  The draw really did happen on both sides - only the dump differed.
     std::string trace_glyph_drawn_;
+    // This tick's DSP_GetTextDispPos( TXT_WINDOW ): see trace_dump_state.
+    std::string trace_glyph_measured_;
+    // This frame was not drawn: see th2::engine_draw_flag.
+    bool frame_undrawn_ = false;
+    std::string trace_glyph_string() const;
     bool trace_choice_answered_ = false;
     int choice_highlight_ = 0;
     int choice_selected_ = -1;
     int choice_result_register_ = -1;
     bool choice_ex_ = false;
     // --- UI State ---
+    // Where a new game starts.  The title screen's scan walks it too, so the
+    // first scene is fetched and decoded before the click that starts it.
+    static constexpr const char* new_game_script = "EV_0301MORNING.SDT";
+    bool title_scanned_ = false;
     enum class UiMode {
         title,
         cg_gallery,
@@ -953,7 +976,16 @@ private:
     std::chrono::steady_clock::time_point sidebar_alpha_updated_{};
     bool sidebar_mouse_near_ = false;
     bool suppress_sidebar_mouse_up_ = false;
+    // NovelMessage.disp: the engine's own switch for the text and the bar,
+    // which it turns off for a background fade or a character animation and
+    // back on with the next message.  Only the engine writes it.
     bool message_visible_ = true;
+    // The player put the window away (F10, the side bar, the touch menu).
+    // Kept apart from message_visible_ because any input brings this one
+    // back - and when the two were one flag, a click during a scene change
+    // put the old message and the bar back over the fade.
+    bool window_hidden_ = false;
+    bool message_shown() const { return message_visible_ && !window_hidden_; }
     // Message.wstep: whether the message *window* is up, which is a
     // different thing from whether the text is shown.  AVG_GetWindowCond
     // reads this, and AVG_ControlChar uses it to know the window was open
@@ -1035,6 +1067,8 @@ private:
     int map_previous_field_ = 1;
     int map_hover_ = -1;
     int map_slide_ticks_ = 0;
+    // |EventFieldRoolCount| before this frame's roll step, 0 if none ran.
+    int map_marker_roll_ = 0;
     // AVG_ControlMapEvent's select_back (a function static, so it outlives
     // each map) and the pointer it reads select from every frame.
     int map_select_back_ = 0;
@@ -1104,6 +1138,9 @@ private:
     int trace_mouse_x_ = 0;
     int trace_mouse_y_ = 0;
     void trace_drive_map(bool pick);
+    void trace_map_follow_pointer();
+    void trace_peek_map_pointer();
+    void trace_map_pick_position(int& x, int& y) const;
     std::chrono::steady_clock::time_point map_tick_{};
     std::chrono::steady_clock::time_point map_started_{};
     std::optional<th2::ReadMarker> current_read_marker() const;
@@ -1208,6 +1245,16 @@ private:
     bool trace_mode_ = false;
     std::filesystem::path trace_dir_;
     TraceScript trace_script_;
+    // --record: live input, captured as a script while it is played.  Until
+    // record_from_ the base script (--trace-input) drives, unpaced; from it
+    // on the player does, at sixty ticks a second.
+    TraceRecorder recorder_;
+    std::uint64_t record_from_ = 0;
+    bool record_live() const
+    {
+        return recorder_.active() && trace_tick_ >= record_from_;
+    }
+    void record_input_event(const SDL_Event& event);
     std::uint64_t trace_tick_ = 0;
     std::uint64_t trace_last_tick_ = 0;
     // Frames before this tick are computed but not written.  A frame is
@@ -1255,6 +1302,8 @@ public:
     // there for fifteen times as many ticks.
     std::chrono::steady_clock::time_point engine_now() const;
     void set_trace_hold(std::uint64_t tick, int seconds);
+    void enable_recording(const std::filesystem::path& path,
+                          std::uint64_t from);
     // Write a checkpoint at the end of `tick`, and resume from `file` once
     // the lead-in has reached `trigger`.  Either may be left unset.
     void set_trace_checkpoint(const std::filesystem::path& save_file,
@@ -1291,11 +1340,29 @@ private:
     static std::chrono::milliseconds audio_fade_duration(int frames);
     float text_line_height() const;
     std::vector<std::string> display_lines(std::string_view source) const;
+    // display_lines() measures a growing prefix per character, and a frame
+    // asks for the same message's lines from several places: remembered by
+    // text, width and font generation, the last few of them.
+    struct WrappedText {
+        std::string source;
+        float width = 0.0f;
+        std::uint64_t generation = 0;
+        std::vector<std::string> lines;
+    };
+    mutable std::vector<WrappedText> wrapped_text_;
     float message_text_x() const;
     float message_text_y() const;
     static std::size_t utf8_prefix_bytes(
         std::string_view text, std::size_t characters);
     static std::size_t utf8_character_count(std::string_view text);
+    // For each byte of `visible` that starts a character, the index in
+    // msg().counted() of the engine glyph it is drawn as.  The two strings
+    // are different renderings of one source: the engine does not count the
+    // script's line breaks, among other things, so numbering the visible
+    // string's own characters ran a message's tail - one character per line
+    // break - past every glyph the engine reveals, and the outline text
+    // stopped three or four characters short with the indicator already up.
+    std::vector<std::size_t> engine_glyph_map(std::string_view visible) const;
     int choice_reveal_count(int index) const;
     bool choice_reveal_finished() const;
     // The single point at which a choice is committed.  AVG_ControlSelectWindow
@@ -1323,6 +1390,8 @@ private:
     void retire_soak_gpu_work(bool force = false);
     std::vector<std::uint8_t> load_transition_mask(
         int type, int& width, int& height);
+    std::vector<std::uint8_t> transition_mask_pixels(
+        SDL_Surface* surface, int type, int& width, int& height);
     // Script-driven transitions run through AVG_EffCnt(), which the
     // effect-speed setting scales; the title, save and gallery screens use
     // AVG_EffCnt4(), which it does not.
@@ -1390,6 +1459,40 @@ private:
     void stop_bgm(int fade);
     bool movie_bgm_stop_pending_ = false;
     void play_voice(const th2::Event& event);
+    void draw_engine_text(const th2::EngineText& text);
+    // The engine's system menu, for the engine bar: game_engine_config.cpp.
+    struct EngineConfigState {
+        int flag = 0;
+        int mode = 0;
+        int cnt = 0;
+        int next_cnt = 0;
+        int next_mode = 0;
+    };
+    EngineConfigState engine_config_{};
+    int engine_config_select_back_ = 0;   // AVG_ControlConfigWindow's static
+    int engine_config_open_mode_ = 0;     // ConfigOpenMode
+    int engine_config_mouse_ = 0;         // Config.mouse
+    // AvgStep[0] == AVG_CONFIG, and AVG_ChangeSetp's pending change, which
+    // AVG_RenewSetp applies at the end of the frame.
+    bool engine_config_step_ = false;
+    std::optional<bool> engine_config_step_next_;
+    // AVG_CloseBack has put the half-tone plate away; AVG_OpenBack brings it
+    // back.  setup_background_graphs re-asserts the plate every frame and
+    // has to know.
+    bool engine_back_closed_ = false;
+    // GRP_WEATHER's display: AVG_CloseBack hides every petal, and the next
+    // AVG_ControlWeather puts them back.
+    bool weather_disp_ = true;
+    bool engine_config_check() const;
+    void engine_go_config(int mode);
+    void engine_close_back();
+    void engine_open_back();
+    void engine_set_config_window();
+    void engine_reset_config_window();
+    void engine_end_config();
+    void engine_close_start_config_window(int cmax);
+    void control_engine_config();
+    void play_log_voice(int character, int scenario, int voice, bool a_cut);
     void replay_backlog_voice(const BacklogVoice& voice);
     void update_audio();
     void refresh_audio_wait(bool before_script);
@@ -1803,10 +1906,12 @@ private:
     // target surviving between frames is not contractual, and an FBO
     // attachment can be invalidated on the web build.  Both blits stay on
     // the GPU; there is no readback.
-    void ensure_previous_frame();
-    void capture_previous_frame(SDL_Texture* art_target);
-    Texture previous_frame_;
-    bool previous_frame_valid_ = false;
+    // The art target that has had its first clear; any other is new.
+    SDL_Texture* art_cleared_for_ = nullptr;
+    // Whether the authentic-text and sidebar layers were drawn into since
+    // their last clear: an empty layer is neither cleared nor composited.
+    bool text_layer_used_ = true;
+    bool sidebar_layer_used_ = true;
     // Cross-dissolves two character poses through a scratch target, the way
     // the original blends the pair inside one sprite.  False when the
     // renderer cannot do it, so the caller falls back.

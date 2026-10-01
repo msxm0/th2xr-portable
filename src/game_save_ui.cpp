@@ -621,6 +621,7 @@ void Game::update_map()
         // The characters' sprites were set up in case 0 and animate from
         // there, through the clock and the fade-in, not from step 3.
         ++map_anim_frames_;
+        map_marker_roll_ = 0;
         // Step 1 before step 2, and stepped here rather than in
         // update_clock_calendar: AVG_ControlMapEvent calls AVG_ViewClock
         // itself, from after EXEC_ControlLang, where update_clock_calendar
@@ -674,6 +675,11 @@ void Game::update_map()
                     && map_positions_[position].field == map_field_;
             }
         }
+        // The markers' cross-fade reads EventFieldRoolCount before this
+        // step takes one off it, the fields' slide after:
+        //     cnt = 8-abs(EventFieldRoolCount); ...DRW_BLD(cnt*32)...
+        //     EventFieldRoolCount--; cnt = EventFieldRoolCount*EventFieldRoolCount;
+        map_marker_roll_ = std::abs(map_slide_ticks_);
         if (map_slide_ticks_ > 0) {
             --map_slide_ticks_;
         } else if (map_slide_ticks_ < 0) {
@@ -691,6 +697,8 @@ void Game::update_map()
                 // releasing the map and loading the choice, so the load lands
                 // one frame after the fade ends.
                 map_finish_pending_ = true;
+                // case 4, scnt==16: AVG_ResetBack(0); MainWindow.draw_flag=1;
+                th2::set_draw_flag_on();
             }
         }
     }
@@ -865,6 +873,7 @@ int Game::novel_log_depth() const
 
 void Game::draw_sidebar()
 {
+    sidebar_layer_used_ = true;     // composited and cleared next frame
     if (!ui_sidebar_track_ || !ui_sidebar_btns_) return;
 
     // AVG_ControlHistorySystem's fade, on DRW_BLD's 0..256 scale rather than
@@ -879,15 +888,27 @@ void Game::draw_sidebar()
     // petals step: the browser build renders at the display refresh rate,
     // which is often not 60 Hz.  A stall is clamped so the fade cannot jump.
     const auto now = engine_now();
-    const float steps = std::clamp(
-        static_cast<float>(
-            std::chrono::duration<double>(now - sidebar_alpha_updated_).count()
-            * 60.0),
-        0.0f, 8.0f);
+    // In a trace run the engine's own count: once per control pass, and
+    // MUS_GetMousePosX() is the scripted pointer.  Elapsed time there is
+    // 16 ms a tick - 0.96 of a sixtieth - so the fade moved 23.04 a frame,
+    // and the pointer it asked about was SDL's, which a trace never moves.
+    // The steady route parks at x=400 with the bar pinned at 64, so neither
+    // showed until a recorded run put the pointer on the bar.
+    const float steps = trace_mode_
+        ? static_cast<float>(control_steps_)
+        : std::clamp(
+              static_cast<float>(
+                  std::chrono::duration<double>(now - sidebar_alpha_updated_)
+                      .count()
+                  * 60.0),
+              0.0f, 8.0f);
     sidebar_alpha_updated_ = now;
     // MSG_DRAG holds the bar up while the log handle is being pulled, which
     // is the one way the pointer can be over it and still want it opaque.
-    const bool rising = sidebar_mouse_near_ || backlog_handle_dragging_;
+    const bool near = trace_mode_
+        ? trace_mouse_x_ >= th2::display_width - 24
+        : sidebar_mouse_near_;
+    const bool rising = near || backlog_handle_dragging_;
     switch (config_.sidebar_mode) {
     case 0:
         sidebar_alpha_ = std::clamp(
@@ -906,6 +927,11 @@ void Game::draw_sidebar()
         sidebar_alpha_ = 0.0f;
         break;
     }
+    if (msg().engine_bar()) {
+        // The engine's own bar: ControlHistorySystem has already set up all
+        // eleven planes and the fade this frame, from the machine's state.
+        sidebar_alpha_ = static_cast<float>(msg().history_bar().fade);
+    }
     if (sidebar_alpha_ <= 0.0f) {
         return;
     }
@@ -920,11 +946,6 @@ void Game::draw_sidebar()
                     const SDL_FRect& dst) {
         auto* const exact = display_->gl_exact_blend();
         if (exact && exact->available()
-            // The whole target, as DSP's own graph path captures it: the
-            // region form's rows are indexed for a bottom-up framebuffer and
-            // the shader reads the scratch at gl_FragCoord, so a band-limited
-            // capture left every button blending against an empty scratch -
-            // visibly, each one composited over black instead of the track.
             && exact->capture_destination(renderer_)
             && exact->draw(renderer_, texture, src, dst, false, false, 3,
                            fade, th2::bright_neutral, th2::bright_neutral,
@@ -936,6 +957,22 @@ void Game::draw_sidebar()
         SDL_RenderTexture(renderer_, texture, &src, &dst);
         SDL_SetTextureAlphaMod(texture, 255);
     };
+
+    if (msg().engine_bar()) {
+        // GRP_HISTORY+0 is BMP_HISTORY+0 (sys0000), the rest BMP_HISTORY+1
+        // (sys0001).
+        const auto& graphs = msg().history_bar().g;
+        for (std::size_t i = 0; i < graphs.size(); ++i) {
+            const auto& g = graphs[i];
+            const auto to_rect = [](int x, int y, int w, int h) {
+                return SDL_FRect{static_cast<float>(x), static_cast<float>(y),
+                                 static_cast<float>(w), static_cast<float>(h)};
+            };
+            blit(i == 0 ? ui_sidebar_track_.get() : ui_sidebar_btns_.get(),
+                 to_rect(g.sx, g.sy, g.w, g.h), to_rect(g.dx, g.dy, g.w, g.h));
+        }
+        return;
+    }
 
     // sys0000.tga is the complete 30x600 sidebar backing.
     const SDL_FRect sidebar_dst{770.0f, 0.0f, 30.0f, 600.0f};
@@ -1042,13 +1079,13 @@ void Game::update_sidebar_hover(float x, float y)
     if (x < 776.0f || x >= 798.0f) {
         return;
     }
+    // MUS_GetMouseNoEx( -1, 0 ) is the history bar's rect under the pointer,
+    // and rect 0 is the whole track, (776, 10, 22, 255) - not the handle.
+    // ControlHistorySystem's `case 0` lights the handle for any of it, so the
+    // handle comes up the moment the pointer is on the track, wherever the
+    // handle happens to sit.
     if (!backlog_.empty()) {
-        const float ratio = backlog_.empty() ? 1.0f
-            : 1.0f - static_cast<float>(backlog_depth_)
-                / static_cast<float>(backlog_.size());
-        const float handle_y = 10.0f + ratio * (255.0f - 31.0f);
-        backlog_handle_hover_ =
-            y >= handle_y && y < handle_y + 30.0f;
+        backlog_handle_hover_ = y >= 10.0f && y < 10.0f + 255.0f;
     }
     opacity_handle_hover_ =
         y >= opacity_track_top
@@ -1140,7 +1177,7 @@ bool Game::handle_sidebar_click(float x, float y, bool activate_buttons)
             break;
         case 6:
             play_se(-1, 9104, false, 255);
-            message_visible_ = !message_visible_;
+            window_hidden_ = !window_hidden_;
             break;
         case 7:
             play_se(-1, 9104, false, 255);

@@ -170,16 +170,28 @@ void Game::setup_background_graphs(
         // under it every frame the mix could never get past the blend level
         // and the zoom sat half faded until it ended.
         const bool no_snapshot = back().fd_type == th2::bak_cfzoom1
-            || back().fd_type == th2::bak_cfzoom4;
+            || back().fd_type == th2::bak_cfzoom4
+            || transition_->no_snapshot;
         if (no_snapshot) {
             display().reset_graph(th2::grp_back + 1);
         } else {
             display().borrow_bmp(
                 th2::bmp_back + 1, transition_->previous.get(),
                 th2::display_width, th2::display_height, false);
-            display().set_graph(
-                th2::grp_back + 1, th2::bmp_back + 1, th2::lay_back, true,
-                th2::check_none);
+            // Seated once, like GRP_BACK above: DSP_SetGraph resets the
+            // brightness and the display flag with everything else, and
+            // AVG_ControlBackChange's BAK_FADE drives the outgoing snapshot
+            // through exactly those - DSP_SetGraphBright( GRP_BACK+1,
+            // 128-rate, ... ) for the first half of a fade to a colour, then
+            // DSP_SetGraphDisp( GRP_BACK+1, OFF ).  Re-seated every frame the
+            // snapshot sat at full brightness and the fade to black lagged
+            // the engine's by the whole of its first half.
+            if (display().graph(th2::grp_back + 1).bno != th2::bmp_back + 1
+                || display().graph(th2::grp_back + 1).layer != th2::lay_back) {
+                display().set_graph(
+                    th2::grp_back + 1, th2::bmp_back + 1, th2::lay_back, true,
+                    th2::check_none);
+            }
         }
     } else {
         // Not wiping.  GRP_BACK+1 is shared between the wipe's outgoing
@@ -210,6 +222,11 @@ void Game::setup_background_graphs(
                    || msg().check_half_tone_step() == th2::tone_nodisp) {
             display().reset_graph(th2::grp_back + 1);
             display().set_graph_disp(th2::grp_back, true);
+        }
+        // AVG_CloseBack: the engine's system menu has put the plate away,
+        // and only AVG_OpenBack brings it back.
+        if (engine_back_closed_) {
+            display().set_graph_disp(th2::grp_back + 1, false);
         }
     }
 
@@ -498,7 +515,11 @@ th2::AvgBack::Hooks Game::background_hooks()
     hooks.set_char_bright = [this](int r, int g, int b) {
         chars().set_char_bright_all(r, g, b);
     };
-    hooks.novel_message_disp = [this](bool on) { message_visible_ = on; };
+    // AVG_SetNovelMessageDisp, the whole of it, as for a character: the
+    // keywait mark and the bar's mouse rect go down with the text.
+    hooks.novel_message_disp = [this](bool on) {
+        msg().set_novel_message_disp(on);
+    };
     hooks.reset_half_tone = [this] { reset_half_tone(); };
     hooks.global_count = [this] { return global_count_; };
     return hooks;
@@ -561,6 +582,48 @@ th2::AvgMsg::Hooks Game::message_hooks()
             if (overlay_states_[static_cast<std::size_t>(i)].visible) {
                 display().set_graph_disp(th2::grp_script + i, on);
             }
+        }
+    };
+    // The engine's history bar, which a trace run uses in place of ours.
+    hooks.select_message_flag = [this] { return choosing_; };
+    hooks.go_config = [this](int page) {
+        // AVG_GoConfig( 1..3 ): the engine's own save, load and side-bar
+        // settings screens, which are not transcribed.  Only the engine bar
+        // calls this, and there ours would not stand in for them - they are
+        // a different UI mode with the scene still running - so the click is
+        // reported and nothing opens.
+        if (msg().engine_bar()) {
+            SDL_Log("engine config: AVG_GoConfig(%d) opens a screen that is "
+                    "not transcribed", page);
+            return;
+        }
+        if (page == 1 && !replay_mode_) {
+            open_save_load(UiMode::save);
+        } else if (page == 2 && !replay_mode_) {
+            open_save_load(UiMode::load);
+        } else if (page == 3) {
+            open_config();
+        }
+    };
+    hooks.toggle_auto_flag = [this] { auto_mode_ = !auto_mode_; };
+    hooks.msg_cut_mode = [this] { return skip_mode_; };
+    hooks.set_msg_cut_mode = [this](bool on) { skip_mode_ = on; };
+    hooks.msg_cut_offered = [this] {
+        return config_.skip_unread || current_text_is_read();
+    };
+    hooks.side_option = [this] { return config_.sidebar_mode; };
+    hooks.omake = [this] { return replay_mode_; };
+    hooks.set_half_tone_depth = [this](int depth) {
+        config_.message_half_tone = std::clamp(
+            depth, th2::GameConfig::min_message_half_tone,
+            th2::GameConfig::max_message_half_tone);
+    };
+    hooks.log_voice = [this](int cno, int sno, int vno, int a_cut) {
+        play_log_voice(cno, sno, vno, a_cut != 0);
+    };
+    hooks.measure_text = [this] {
+        if (trace_mode_) {
+            trace_glyph_measured_ = trace_glyph_string();
         }
     };
     return hooks;

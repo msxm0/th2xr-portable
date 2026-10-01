@@ -127,6 +127,9 @@ public:
 
     void open_char();                                      // AVG_OpenChar
     void close_char();                                     // AVG_CloseChar
+    // AVG_ConfigCheckChar: no character is doing anything, CHAR_COND_WAIT
+    // included - which is where it differs from any_animating().
+    bool config_check() const;
 
     // SetCharPosShake( shx, shy, disp ): moves every character graph and,
     // when disp is not -1, takes them out of the plate (cut_mode 2) or puts

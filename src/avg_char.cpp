@@ -87,6 +87,7 @@ void AvgChar::avg_load_char(int index, int cno, int pose, int in_type)
 {
     // AVG_LoadChar: decode into BMP_CHAR+index*2+grp, then give the slot a
     // graph at LAY_CHAR+layer and put it where the character stands.
+    set_draw_flag_on();   // MainWindow.draw_flag=ON;
     CharState& character = chars_[index];
     const int slot = bmp_char + index * 2 + character.grp;
     if (hooks_.load_char_bitmap) {
@@ -268,6 +269,7 @@ void AvgChar::reset_char(int char_no, int out_type, int frame)
         chars_[index].type = char_type_wait2;
         return;
     }
+    set_draw_flag_on();   // MainWindow.draw_flag=ON;
     if (hooks_.reset_half_tone) {
         hooks_.reset_half_tone();
     }
@@ -421,6 +423,16 @@ void AvgChar::open_char()
     for (int i = 0; i < max_char; ++i) {
         display_.set_graph_disp(grp_char + i, true);
     }
+}
+
+bool AvgChar::config_check() const
+{
+    for (const auto& character : chars_) {
+        if (character.flag && character.cond != char_cond_nomal) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void AvgChar::close_char()

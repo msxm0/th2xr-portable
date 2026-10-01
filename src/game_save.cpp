@@ -494,6 +494,7 @@ bool Game::load_body(std::istream& in)
     reset_play_state();
     ui_mode_ = UiMode::game;
     message_visible_ = true;
+    window_hidden_ = false;
 
     // Script identity
     const auto script_name = read_str(in, 64);

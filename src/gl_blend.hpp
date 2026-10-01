@@ -33,18 +33,11 @@ public:
 
     bool available() const;
 
-    // Copies the current render target into an internally held scratch, so
-    // the next draw() can read the destination.  Returns false if there is
-    // nothing to copy (drawing straight to the window).
-    //
-    // `region` limits the copy to the part the next draw will read, in SDL's
-    // top-left coordinates.  The scratch stays full size and aligned with
-    // the target either way; outside the region it simply holds whatever it
-    // held before, which nothing samples.  Glyphs need this - one composite
-    // per glyph against a whole-screen copy each time is a lot of bandwidth
-    // to move for a 24 pixel box.
-    bool capture_destination(SDL_Renderer* renderer,
-                             const SDL_FRect* region = nullptr);
+    // Asks the next draw() to read the destination: it copies the part of
+    // the current render target it covers into an internally held scratch
+    // first.  Returns false if there is nothing to copy (drawing straight to
+    // the window).
+    bool capture_destination(SDL_Renderer* renderer);
 
     // Composites `source`'s `src` rectangle into the current render target's
     // `dst` rectangle.  `alpha` is DRW_BLD's parameter on the rasteriser's

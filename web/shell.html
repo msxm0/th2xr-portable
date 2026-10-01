@@ -110,12 +110,49 @@
   // IndexedDB so it survives a page reload.
   const PREF_ROOT = '/libsdl';
 
+  // A sync walks every file under the root and every key in the database,
+  // a couple of thousand IndexedDB callbacks on the main thread, so it only
+  // runs once something has actually changed: watchStorage() marks the
+  // filesystem's own mutating calls.
+  let storageDirty = false;
+  let storageSyncing = false;
   function flushStorage() {
-    if (Module.FS) {
-      Module.FS.syncfs(false, (error) => {
-        if (error) console.error('syncfs write failed', error);
-      });
+    if (!Module.FS || !storageDirty || storageSyncing) {
+      return;
     }
+    storageDirty = false;
+    storageSyncing = true;
+    Module.FS.syncfs(false, (error) => {
+      storageSyncing = false;
+      if (error) {
+        storageDirty = true;    // try again next time
+        console.error('syncfs write failed', error);
+      }
+    });
+  }
+
+  function watchStorage() {
+    const FS = Module.FS;
+    for (const name of ['write', 'rename', 'unlink', 'rmdir', 'mkdir',
+                        'truncate', 'ftruncate', 'symlink', 'chmod', 'utime']) {
+      const original = FS[name];
+      if (typeof original !== 'function') {
+        continue;
+      }
+      FS[name] = function () {
+        storageDirty = true;
+        return original.apply(this, arguments);
+      };
+    }
+    // Opening for writing creates or truncates even if nothing is written.
+    const open = FS.open;
+    FS.open = function (path, flags) {
+      if (typeof flags === 'string' ? flags !== 'r'
+                                    : (flags & 3) !== 0 || (flags & 0x240) !== 0) {
+        storageDirty = true;
+      }
+      return open.apply(this, arguments);
+    };
   }
 
   // Engine arguments can come from the query string, so a device that is
@@ -161,6 +198,7 @@
       status.textContent = 'Loading saved data…';
       Module.FS.syncfs(true, (error) => {
         if (error) console.error('syncfs read failed', error);
+        watchStorage();
         status.textContent = 'Ready.';
         startButton.textContent = 'Start';
         startButton.disabled = false;
@@ -474,7 +512,11 @@
   // Saves are written straight to the emulated filesystem, so push them into
   // IndexedDB periodically and whenever the page is being hidden or closed.
   setInterval(flushStorage, 10000);
-  window.addEventListener('pagehide', flushStorage);
+  window.addEventListener('pagehide', () => {
+    // Leaving is the last chance, whatever is in flight.
+    storageSyncing = false;
+    flushStorage();
+  });
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') flushStorage();
   });

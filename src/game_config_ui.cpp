@@ -78,7 +78,7 @@ void Game::return_to_title()
     replay_mode_ = false;
     wake_time_.reset();
     audio_wait_.reset();
-    transition_.reset();
+    end_transition();
     back().br_flag = 0;
     bgm_.stop();
     for (auto& channel : transient_se_) channel.stop();

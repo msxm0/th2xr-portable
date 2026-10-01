@@ -283,12 +283,17 @@ struct GlPatternTransition::Impl {
             glUniform1i(previous_location, 0);
             glUniform1i(next_location, 1);
             glUniform1i(mask_location, 2);
-            glUniform1f(vague_location, 128.0f);
+            // Integer uniforms, as the shader declares them: glUniform1f on
+            // an int is an error that leaves it 0, and the shader divides by
+            // u_vague and by u_target_size.
+            glUniform1i(vague_location, 128);
+            glUniform2i(mask_size_location, 1, 1);
+            glUniform2i(target_size_location, 2, 2);
             glBindVertexArray(vertex_array);
 
             GLubyte pixel[4] = {0, 0, 0, 0};
             // Past the end of the ramp the result must be the incoming frame.
-            glUniform1f(offset_location, 384.0f);
+            glUniform1i(offset_location, 384);
             glDrawArrays(GL_TRIANGLES, 0, 3);
             glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
             if (!(pixel[1] > 200 && pixel[0] < 64)) {
@@ -298,7 +303,7 @@ struct GlPatternTransition::Impl {
                         pixel[0], pixel[1], pixel[2], pixel[3]);
             }
             // Before it starts, the outgoing one.
-            glUniform1f(offset_location, 0.0f);
+            glUniform1i(offset_location, 0);
             glDrawArrays(GL_TRIANGLES, 0, 3);
             glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
             if (!(pixel[0] > 200 && pixel[1] < 64)) {
@@ -438,29 +443,19 @@ bool GlPatternTransition::draw(
         glUniform2i(impl_->target_size_location, tw, th);
     }
 
-    // Put these back afterwards rather than trusting SDL to reset them: it
-    // caches its own idea of the GL state and only sets what it thinks has
-    // changed.
-    const GLboolean blend_was_on = glIsEnabled(GL_BLEND);
-    const GLboolean scissor_was_on = glIsEnabled(GL_SCISSOR_TEST);
+    // Nothing is saved to put back.  The SDL_FlushRenderer above marks SDL's
+    // cached GL state invalid, so it sets blend, scissor, viewport, program
+    // and textures again before its next draw - and a query per frame here,
+    // or a glGetError, is a round trip to the GPU process in WebGL.
     glDisable(GL_BLEND);
     glDisable(GL_SCISSOR_TEST);
     glBindVertexArray(impl_->vertex_array);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindVertexArray(0);
-    if (blend_was_on) {
-        glEnable(GL_BLEND);
-    }
-    if (scissor_was_on) {
-        glEnable(GL_SCISSOR_TEST);
-    }
-
-    // Put back what SDL expects to find; it caches this state rather than
-    // setting it per draw.
     glActiveTexture(GL_TEXTURE0);
     glUseProgram(0);
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-    return glGetError() == GL_NO_ERROR;
+    return true;
 }
 
 #else  // No GL headers here; SDL_GPU is the route to a shader instead.

@@ -133,7 +133,9 @@ int Game::prefetch_event_assets(
         // every pixel - too much for the frame the wipe starts on.
         if (const auto* change = literal(event, 0);
             change && *change >= 0x80) {
-            request(graphics_, std::format("f0{:03d}.bmp", *change & 0x7f));
+            const auto mask = std::format("f0{:03d}.bmp", *change & 0x7f);
+            note("grp:", mask, false);
+            request(graphics_, mask);
             if (!transition_masks_.contains(*change)) {
                 pending_transition_masks_.insert(*change);
             }
@@ -148,12 +150,12 @@ int Game::prefetch_event_assets(
         // The tone and the weather are engine state rather than arguments,
         // so this is the name the load would use if it happened now.  A
         // script that changes either first only costs a wasted request.
-        return request(
-            backgrounds_,
-            std::format(
-                "B{:03d}{}{}{}.bmp", scene / 10,
-                (tone_back_ < 0 ? tone_ : tone_back_) % 4, weather_,
-                scene % 10));
+        // Decoded ahead as well as fetched: set_background() takes it.
+        const auto background = std::format(
+            "B{:03d}{}{}{}.bmp", scene / 10,
+            (tone_back_ < 0 ? tone_ : tone_back_) % 4, weather_, scene % 10);
+        note("bak:", background, true);
+        return request(backgrounds_, background);
     }
     if (name == "H" || name == "HT" || name == "V" || name == "VT") {
         const auto* visual_high = literal(event, 1);
@@ -164,7 +166,9 @@ int Game::prefetch_event_assets(
         const int visual = *visual_high * 10
             + (visual_low && *visual_low >= 0 ? *visual_low : 0);
         const char prefix = (name == "H" || name == "HT") ? 'h' : 'v';
-        return request(graphics_, std::format("{}{:06d}.tga", prefix, visual));
+        const auto cg = std::format("{}{:06d}.tga", prefix, visual);
+        note("grp:", cg, false);  // set_cg() takes it decoded
+        return request(graphics_, cg);
     }
     if (name == "SetBmpEx") {
         // Backgrounds, character sprites and CGs: by far the most of what a
@@ -404,11 +408,14 @@ void Game::submit_scan_wants()
 
     std::string lines;
     lines.reserve(wanted.size() * 64);
+    // "path:offset:size<TAB>depth": the part before the tab is the store's
+    // own key for the range, so the JS side slices it out instead of
+    // rebuilding it.
     for (const WantedRange* want : wanted) {
         lines += want->path;
-        lines += '\t';
+        lines += ':';
         lines += std::to_string(want->offset);
-        lines += '\t';
+        lines += ':';
         lines += std::to_string(want->size);
         lines += '\t';
         lines += std::to_string(want->depth);
@@ -495,6 +502,18 @@ void Game::prefetch_upcoming_assets()
     explore(runtime_.vm_bytecode(), runtime_.vm_registers(),
             runtime_.script_name(), runtime_.vm_pc(), 0, requests,
             request_budget, visited);
+    // The title screen starts a new game from engine code, not from an
+    // instruction this walk could follow, so its first scene - background,
+    // music, the opening lines' voices - would otherwise be read and decoded
+    // on the frame the player clicks.
+    if (ui_mode_ == UiMode::title && visited.insert(new_game_script).second) {
+        static constexpr std::array<std::int32_t, 64> none{};
+        const auto prefix = script_prefix_bytecode(new_game_script);
+        if (!prefix.empty()) {
+            explore(prefix, none, new_game_script, 0, 0, requests,
+                    request_budget, visited);
+        }
+    }
 
     submit_scan_wants();
     update_predecode_queues();

@@ -70,6 +70,7 @@ PersistentState::~PersistentState() {
 }
 
 void PersistentState::close() {
+    read_memo_valid_ = false;   // another database is another answer
     sqlite3_close(db_);
     db_ = nullptr;
 }
@@ -113,6 +114,11 @@ void PersistentState::exec(std::string_view sql) const {
 }
 
 bool PersistentState::is_line_read(const ReadMarker& marker) const {
+    if (read_memo_valid_ && read_memo_marker_.position == marker.position
+        && read_memo_marker_.revealed_count == marker.revealed_count
+        && read_memo_marker_.script == marker.script) {
+        return read_memo_result_;
+    }
     Statement statement(
         db_, "SELECT 1 FROM read_lines "
              "WHERE script = ? COLLATE NOCASE "
@@ -120,10 +126,14 @@ bool PersistentState::is_line_read(const ReadMarker& marker) const {
     bind_text(db_, statement.get(), 1, marker.script);
     bind_int(db_, statement.get(), 2, static_cast<int>(marker.position));
     bind_int(db_, statement.get(), 3, static_cast<int>(marker.revealed_count));
-    return statement.step();
+    read_memo_result_ = statement.step();
+    read_memo_marker_ = marker;
+    read_memo_valid_ = true;
+    return read_memo_result_;
 }
 
 bool PersistentState::mark_line_read(const ReadMarker& marker) {
+    read_memo_valid_ = false;
     Statement statement(db_,
                         "INSERT OR IGNORE INTO read_lines "
                         "(script, position, revealed_count) VALUES (?, ?, ?)");
