@@ -1,6 +1,7 @@
 #include "avg_msg.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <istream>
 #include <ostream>
 
@@ -304,6 +305,9 @@ void AvgMsg::advance_step()
     } else {
         message_.step1 = msg_next;
         message_.kstep++;
+        if (hooks_.page_end) {
+            hooks_.page_end();
+        }
     }
 }
 
@@ -357,18 +361,11 @@ void AvgMsg::control_wait(const GameKey& key)
         set_novel_message_disp(false);
     } else if (key.pup || command_btrg == 1) {
         if (hooks_.play_se) hooks_.play_se(9012, 140);
-        if (engine_bar_) {
-            if (novel_buf_.bmax - 1 > 0) {
-                key_wait_count_ = 0;
-                key_wait_count2_ = 0;
-                if (hooks_.reset_keywait) hooks_.reset_keywait();
-                novel_log_start();
-            }
-        } else {
+        if (novel_buf_.bmax - 1 > 0) {
             key_wait_count_ = 0;
             key_wait_count2_ = 0;
             if (hooks_.reset_keywait) hooks_.reset_keywait();
-            if (hooks_.log_start) hooks_.log_start();
+            novel_log_start();
         }
     } else if ((hit && mouse_.x < DISP_X - 32) || cut || wait_auto_mode()) {
         // The original's condition has four more terms, all off here:
@@ -449,6 +446,7 @@ void AvgMsg::renew_mouse(int x, int y, bool left)
 {
     // MUS_RenewMouse, the parts a trace can reach.  MouseStruct.active is
     // taken as always on: the reference's window never loses focus.
+    bar_press_ = -1;
     mouse_.x = x;
     mouse_.y = y;
     // rect_err = !(0 < mx && 0 < my && disp_w >= mx && disp_h >= my);
@@ -503,7 +501,30 @@ int AvgMsg::mouse_no_btrg() const
 
 int AvgMsg::mouse_no_trg() const
 {
+    if (bar_press_ >= 0) {
+        return bar_press_;
+    }
     return mouse_no_ex(mouse_lbutton, 0);
+}
+
+void AvgMsg::set_mouse_pos_rect(int lno, int no)
+{
+    //     if( no < 0) return ;
+    //     if(!MouseCheck[lno][no].flag)return ;
+    //     x = MouseCheck[lno][no].sx;
+    //     y = MouseCheck[lno][no].sy + MouseCheck[lno][no].h-1;
+    //     MUS_SetMousePos( (HWND)hwnd, x, y );
+    if (lno < 0 || lno >= mouse_layers || no < 0 || no >= mouse_rest_max) {
+        return;
+    }
+    const auto& rect =
+        rects_[static_cast<std::size_t>(lno)][static_cast<std::size_t>(no)];
+    if (!rect.flag) {
+        return;
+    }
+    if (hooks_.set_mouse_pos) {
+        hooks_.set_mouse_pos(rect.sx, rect.sy + rect.h - 1);
+    }
 }
 
 void AvgMsg::set_mouse_rect(int lno, int no, int sx, int sy, int w, int h,
@@ -695,13 +716,16 @@ void AvgMsg::set_history_voice_mouse_rect()
         // \n; n counts the escape bytes among them, which take no room.
         int j = 0;
         int n = 0;
+        std::size_t end = text.size();
         for (std::size_t pos = start; pos < text.size();) {
             if (starts_at(text, pos, close_quote)) {
+                end = pos + close_quote.size();
                 break;
             }
             if (starts_at(text, pos, "\\k") || starts_at(text, pos, "\\n")) {
                 n += 2;
                 if (j != 0) {
+                    end = pos;
                     break;
                 }
             }
@@ -711,18 +735,30 @@ void AvgMsg::set_history_voice_mouse_rect()
             j += cp932_width(text, pos, length);
             pos += length;
         }
-        int vwork = voice.px + 17 * (j - n);
-        int vpx = voice.px;
-        int vpy = voice.py;
-        set_mouse_rect(32 + m++, vpx, vpy - 9, 17 * j, 34 + 18, true,
-                       32 + static_cast<int>(i));
-        vwork -= 34 * 20;
-        while (vwork > 0) {
-            vpx = mes_x;
-            vpy += pich_h + 34;
-            set_mouse_rect(32 + m++, vpx, vpy - 9, vwork, 34 + 18, true,
+        if (i < nb.vv_span.size()) {
+            nb.vv_span[i] = {start, end};
+        }
+        std::vector<std::array<int, 4>> measured;
+        if (hooks_.log_voice_rects
+            && hooks_.log_voice_rects(text, start, end, measured)) {
+            for (const auto& r : measured) {
+                set_mouse_rect(32 + m++, r[0], r[1], r[2], r[3], true,
+                               32 + static_cast<int>(i));
+            }
+        } else {
+            int vwork = voice.px + 17 * (j - n);
+            int vpx = voice.px;
+            int vpy = voice.py;
+            set_mouse_rect(32 + m++, vpx, vpy - 9, 17 * j, 34 + 18, true,
                            32 + static_cast<int>(i));
             vwork -= 34 * 20;
+            while (vwork > 0) {
+                vpx = mes_x;
+                vpy += pich_h + 34;
+                set_mouse_rect(32 + m++, vpx, vpy - 9, vwork, 34 + 18, true,
+                               32 + static_cast<int>(i));
+                vwork -= 34 * 20;
+            }
         }
 
         // vv_mes: as many spaces as the line starts cells in, then the
@@ -752,6 +788,7 @@ void AvgMsg::set_history_voice_mouse_rect()
     }
     for (; i < nb.vv_mes.size(); ++i) {
         nb.vv_mes[i].clear();
+        nb.vv_span[i] = {0, 0};
     }
     for (; m < nlog_v_max; ++m) {
         reset_mouse_rect(32 + m);
@@ -848,8 +885,7 @@ void AvgMsg::control_novel_message(const GameKey& key)
         // The instruction retires this frame - unless a choice is up under
         // the message, when this is where the reader sits and the bar is
         // answered from here.
-        if (engine_bar_ && hooks_.select_message_flag
-            && hooks_.select_message_flag()) {
+        if (hooks_.select_message_flag && hooks_.select_message_flag()) {
             const int command_trg = mouse_no_trg();
             const int command_btrg = mouse_no_btrg();
             if (key.diswin || command_trg == 7) {
@@ -978,9 +1014,7 @@ void AvgMsg::control_novel_message(const GameKey& key)
         control_wait(key);
         break;
 
-    // The log.  Only the engine bar gets here: without it, paging back is
-    // hooks_.log_start(), the port's own UI, and the machine stays parked in
-    // MSG_WAIT or MSG_STOP.  Nothing in these states drives the script.
+    // The log.  Nothing in these states drives the script.
     case msg_log:
         control_log(key);
         break;
@@ -1199,19 +1233,6 @@ void AvgMsg::control_history_system()
     }
 }
 
-void AvgMsg::seed_history_depth(int bmax)
-{
-    novel_buf_.bmax = std::clamp(bmax, 0, nlog_max);
-    novel_buf_.bpoint = novel_buf_.bmax % nlog_max;
-    novel_buf_.bcount = 0;
-    // TXT_WINDOW's display was never carried either; AVG_SetNovelMessageDisp
-    // is the only thing that sets it outside the log, so it follows disp.
-    main_text_disp_ = message_.disp != 0;
-    if (message_.disp) {
-        set_history_system_mouse_rect();
-    }
-}
-
 namespace {
 
 void write_i32(std::ostream& out, int value)
@@ -1245,6 +1266,7 @@ std::string read_string(std::istream& in)
 }
 
 constexpr int history_magic = 0x54534948;   // "HIST"
+constexpr int log_magic = 0x474f4c4e;       // "NLOG"
 
 void write_text(std::ostream& out, const EngineText& text)
 {
@@ -1309,6 +1331,74 @@ void AvgMsg::write_history(std::ostream& out) const
     write_text(out, log_text_);
     write_text(out, log_voice_text_);
     write_i32(out, history_bar_.fade);
+}
+
+void AvgMsg::clear_log()
+{
+    // A new game starts with nothing to page back to.
+    novel_buf_ = {};
+    log_text_ = {};
+    log_voice_text_ = {};
+}
+
+void AvgMsg::write_log(std::ostream& out) const
+{
+    write_i32(out, log_magic);
+    const auto& nb = novel_buf_;
+    for (int i = 0; i < nlog_max; ++i) {
+        write_string(out, nb.buf[static_cast<std::size_t>(i)]);
+        const auto& voices = nb.nv[static_cast<std::size_t>(i)];
+        write_i32(out, static_cast<int>(voices.size()));
+        for (const auto& v : voices) {
+            for (const int field : {v.sno, v.vno, v.cno, v.a_cut, v.vstcount,
+                                    v.px, v.py}) {
+                write_i32(out, field);
+            }
+        }
+    }
+    for (const int field : {nb.sno, nb.vno, nb.cno, nb.a_cut, nb.bmax,
+                            nb.bpoint}) {
+        write_i32(out, field);
+    }
+}
+
+bool AvgMsg::read_log(std::istream& in)
+{
+    if (read_i32(in) != log_magic || !in) {
+        return false;
+    }
+    NovelBufState nb;
+    for (int i = 0; i < nlog_max; ++i) {
+        nb.buf[static_cast<std::size_t>(i)] = read_string(in);
+        const int voices = read_i32(in);
+        if (!in || voices < 0 || voices > nlog_v_max) {
+            return false;
+        }
+        for (int k = 0; k < voices; ++k) {
+            NovelVoice v;
+            v.sno = read_i32(in);
+            v.vno = read_i32(in);
+            v.cno = read_i32(in);
+            v.a_cut = read_i32(in);
+            v.vstcount = read_i32(in);
+            v.px = read_i32(in);
+            v.py = read_i32(in);
+            nb.nv[static_cast<std::size_t>(i)].push_back(v);
+        }
+    }
+    nb.sno = read_i32(in);
+    nb.vno = read_i32(in);
+    nb.cno = read_i32(in);
+    nb.a_cut = read_i32(in);
+    nb.bmax = std::clamp(read_i32(in), 0, nlog_max);
+    nb.bpoint = read_i32(in);
+    if (!in) {
+        return false;
+    }
+    // Loaded at the current line, not paging back through the log.
+    nb.bcount = 0;
+    novel_buf_ = std::move(nb);
+    return true;
 }
 
 bool AvgMsg::read_history(std::istream& in)
@@ -1502,7 +1592,10 @@ std::size_t AvgMsg::visible_glyphs() const
     }
     // Everything here reads the text object, not NovelMessage: ts->cnt and
     // ts->step are what TXT_DrawTextEx is actually handed.
-    auto shown = txt_visible_glyphs(counted_, text_cnt_);
+    auto shown = txt_visible_glyphs(
+        counted_,
+        text_cnt_ < 0 ? text_cnt_
+                      : text_cnt_ + static_cast<int>(std::floor(present_extra_)));
 
     // TXT_DrawTextEx stops the draw outright at the current \k:
     //
@@ -1558,8 +1651,75 @@ int AvgMsg::glyph_alpha(std::size_t index) const
         && counted_.glyph_step[index] < text_step_) {
         return 256;
     }
+    if (present_extra_ > 0.0) {
+        const double delta =
+            text_cnt_ + present_extra_ - counted_.glyph_count[index];
+        return static_cast<int>(std::floor(std::clamp(delta, 0.0, 16.0) * 16));
+    }
     const int delta = text_cnt_ - counted_.glyph_count[index];
     return std::clamp(delta, 0, 16) * 16;
+}
+
+void AvgMsg::set_presentation_phase(double phase)
+{
+    present_extra_ = 0.0;
+    if (phase <= 0.0 || message_.step1 != msg_disp || text_cnt_ < 0
+        || message_.count >= message_.max) {
+        return;
+    }
+    //     if( Avg.demo ) NovelMessage.count+=(short)(2*30/Avg.frame);
+    //     else           NovelMessage.count+=AVG_MsgCnt();
+    const int step = hooks_.demo && hooks_.demo()
+        ? 2 * 30 / 60
+        : (hooks_.msg_cnt ? hooks_.msg_cnt() : 1);
+    if (step <= 0 || step >= 9999) {
+        return;   // the skip key: the whole page arrives on the next tick
+    }
+    present_extra_ = std::min(phase * step,
+                              static_cast<double>(message_.max - text_cnt_));
+}
+
+bool AvgMsg::present_half_tone(double phase, int& r, int& g, int& b) const
+{
+    if (half_tone_.tstep != tone_fadeout
+        || (hooks_.wav_effect && hooks_.wav_effect())) {
+        return false;
+    }
+    const int pulse = hooks_.eff_cnt_puls ? hooks_.eff_cnt_puls() : 1;
+    if (pulse <= 0 || pulse >= 9999 || half_tone_.tcount >= 16) {
+        return false;
+    }
+    // tcount was stepped before the brightness was worked out, so the
+    // screen shows tcount and the next tick tcount+pulse.
+    const double c = std::min(16.0, half_tone_.tcount + phase * pulse);
+    const int tone = half_tone_depth();
+    const auto at = [&](int channel) {
+        return static_cast<int>(std::floor(
+            (c * channel * tone / 128.0 + (16.0 - c) * channel) / 16.0));
+    };
+    r = at(back_->r);
+    g = at(back_->g);
+    b = at(back_->b);
+    return true;
+}
+
+double AvgMsg::present_bar_fade(double phase) const
+{
+    const auto& bar = history_bar_;
+    const double now = bar.fade;
+    if (!bar.shown || phase <= 0.0) {
+        return now;
+    }
+    const bool away = mouse_.x < DISP_X - 24 && message_.step1 != msg_drag;
+    int next = bar.fade;
+    switch (hooks_.side_option ? hooks_.side_option() : 0) {
+    case 0: next = std::clamp(bar.fade + (away ? -24 : 24), 64, 256); break;
+    case 1: next = 256; break;
+    case 2: next = std::clamp(bar.fade + (away ? -32 : 32), 0, 256); break;
+    case 3: next = 0; break;
+    default: break;
+    }
+    return now + (next - now) * phase;
 }
 
 void AvgMsg::restore_raw(std::string raw)

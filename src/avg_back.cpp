@@ -941,6 +941,135 @@ void AvgBack::set_flash(int r, int g, int b, int fade1, int fade2)
     fade_.flash = fade2;
 }
 
+bool AvgBack::present_back_fade(double phase, int& r, int& g, int& b) const
+{
+    const int max = eff_cnt(back_.br_fade);
+    if (!back_.br_flag || max <= 0 || back_.br_cnt >= max) {
+        return false;
+    }
+    // The count was stepped before the colour was worked out, so the screen
+    // shows br_cnt and the next tick br_cnt+1 - the target, at the end.
+    const double c = std::min(static_cast<double>(max), back_.br_cnt + phase);
+    const auto at = [&](int end, int start) {
+        return static_cast<int>(std::floor((end * c + start * (max - c)) / max));
+    };
+    r = at(back_.er, back_.r);
+    g = at(back_.eg, back_.g);
+    b = at(back_.eb, back_.b);
+    return true;
+}
+
+bool AvgBack::present_fade(double phase, int& r, int& g, int& b) const
+{
+    const int max = eff_cnt(fade_.fade);
+    if (!fade_.flag || max <= 0 || fade_.cnt >= max) {
+        return false;
+    }
+    const double c = std::min(static_cast<double>(max), fade_.cnt + phase);
+    const auto at = [&](int start, int end) {
+        return static_cast<int>(std::floor((start * (max - c) + end * c) / max));
+    };
+    r = at(fade_.sr, fade_.er);
+    g = at(fade_.sg, fade_.eg);
+    b = at(fade_.sb, fade_.eb);
+    return true;
+}
+
+double AvgBack::present_fd_cnt(double phase) const
+{
+    if (!back_.fd_flag) {
+        return -1.0;
+    }
+    int back_max = eff_cnt(back_.fd_max);
+    if (back_.fd_type == bak_fade
+        && (back_.r != bright_neutral || back_.g != bright_neutral
+            || back_.b != bright_neutral)) {
+        back_max *= 2;
+    }
+    if (back_.fd_type == bak_lasterin && back_.fd_max == -2 && level()) {
+        back_max *= 2;
+    }
+    if (back_max <= 0 || back_.fd_cnt + 1 >= back_max) {
+        return -1.0;
+    }
+    return back_.fd_cnt + phase;
+}
+
+bool AvgBack::present_back_change(int gno, double phase, Graph& graph) const
+{
+    const double fd = present_fd_cnt(phase);
+    if (fd < 0.0 || !level()) {
+        return false;
+    }
+    const int back_max = eff_cnt(back_.fd_max);
+    if (back_max <= 0) {
+        return false;
+    }
+    const double rate = 256.0 * fd / back_max;
+    const auto bld = [](double alpha) {
+        return DRW_BLD(static_cast<int>(std::floor(alpha)));
+    };
+    switch (back_.fd_type) {
+    case bak_cfade:
+        if (gno != grp_back) {
+            return false;
+        }
+        graph.param = bld(rate);
+        return true;
+    case bak_cfzoom2: {
+        double z = 256.0 - rate;
+        z = 256.0 - z * z / 256.0;
+        if (gno == grp_back) {
+            graph.param = bld(z);
+            return true;
+        }
+        if (gno == grp_back + 1) {
+            Display::apply_zoom2(graph, DISP_X / 2, DISP_Y / 2,
+                                 static_cast<int>(std::floor(z * 2)));
+            return true;
+        }
+        return false;
+    }
+    case bak_cfzoom3: {
+        double z = 256.0 - rate;
+        z = z * z / 256.0;
+        if (gno != grp_back + 1) {
+            return false;
+        }
+        graph.param = bld(z);
+        Display::apply_zoom2(graph, DISP_X / 2, DISP_Y / 2,
+                             static_cast<int>(std::floor(z / 2 - 128)));
+        return true;
+    }
+    case bak_slide_up: case bak_slide_do:
+    case bak_slide_ri: case bak_slide_le: {
+        if (gno != grp_back && gno != grp_back + 1) {
+            return false;
+        }
+        graph.param = bld(rate);
+        const double left = 256.0 - rate;
+        const int y = static_cast<int>(std::floor(
+            DISP_Y - DISP_Y * left * left / (256.0 * 256.0)));
+        const int x = static_cast<int>(std::floor(
+            DISP_X - DISP_X * left * left / (256.0 * 256.0)));
+        const bool front = gno == grp_back;
+        switch (back_.fd_type) {
+        case bak_slide_up:
+            graph.dx = 0; graph.dy = front ? y - DISP_Y : y; break;
+        case bak_slide_do:
+            graph.dx = 0; graph.dy = front ? -y + DISP_Y : -y; break;
+        case bak_slide_ri:
+            graph.dy = 0; graph.dx = front ? -x + DISP_X : -x; break;
+        default:
+            graph.dy = 0; graph.dx = front ? x - DISP_X : x; break;
+        }
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 void AvgBack::control_fade()
 {
     // void AVG_ColtrolFade( void ).

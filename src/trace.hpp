@@ -114,7 +114,13 @@ public:
     // `from` 0 means no lead-in.
     void begin(const std::filesystem::path& path, const TraceScript* base,
                std::uint64_t from);
-    bool active() const { return file_ != nullptr; }
+    // Live play: the same sampling with nothing written.  Normal play is a
+    // recording nobody keeps - the engine gets the player's hands through
+    // sample() exactly as a recorded run does, so what a recording verifies
+    // against the reference is what everyone plays.
+    void begin_live() { live_ = true; }
+    bool active() const { return live_ || file_ != nullptr; }
+    bool recording() const { return file_ != nullptr; }
 
     // Device changes between samples, in the 800x600 game space.
     void pointer(int x, int y);
@@ -135,7 +141,14 @@ private:
         std::uint64_t since = 0;
     };
     std::FILE* file_ = nullptr;
+    bool live_ = false;
     int x_ = 0, y_ = 0;
+    // A pointer move that came after a button went down, held until that
+    // press has been sampled.  A tap arrives as press, release and a move
+    // off the screen all at once, and without this the tick that sees the
+    // click would see it land wherever the finger was moved away to.
+    bool pointer_deferred_ = false;
+    int deferred_x_ = 0, deferred_y_ = 0;
     bool pointer_written_ = false;
     int written_x_ = 0, written_y_ = 0;
     std::vector<std::string> down_;      // physically down now

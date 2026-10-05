@@ -87,6 +87,7 @@ struct WaitFrameState {
 // Set by --cpu-transitions.  Forces the CPU blend even where the shader
 // would work, so the two paths can be compared without rebuilding.
 extern bool force_cpu_transitions;
+extern int web_frame_pacing;
 // --trace-prefetch: report what the lookahead guessed against what was used.
 extern bool trace_prefetch;
 
@@ -125,6 +126,10 @@ Texture load_toned_texture(
     Surface predecoded = {});
 th2::AudioClip load_audio(const th2::Archive& archive, std::string_view name);
 int scenario_number(std::string_view name);
+// One engine tick.  MAIN_Loop steps next_time by 1000/60 - integer divided,
+// so 16 ms - and the original therefore ran at 62.5 ticks a second, not 60.
+// Every wait the scripts count in ticks was timed against that.
+inline constexpr int engine_tick_ms = 1000 / 60;
 // Left edge of the message sidebar, from HistorySystemRectX[] in the
 // original's GM_AvgMsg.cpp.
 inline constexpr float sidebar_left_x = 776.0f;
@@ -159,12 +164,12 @@ public:
     int run();
     int run_loop();
     void iterate();
+    void run_tick();
 private:
-    static constexpr std::uint32_t save_version_ = 26;
-    static constexpr std::uint32_t first_backlog_voice_save_version_ = 25;
-    static constexpr std::uint32_t oldest_supported_save_version_ = 26;
+    // 27: the engine's NovelBuf replaces the port's backlog.
+    static constexpr std::uint32_t save_version_ = 27;
+    static constexpr std::uint32_t oldest_supported_save_version_ = 27;
     static bool is_confirm_key(SDL_Keycode key);
-    static int choice_number_key(SDL_Keycode key);
     static bool is_alt_enter(const SDL_KeyboardEvent& key);
     enum class AudioWaitKind {
         bgm,
@@ -259,6 +264,7 @@ private:
     // Render targets from finished transitions, for the next one.
     std::vector<Texture> spare_frame_targets_;
     void end_transition();
+    void renew_wipe_backdrop(SDL_Texture* target);
     struct Transition {
         Texture previous;
         Surface previous_pixels;
@@ -838,9 +844,7 @@ private:
     std::chrono::steady_clock::time_point half_tone_updated_{};
     std::array<float, 3> background_brightness_{128.0f, 128.0f, 128.0f};
     std::chrono::steady_clock::time_point skip_next_time_{};
-    std::optional<std::chrono::steady_clock::time_point> auto_next_time_;
     std::string current_line_key_;
-    std::chrono::steady_clock::time_point text_reveal_started_{};
     std::size_t text_reveal_start_ = 0;
     // The counter has reached NovelMessage.max (count + 8): the page is
     // "done" as far as input and the click indicator are concerned.
@@ -881,6 +885,39 @@ private:
     std::string trace_glyph_measured_;
     // This frame was not drawn: see th2::engine_draw_flag.
     bool frame_undrawn_ = false;
+    // A tick ran this frame.  Without one the art target is left as the
+    // last tick drew it (see draw_frame).
+    bool tick_this_frame_ = true;
+    // Desktop: SDL_RenderPresent waits for the display (no sleep pacing).
+    bool vsync_paced_ = false;
+
+    // --- drawing between ticks (src/game_subtick.cpp) ------------------
+    //
+    // How far past the last tick this frame is drawn, 0..1; 0 on a tick, in
+    // a trace, and with the option off.
+    double presentation_phase() const;
+    // Whether the next tick steps the scene's ramps, or the menu's - the
+    // only things a frame between ticks may draw further along.
+    bool subtick_scene_steps() const;
+    bool subtick_menu_steps() const;
+    // Display's presenter: the in-between values for one graph's copy.
+    void present_graph(int gno, th2::Graph& graph) const;
+    bool present_engine_config_graph(
+        int gno, double phase, th2::Graph& graph) const;
+    // Set only while a frame between ticks is being drawn; everything the
+    // engine asks sees 0.
+    double presentation_phase_ = 0.0;
+    double scroll_present_extra_ = 0.0;
+    double choice_present_extra_ = 0.0;
+    bool present_scene_ = false;
+    bool present_menu_ = false;
+    bool subtick_drawn_ = false;   // the copy was drawn this frame
+    // The art target's twin a frame between ticks is drawn into, so the art
+    // target keeps exactly what the last tick drew.
+    Texture subtick_art_;
+    SDL_Texture* ensure_subtick_art();
+    void end_presentation();
+    void trace_dump_subtick_frame();
     std::string trace_glyph_string() const;
     bool trace_choice_answered_ = false;
     int choice_highlight_ = 0;
@@ -898,8 +935,6 @@ private:
         music_room,
         replay_gallery,
         game,
-        system_menu,
-        backlog,
         save,
         load,
         map,
@@ -940,52 +975,17 @@ private:
     std::chrono::steady_clock::time_point title_started_{};
     std::optional<std::chrono::steady_clock::time_point> title_exit_started_;
     bool title_exit_game_ = false;
-    int menu_highlight_ = 0;
-    struct BacklogVoice {
-        std::size_t start = 0;
-        std::size_t end = 0;
-        int scenario = 0;
-        int voice = 0;
-        int character = 0;
-        int volume = 255;
-        bool alternate = false;
-    };
-    struct BacklogEntry {
-        std::string text;
-        std::vector<BacklogVoice> voices;
-    };
-    std::vector<BacklogEntry> backlog_;
-    std::vector<BacklogVoice> current_backlog_voices_;
-    std::optional<BacklogVoice> pending_backlog_voice_;
-    int backlog_depth_ = 0;
-    int backlog_voice_hover_ = -1;
-    bool backlog_handle_dragging_ = false;
     // First visible line when a page of text is taller than the screen.
     int message_scroll_ = 0;
     bool message_scroll_follow_ = true;
     bool message_scroll_dragging_ = false;
-    // The backlog scrolls the same way, but starts at the top of an entry
-    // rather than following its end.
-    int backlog_scroll_ = 0;
-    bool backlog_scroll_dragging_ = false;
-    bool opacity_handle_hover_ = false;
-    bool opacity_handle_dragging_ = false;
-    bool backlog_handle_hover_ = false;
-    int sidebar_hover_ = -1;
-    float sidebar_alpha_ = 0.0f;
-    std::chrono::steady_clock::time_point sidebar_alpha_updated_{};
-    bool sidebar_mouse_near_ = false;
-    bool suppress_sidebar_mouse_up_ = false;
     // NovelMessage.disp: the engine's own switch for the text and the bar,
     // which it turns off for a background fade or a character animation and
     // back on with the next message.  Only the engine writes it.
     bool message_visible_ = true;
-    // The player put the window away (F10, the side bar, the touch menu).
-    // Kept apart from message_visible_ because any input brings this one
-    // back - and when the two were one flag, a click during a scene change
-    // put the old message and the bar back over the fade.
-    bool window_hidden_ = false;
-    bool message_shown() const { return message_visible_ && !window_hidden_; }
+    // Hiding the window is the engine's too now - GameKey.diswin and the
+    // bar's button, MSG_SYSTEM - so this is the whole of it.
+    bool message_shown() const { return message_visible_; }
     // Message.wstep: whether the message *window* is up, which is a
     // different thing from whether the text is shown.  AVG_GetWindowCond
     // reads this, and AVG_ControlChar uses it to know the window was open
@@ -1137,6 +1137,31 @@ private:
     bool map_enter_finished_this_frame_ = false;
     int trace_mouse_x_ = 0;
     int trace_mouse_y_ = 0;
+    // Live input with no name in a script, held for the next tick's sample:
+    // wheel notches (KeyCond.wheel), the middle button's edge, and a bar
+    // button a gesture stands in for (-1 for none).
+    int live_wheel_ = 0;
+    bool live_middle_ = false;
+    int live_bar_button_ = -1;
+    bool half_tone_unsaved_ = false;
+    // MUS_SetMousePos during a replay: where the engine put the pointer, and
+    // the script position it replaced (the warp lasts until that changes).
+    struct PointerWarp {
+        int x = 0, y = 0;
+        int from_x = 0, from_y = 0;
+    };
+    std::optional<PointerWarp> pointer_warp_;
+    int script_mouse_x_ = 0;
+    int script_mouse_y_ = 0;
+    void warp_pointer(int x, int y);
+    // Whether the pointer last came from a finger (the touch-synthesised
+    // mouse), and which shape the choice rects were last given for it.
+    bool pointer_from_touch_ = false;
+    // The finger on the touch-synthesised mouse is holding the engine bar's
+    // button down (see begin_touch_drag).
+    bool touch_bar_press_ = false;
+    bool choice_rects_for_touch_ = false;
+    void register_choice_rects(bool touch);
     void trace_drive_map(bool pick);
     void trace_map_follow_pointer();
     void trace_peek_map_pointer();
@@ -1146,7 +1171,6 @@ private:
     std::optional<th2::ReadMarker> current_read_marker() const;
     bool current_text_is_read() const;
     void mark_current_text_read();
-    void manual_advance();
     int map_sakura_type() const;
     static std::uint16_t map_u16(
         std::span<const std::uint8_t> bytes, std::size_t offset);
@@ -1166,6 +1190,7 @@ private:
     void begin_clock(int requested, int first_frame = 1);
     void begin_calendar(int month, int day);
     void update_clock_calendar();
+    void control_calendar_key();
     static int sprite_blend_mode(SDL_Texture* texture);
     void draw_sprite_frame(
         const MapCharacter& animation, int frame, float x, float y,
@@ -1252,9 +1277,18 @@ private:
     std::uint64_t record_from_ = 0;
     bool record_live() const
     {
-        return recorder_.active() && trace_tick_ >= record_from_;
+        return recorder_.recording() && trace_tick_ >= record_from_;
     }
+    // The player's hands drive the engine: normal play, and a recording
+    // past its lead-in.  Only a scripted replay does without them.
+    bool live_input() const { return !trace_mode_ || record_live(); }
+    // Whether a press may become engine input now.  Not while one of the
+    // port's own screens is up over the scene - the save and load screens,
+    // the ImGui panels, a movie - which take their input from SDL directly.
+    bool engine_input_open() const;
     void record_input_event(const SDL_Event& event);
+    bool handle_host_key(const SDL_Event& event);
+    bool handle_text_scroll_drag(const SDL_Event& event);
     std::uint64_t trace_tick_ = 0;
     std::uint64_t trace_last_tick_ = 0;
     // Frames before this tick are computed but not written.  A frame is
@@ -1416,7 +1450,9 @@ private:
     float screen_flash_alpha() const;
     void update_shake();
     ShakeSample shake_sample();
-    BackgroundView current_background_view() const;
+    // `extra` ticks on from sc_cnt, for a frame drawn between ticks; 0 for
+    // everything the engine itself asks.
+    BackgroundView current_background_view(double extra = 0.0) const;
     void update_background_scroll();
     void begin_background_scroll(
         float x, float y, float width, float height, int frames, int type);
@@ -1485,6 +1521,11 @@ private:
     bool weather_disp_ = true;
     bool engine_config_check() const;
     void engine_go_config(int mode);
+    // The port's screen standing in for the engine's save (1), load (2) or
+    // side-bar settings (3), and the way back from it.
+    void engine_open_port_screen(int page);
+    void engine_port_screen_closed();
+    void engine_config_loaded();
     void engine_close_back();
     void engine_open_back();
     void engine_set_config_window();
@@ -1493,7 +1534,6 @@ private:
     void engine_close_start_config_window(int cmax);
     void control_engine_config();
     void play_log_voice(int character, int scenario, int voice, bool a_cut);
-    void replay_backlog_voice(const BacklogVoice& voice);
     void update_audio();
     void refresh_audio_wait(bool before_script);
     void set_background(const th2::Event& event, bool keep_characters);
@@ -1544,9 +1584,6 @@ private:
     std::int64_t read_i64(std::istream& in) const;
     std::string read_str(std::istream& in, std::size_t size) const;
     // --- UI Methods ---
-    void push_backlog();
-    int novel_log_depth() const;
-    void open_system_menu();
     void reset_play_state();
     void initialize_scenario_flags();
     void start_new_game();
@@ -1554,7 +1591,6 @@ private:
     void begin_title_exit(bool start_game);
     void begin_title_menu_transition(bool extras);
     void update_title();
-    void close_system_menu();
     void open_config();
     void close_config();
     static void append_u16(
@@ -1593,7 +1629,6 @@ private:
     void return_to_title();
     void draw_config();
     void draw_name_input();
-    void open_backlog();
     // GRP_KEYWAIT's state, set by AVG_ControlNovelMessage and read by
     // draw_click_indicator().
     bool keywait_visible_ = false;
@@ -1608,7 +1643,6 @@ private:
     // instant, 3 the slowest.  Ours is a millisecond-per-character slider,
     // so it is folded back into the four the original has.
     int message_wait_setting() const;
-    void close_backlog();
     // Starts background transfers for the assets the script is about to
     // need, so their reads do not stall a frame (browser build; a no-op
     // where reads come off a disk).
@@ -1680,9 +1714,6 @@ private:
     bool begin_touch_drag(float logical_x, float logical_y);
     // Drops the hover highlights a lifted finger left behind.
     void clear_pointer_highlights();
-    bool backlog_older();
-    bool backlog_newer();
-    void execute_menu_item(int index);
     void open_save_load(UiMode mode);
     void close_save_load();
     void draw_save_digit_sheet_text(
@@ -1690,7 +1721,6 @@ private:
         std::uint8_t red = 255, std::uint8_t green = 255,
         std::uint8_t blue = 255);
     void draw_save_digit_number(float x, float y, int number, int digits);
-    void draw_system_menu();
     int map_marker_level(int field) const;
     void draw_map(bool ui);
     bool title_extras_available() const;
@@ -1793,25 +1823,14 @@ private:
     void move_save_load_focus(SDL_Keycode key);
     void activate_save_load_item(int item);
     void handle_save_load_input(const SDL_Event& event);
-    void handle_system_menu_input(const SDL_Event& event);
     void change_map_field(int direction);
     void update_map_hover(float x, float y);
     bool map_hover_on_page() const;
-    void handle_map_input(const SDL_Event& event);
     void update_map();
-    void draw_backlog();
-    std::vector<SDL_FRect> backlog_voice_rects(
-        const BacklogEntry& entry, int voice_index) const;
     void draw_sidebar();
-    void update_sidebar_hover(float x, float y);
     // Handles a press on the sidebar.  With activate_buttons false the
     // buttons are left alone and only the draggable parts respond, which is
     // what a touch press does: the buttons wait for the release.
-    bool handle_sidebar_click(float x, float y, bool activate_buttons = true);
-    void set_backlog_from_sidebar_y(float y);
-    void set_message_alpha_from_sidebar_y(float y);
-    void finish_sidebar_drag();
-    void handle_backlog_input(const SDL_Event& event);
     void draw_click_indicator();
     // GRP_KEYWAIT's sprite frame; see the definition.
     bool draw_keywait_sprite(
@@ -1820,6 +1839,23 @@ private:
     int keywait_frame() const;
     std::size_t message_visible_lines() const;
     int message_scroll_limit(std::size_t total_lines) const;
+    // Scroll text that overflows its box by `direction` lines; false when
+    // nothing here overflows.
+    bool scroll_overflowing_text(int direction);
+    // The engine's log entry in the outline font (see draw_log_modern).
+    struct LogDisplay {
+        std::string text;
+        std::vector<std::size_t> raw_of;
+    };
+    LogDisplay log_display(const std::string& raw) const;
+    std::pair<std::size_t, std::size_t> log_voiced_span(
+        const std::string& raw, std::size_t start) const;
+    std::vector<SDL_FRect> log_span_rects(
+        const std::string& raw, std::size_t start, std::size_t end) const;
+    void draw_log_modern();
+    bool log_entry_shown() const;
+    int log_scroll_ = 0;
+    std::string log_scroll_text_;
     void draw_scrollbar(
         std::size_t total_lines, int scroll, bool dragging);
     int scroll_from_y(float y, std::size_t total_lines) const;
@@ -1840,10 +1876,6 @@ private:
     void update_half_tone();
     bool handle_message_scroll_press(float x, float y);
     void set_message_scroll_from_y(float y);
-    bool handle_backlog_scroll_press(float x, float y);
-    void set_backlog_scroll_from_y(float y);
-    std::string_view backlog_view_text() const;
-    std::vector<std::string> backlog_view_lines() const;
     void select_overlay();
     void begin_overlay();
     void select_sidebar();

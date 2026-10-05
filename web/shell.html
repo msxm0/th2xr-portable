@@ -165,6 +165,20 @@
   if (engineArguments.length) {
     appendLog('engine arguments: ' + engineArguments.join(' '));
   }
+  // And environment variables, for the debugging switches the engine reads
+  // with getenv (TH2_FRAME_STEP, TH2_FRAME_HASH, ...): ?env=NAME=value,...
+  const engineEnvironment = (() => {
+    const raw = new URLSearchParams(location.search).get('env');
+    const pairs = raw ? raw.split(',').filter(Boolean) : [];
+    return pairs.map((pair) => {
+      const at = pair.indexOf('=');
+      return at < 0 ? [pair, '1'] : [pair.slice(0, at), pair.slice(at + 1)];
+    });
+  })();
+  if (engineEnvironment.length) {
+    appendLog('engine environment: '
+      + engineEnvironment.map(([k, v]) => k + '=' + v).join(' '));
+  }
 
   // A crash before the menu leaves nothing on screen to go on, so surface
   // whatever the page can see.
@@ -193,6 +207,9 @@
     preRun: [() => {
       Module.FS.mkdirTree(PREF_ROOT);
       Module.FS.mount(Module.IDBFS, {}, PREF_ROOT);
+      for (const [name, value] of engineEnvironment) {
+        Module.ENV[name] = value;
+      }
     }],
     onRuntimeInitialized: () => {
       status.textContent = 'Loading saved data…';

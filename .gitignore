@@ -35,3 +35,6 @@ ffmpeg-*.7z
 reference/build/
 reference/gen/
 reference/run/
+
+# Python bytecode from the reference tools
+__pycache__/

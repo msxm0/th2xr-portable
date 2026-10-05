@@ -42,29 +42,6 @@ namespace th2app {
 Game::SaveBundleDialog* Game::android_save_bundle_export_dialog_ = nullptr;
 #endif
 
-void Game::push_backlog()
-{
-    if (message_.empty()) return;
-    const auto& text = message_.visible();
-    if (!backlog_.empty() && backlog_.back().text == text) return;
-    backlog_.push_back({text, current_backlog_voices_});
-    if (backlog_.size() > 256) backlog_.erase(backlog_.begin());
-}
-
-void Game::open_system_menu()
-{
-    if (choosing_) return;
-    // AVG_GoConfig(0): its own sound, and an open that runs for
-    // AVG_EffCnt(-1) frames, so it follows the effect speed setting and is
-    // instant only when that is set to instant.
-    play_se(-1, 9002, false, 150);
-    save_snapshot_ = capture_frame_thumbnail(
-    save_thumbnail_width, save_thumbnail_height);
-    begin_transition(1, 15, 128, false, EffectTiming::menu);
-    ui_mode_ = UiMode::system_menu;
-    menu_highlight_ = 4;
-}
-
 void Game::reset_play_state()
 {
     bgm_.stop();
@@ -117,14 +94,10 @@ void Game::reset_play_state()
 
     message_ = th2::Message{};
     message_visible_ = true;
-    window_hidden_ = false;
     message_ends_block_ = true;
     waiting_for_input_ = false;
     current_line_key_.clear();
-    backlog_.clear();
-    current_backlog_voices_.clear();
-    pending_backlog_voice_.reset();
-    backlog_depth_ = 0;
+    msg().clear_log();
     choices_.clear();
     choosing_ = false;
     choice_highlight_ = 0;
@@ -145,7 +118,6 @@ void Game::reset_play_state()
     calendar_state_.reset();
     skipped_month_ = 0;
     skipped_day_ = 0;
-    auto_next_time_.reset();
     auto_mode_ = false;
     skip_mode_ = false;
     demo_mode_ = false;
@@ -237,15 +209,6 @@ void Game::update_title()
     }
 }
 
-void Game::close_system_menu()
-{
-    // AVG_ControlConfigWindow takes its cmax = AVG_EffCnt(-1) once and uses
-    // it for CNF_CLOSE as well as CNF_OPEN, so closing runs as long as
-    // opening.
-    begin_transition(1, 15, 128, false, EffectTiming::menu);
-    ui_mode_ = UiMode::game;
-}
-
 void Game::open_config()
 {
     config_open_ = true;
@@ -257,6 +220,7 @@ void Game::close_config()
     config_open_ = false;
     config_gamepad_focus_requested_ = false;
     th2::save_config(config_path_, config_);
+    engine_port_screen_closed();
 }
 
 void Game::append_u16(

@@ -19,6 +19,7 @@ extern "C" {
  */
 unsigned long th2ref_time(void);
 void          th2ref_advance_tick(void);
+void          th2ref_tick_done(int draw_flag);
 unsigned long th2ref_current_tick(void);
 
 /* Called from MAIN_DrawControl with the bitmap MAIN_DrawGraph just filled,
@@ -113,6 +114,7 @@ void  th2ref_note_audio(const char *kind, int a, int b, int c, int d,
 int   th2ref_mouse_level(void);
 
 int   th2ref_cursor_pos(POINT *p);
+int   th2ref_set_cursor_pos(int x, int y);
 short th2ref_async_key(int vk);
 
 #ifdef __cplusplus

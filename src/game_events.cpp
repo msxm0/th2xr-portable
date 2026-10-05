@@ -289,7 +289,6 @@ bool Game::handle(const th2::Event& event)
     } else if (name == "SetDemoFlag") {
         demo_mode_ = number(event, 0) != 0;
         demo_delay_frames_ = std::max(0, number(event, 1));
-        auto_next_time_.reset();
     } else if (name == "SetReplayNo") {
         const int replay = number(event, 0);
         if (unlocked_replays_.emplace(replay).second) {
@@ -503,18 +502,10 @@ bool Game::handle(const th2::Event& event)
         chars().set_char_alph(
             number(event, 0), number(event, 1), number(event, 2));
     } else if (name == "SetMessage2") {
-        push_backlog();
         message_scroll_follow_ = true;
         message_.set(th2::substitute_player_name(
             text(event, 0), player_name_,
             runtime_.flag(213) != 0));
-        current_backlog_voices_.clear();
-        if (pending_backlog_voice_) {
-            pending_backlog_voice_->start = 0;
-            pending_backlog_voice_->end = message_.visible().size();
-            current_backlog_voices_.push_back(*pending_backlog_voice_);
-            pending_backlog_voice_.reset();
-        }
         message_window_open_ = true;
         // void AVG_SetScenarioFlag( int block_no ), which ESC_EOprSetMessage2
         // calls right after AVG_SetNovelMessage:
@@ -546,21 +537,13 @@ bool Game::handle(const th2::Event& event)
                 text(event, 0), player_name_, runtime_.flag(213) != 0),
             number(event, 1));
     } else if (name == "AddMessage2") {
-        const auto reveal_start = message_.visible().size();
         message_.append(th2::substitute_player_name(
             text(event, 0), player_name_,
             runtime_.flag(213) != 0));
-        if (pending_backlog_voice_) {
-            pending_backlog_voice_->start = reveal_start;
-            pending_backlog_voice_->end = message_.visible().size();
-            current_backlog_voices_.push_back(*pending_backlog_voice_);
-            pending_backlog_voice_.reset();
-        }
         message_window_open_ = true;
         current_line_key_ = runtime_.script_name() + ':'
             + std::to_string(runtime_.vm_pc());
         message_ends_block_ = number(event, 1) == 2;
-        static_cast<void>(reveal_start);
         // AVG_AddNovelMessage( EscParam[0].str, EscParam[1].num ).
         msg().add_novel_message(
             th2::substitute_player_name(
@@ -597,7 +580,6 @@ bool Game::handle(const th2::Event& event)
     } else if (name == "K") {
         waiting_for_input_ = true;
         message_ends_block_ = true;
-        auto_next_time_.reset();
     } else if (name == "Run") {
         // EXEC_OprRun: ESC_SetDrawFlag(), MainWindow.draw_flag=ON.
         th2::set_draw_flag_on();
@@ -732,7 +714,8 @@ bool Game::handle(const th2::Event& event)
             std::get<th2::RegisterTarget>(event.arguments.at(0)).index;
         choosing_ = true;
         choice_reveal_cnt_ = 0;
-        choice_highlight_ = 0;
+        // FCT_GLAY for every option until one is under the pointer.
+        choice_highlight_ = -1;
         choice_selected_ = -1;
     } else if (name == "SetMapEvent") {
         map_events_.push_back(MapEvent{
@@ -761,7 +744,7 @@ bool Game::handle(const th2::Event& event)
         choice_result_register_ =
             std::get<th2::RegisterTarget>(event.arguments.at(0)).index;
         choosing_ = true;
-        choice_highlight_ = 0;
+        choice_highlight_ = -1;
         choice_selected_ = -1;
     } else {
         return false;
@@ -1087,12 +1070,9 @@ void Game::advance(bool skipping)
 
     // The reveal, the page turn and the read mark are AVG_ControlNovelMessage's
     // now.  A click is an edge in GameKey, which it reads on the same frame;
-    // this is left with the two things that are not the message machine's -
-    // the choice the player picked, and the autosave at a page end.
-    just_advanced_past_block_end_ = false;
-    if (msg().state().step1 == th2::msg_stop && message_ends_block_) {
-        just_advanced_past_block_end_ = true;
-    }
+    // this is left with what is not the message machine's - the choice the
+    // player picked.  The autosave at a page end hangs off the machine's own
+    // page turn (hooks.page_end).
     if (choosing_) {
         if (choice_selected_ < 0) {
             return;
@@ -1297,9 +1277,13 @@ void Game::exec_control_lang(bool skipping)
     // Autosave after advancing past a block end, if enabled and enough time has passed.
     if (just_advanced_past_block_end_) {
         just_advanced_past_block_end_ = false;
+        // Not in a trace: it writes the player's save slots and reads the
+        // frame back at times the host's clock picks.
         if (config_.autosave_enabled && ui_mode_ == UiMode::game
-            && !replay_mode_ && !demo_mode_) {
-            const auto now = engine_now();
+            && !replay_mode_ && !demo_mode_ && !trace_mode_) {
+            // The port's own interval, in the player's minutes: save()
+            // stamps last_save_time_ off the same clock.
+            const auto now = std::chrono::steady_clock::now();
             constexpr auto minimum_interval = std::chrono::minutes(2);
             if (last_save_time_.time_since_epoch().count() == 0
                 || now - last_save_time_ >= minimum_interval) {

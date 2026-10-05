@@ -50,6 +50,10 @@
 #define timeGetTime() th2ref_time()
 #define GetCursorPos(p)       th2ref_cursor_pos(p)
 #define ScreenToClient(h,p)   ((void)(h), 1)
+/* MUS_SetMousePos: the arrow keys walk the menu and the choices by moving
+ * the cursor, and the next GetCursorPos has to find it there. */
+#define ClientToScreen(h,p)   ((void)(h), 1)
+#define SetCursorPos(x,y)     th2ref_set_cursor_pos(x, y)
 #define GetAsyncKeyState(k)   th2ref_async_key(k)
 #endif
 

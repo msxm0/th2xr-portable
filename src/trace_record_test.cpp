@@ -164,6 +164,43 @@ int main()
         }
     }
 
+    // 4. Normal play is a recording nobody keeps: the live sampler hands the
+    //    engine exactly what a recording sampler does for the same hands.
+    {
+        th2app::TraceRecorder recorded;
+        recorded.begin(dir / "live-twin.txt", nullptr, 0);
+        th2app::TraceRecorder live;
+        live.begin_live();
+        const auto a = play(recorded, 0, 2000, 99);
+        const auto b = play(live, 0, 2000, 99);
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            if (!same(a[i], b[i])) {
+                return fail("live sampler against a recording", i);
+            }
+        }
+    }
+
+    // 5. A tap: press, release and the pointer moved off the screen, all
+    //    before one sample.  The click is where the finger was; the move
+    //    takes effect on the tick after.
+    {
+        th2app::TraceRecorder live;
+        live.begin_live();
+        live.pointer(300, 120);
+        live.sample(0);
+        live.key("lclick", true);
+        live.key("lclick", false);
+        live.pointer(0, 0);
+        const auto tap = live.sample(1);
+        if (!tap.click || tap.mouse_x != 300 || tap.mouse_y != 120) {
+            return fail("tap position", 1);
+        }
+        const auto after = live.sample(2);
+        if (after.click || after.mouse_x != 0 || after.mouse_y != 0) {
+            return fail("pointer after a tap", 2);
+        }
+    }
+
     std::filesystem::remove_all(dir);
     return 0;
 }

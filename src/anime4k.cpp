@@ -196,7 +196,7 @@ struct Anime4K::Impl {
         overlay_height = height;
     }
 
-    void present(bool text_content, bool sidebar_content)
+    void present(bool text_content, bool sidebar_content, SDL_Texture* source)
     {
         ensure_overlay();
         int output_width = 0;
@@ -219,7 +219,8 @@ struct Anime4K::Impl {
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderClear(renderer);
         SDL_SetGPURenderState(renderer, states[0]);
-        SDL_RenderTexture(renderer, art.get(), nullptr, &destination);
+        SDL_RenderTexture(
+            renderer, source ? source : art.get(), nullptr, &destination);
         SDL_SetGPURenderState(renderer, nullptr);
         if (text_content) {
             SDL_RenderTexture(
@@ -273,7 +274,7 @@ SDL_Texture* Anime4K::sidebar_target()
 
 void Anime4K::present()
 {
-    impl_->present(authentic_text_content_, sidebar_content_);
+    impl_->present(authentic_text_content_, sidebar_content_, art_source_);
 }
 
 void Anime4K::reset()

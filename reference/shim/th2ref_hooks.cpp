@@ -57,16 +57,61 @@ int th2ref_text_hidden(void)
     return cached;
 }
 
+/* TH2REF_REALTIME: the engine on the real clock, for measuring how the
+ * original paces itself - MAIN_Loop polls with Sleep(2) between ticks, so
+ * the tick count (which indexes the input script) moves once per tick the
+ * loop actually runs rather than once per poll.  Off, the virtual clock
+ * below, which is what every comparison uses. */
+static int realtime(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("TH2REF_REALTIME");
+        cached = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
 unsigned long th2ref_time(void)
 {
+    if (realtime()) {
+        return timeGetTime();
+    }
     /* Exactly the step MAIN_Loop adds to next_time (1000/frame, integer
      * divided, = 16 at 60fps).  Matching it is what keeps `skip` at zero so
      * no draw is ever dropped - see th2ref_hooks.h. */
     return g_tick * (1000UL / 60UL);
 }
 
+/* After every tick MAIN_Loop runs, with the draw flag it left: in real-time
+ * mode the tick advances here, and TH2REF_TICK_LOG gets one line a tick -
+ * the tick, the real time in ms and the flag (2 = this tick drew and put
+ * next_time a whole step after now). */
+void th2ref_tick_done(int draw_flag)
+{
+    if (!realtime()) {
+        return;
+    }
+    static FILE *log = 0;
+    static int tried = 0;
+    if (!tried) {
+        tried = 1;
+        const char *path = getenv("TH2REF_TICK_LOG");
+        if (path && *path) log = fopen(path, "w");
+    }
+    if (log) {
+        fprintf(log, "%lu %lu %d\n", g_tick, (unsigned long)timeGetTime(),
+                draw_flag);
+        if ((g_tick % 64) == 0) fflush(log);
+    }
+    ++g_tick;
+}
+
 void th2ref_advance_tick(void)
 {
+    if (realtime()) {
+        return;
+    }
     if (!g_dir) {
         g_dir = getenv("TH2REF_DUMP");
         const char *a = getenv("TH2REF_FROM");

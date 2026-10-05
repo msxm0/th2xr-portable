@@ -46,9 +46,16 @@ public:
         sidebar_content_ = sidebar;
     }
 
+    // The art to composite this frame instead of art_target(): a frame
+    // drawn between two ticks is drawn into a copy, so the art target keeps
+    // exactly what the last tick drew (see Game::draw_frame).  Null for the
+    // art target itself.
+    void set_art_source(SDL_Texture* art) { art_source_ = art; }
+
 protected:
     bool authentic_text_content_ = true;
     bool sidebar_content_ = true;
+    SDL_Texture* art_source_ = nullptr;
 
 public:
 

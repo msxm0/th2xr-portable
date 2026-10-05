@@ -110,7 +110,8 @@ public:
         SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
         SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
         SDL_RenderClear(renderer_);
-        SDL_SetTextureScaleMode(art_.get(), SDL_SCALEMODE_LINEAR);
+        SDL_Texture* const art = art_source_ ? art_source_ : art_.get();
+        SDL_SetTextureScaleMode(art, SDL_SCALEMODE_LINEAR);
         // Built on the first drawn frame, once the renderer's context is
         // current - the same reason GlPatternTransition is.
         if (want_anime4k_ && !anime4k_) {
@@ -121,8 +122,8 @@ public:
         // The art layer only, and only this draw: the shader magnifies, so
         // it stands in for the blit rather than wrapping it.  A failure here
         // is not fatal - the plain blit below runs instead.
-        if (!(anime4k_ && anime4k_->draw(renderer_, art_.get(), destination))) {
-            SDL_RenderTexture(renderer_, art_.get(), nullptr, &destination);
+        if (!(anime4k_ && anime4k_->draw(renderer_, art, destination))) {
+            SDL_RenderTexture(renderer_, art, nullptr, &destination);
         }
         if (authentic_text_content_) {
             SDL_RenderTexture(

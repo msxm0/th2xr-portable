@@ -258,6 +258,11 @@ void Game::draw_config()
                     ImGui::TextDisabled(
                         "Anime4K requires SDL's GPU renderer with SPIR-V support.");
                 }
+                option_changed |= ImGui::Checkbox(
+                    "Smooth motion between engine ticks",
+                    &config_.smooth_motion);
+                ImGui::TextDisabled(
+                    "Fades, slides and text drawn in between on fast displays.");
                 ImGui::SeparatorText("Text");
                 option_changed |= ImGui::Checkbox(
                     "Authentic bitmap font", &config_.authentic_font);
@@ -285,9 +290,6 @@ void Game::draw_config()
                 config_.font_size =
                     std::clamp(config_.font_size, 12, 48);
                 ImGui::EndDisabled();
-                option_changed |= ImGui::Checkbox(
-                    "Mouse wheel opens backlog",
-                    &config_.wheel_opens_backlog);
                 static constexpr std::array sidebar_modes{
                     "Fade when away", "Always visible",
                     "Disappear when away", "Hidden",

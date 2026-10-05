@@ -159,6 +159,17 @@ public:
     // that decides what is on screen and leaves the counters alone.
     void control_char(bool tick = true);
 
+    // A frame drawn `phase` (0..1) of a tick after the last one: puts on
+    // `graph`, a copy of GRP_CHAR+i, the in-between value of whatever ramp
+    // character i is on - the IN/OUT fade or slide, a pose dissolve, a
+    // LOCATE slide, a BRIGHT or ALPHA fade - computed the way control_char
+    // computes it, at a fractional count.  The screen shows control_char's
+    // value for cnt-1, so this is that at cnt-1+phase, never past the end.
+    // False, and the graph untouched, for anything else: a wave character
+    // (re-baked into the plate every tick), a pattern or mesh dissolve, or a
+    // ramp that finishes on the next tick anyway.
+    bool present_graph(int gno, double phase, Graph& graph) const;
+
     void init_char();                                      // AVG_InitChar
 
     // Re-decodes every live character's bitmap, which is what a tone change

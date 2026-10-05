@@ -281,6 +281,24 @@ if(BUILD_TESTING AND NOT EMSCRIPTEN)
     target_link_libraries(th2-avg-char-test PRIVATE ZLIB::ZLIB)
     add_test(NAME character-machine COMMAND th2-avg-char-test)
 
+    add_executable(th2-avg-msg-log-test
+        src/avg_msg_log_test.cpp
+        src/avg_char.cpp
+        src/avg_msg.cpp
+        src/avg_back.cpp
+        src/avg_key.cpp
+        src/text_count.cpp
+        src/trace.cpp
+        src/dsp.cpp
+        src/gl_blend.cpp
+        src/gl_anime4k.cpp
+        src/texture.cpp
+        src/image.cpp
+    )
+    target_link_libraries(th2-avg-msg-log-test PRIVATE SDL3::SDL3)
+    target_link_libraries(th2-avg-msg-log-test PRIVATE ZLIB::ZLIB)
+    add_test(NAME message-log-save COMMAND th2-avg-msg-log-test)
+
     add_executable(th2-text-count-test
         src/text_count_test.cpp
         src/text_count.cpp
@@ -380,6 +398,7 @@ if(ANDROID)
         src/game.cpp
         src/game_backlog_touch.cpp
         src/game_engine_config.cpp
+        src/game_subtick.cpp
         src/game_config_ui.cpp
         src/game_events.cpp
         src/game_flow.cpp
@@ -425,6 +444,7 @@ else()
         src/game.cpp
         src/game_backlog_touch.cpp
         src/game_engine_config.cpp
+        src/game_subtick.cpp
         src/game_config_ui.cpp
         src/game_events.cpp
         src/game_flow.cpp
@@ -593,7 +613,7 @@ if(EMSCRIPTEN)
         -sMAX_WEBGL_VERSION=2
         -sGL_ENABLE_GET_PROC_ADDRESS=1
         -sASSERTIONS=1
-        -sEXPORTED_RUNTIME_METHODS=callMain,FS,IDBFS
+        -sEXPORTED_RUNTIME_METHODS=callMain,FS,IDBFS,ENV
         # web_pick_file() allocates the picked file from JS.
         -sEXPORTED_FUNCTIONS=_main,_malloc,_free
         # The game data is several gigabytes, so it is streamed from the

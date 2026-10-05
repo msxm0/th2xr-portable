@@ -506,9 +506,13 @@ void Display::create_bmp(int bno, int width, int height)
         && bitmap.width == width && bitmap.height == height) {
         return;
     }
-    bitmap.owned.reset(SDL_CreateTexture(
-        renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET,
-        width, height));
+    retire_bitmap(bitmap);
+    bitmap.owned = take_spare_target(width, height);
+    if (!bitmap.owned) {
+        bitmap.owned.reset(SDL_CreateTexture(
+            renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET,
+            width, height));
+    }
     bitmap.view = bitmap.owned.get();
     bitmap.width = width;
     bitmap.height = height;
@@ -535,14 +539,61 @@ void Display::release_bmp(int bno)
     if (bno < 0 || bno >= bitmap_max) {
         return;
     }
+    retire_bitmap(bitmaps_[bno]);
     bitmaps_[bno] = Bitmap{};
 }
 
 void Display::release_bmp_all()
 {
     for (auto& bitmap : bitmaps_) {
+        retire_bitmap(bitmap);
         bitmap = Bitmap{};
     }
+}
+
+void Display::retire_bitmap(Bitmap& bitmap)
+{
+    // Only targets this slot made: a borrowed view belongs to the game, and
+    // a plain loaded texture is not worth keeping.
+    if (!bitmap.owned || !bitmap.renderable
+        || SDL_GetNumberProperty(SDL_GetTextureProperties(bitmap.owned.get()),
+                                 SDL_PROP_TEXTURE_ACCESS_NUMBER, -1)
+            != SDL_TEXTUREACCESS_TARGET) {
+        return;
+    }
+    // A handful covers every size the scripts use (the screen, the plates);
+    // past that the oldest goes, so a run of odd sizes cannot pile up.
+    constexpr std::size_t spare_max = 8;
+    if (spare_targets_.size() >= spare_max) {
+        spare_targets_.erase(spare_targets_.begin());
+    }
+    bitmap.view = nullptr;
+    spare_targets_.push_back(std::move(bitmap.owned));
+}
+
+Texture Display::take_spare_target(int width, int height)
+{
+    for (auto at = spare_targets_.begin(); at != spare_targets_.end(); ++at) {
+        if ((*at)->w != width || (*at)->h != height) {
+            continue;
+        }
+        Texture texture = std::move(*at);
+        spare_targets_.erase(at);
+        // As a new one would be: cleared to nothing, and none of the state
+        // its last owner set.
+        SDL_Texture* const held = SDL_GetRenderTarget(renderer_);
+        Uint8 r = 0, g = 0, b = 0, a = 0;
+        SDL_GetRenderDrawColor(renderer_, &r, &g, &b, &a);
+        SDL_SetRenderTarget(renderer_, texture.get());
+        SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 0);
+        SDL_RenderClear(renderer_);
+        SDL_SetRenderTarget(renderer_, held);
+        SDL_SetRenderDrawColor(renderer_, r, g, b, a);
+        SDL_SetTextureColorMod(texture.get(), 255, 255, 255);
+        SDL_SetTextureAlphaMod(texture.get(), 255);
+        return texture;
+    }
+    return {};
 }
 
 void Display::set_bmp(int bno, Texture texture, int width, int height)
@@ -1064,7 +1115,11 @@ void Display::set_graph_zoom(int gno, int dx, int dy, int dw, int dh)
 
 void Display::set_graph_zoom2(int gno, int cx, int cy, int zoom)
 {
-    Graph& graph = at(gno);
+    apply_zoom2(at(gno), cx, cy, zoom);
+}
+
+void Display::apply_zoom2(Graph& graph, int cx, int cy, int zoom)
+{
     if (zoom < -256) {
         graph.poly = Poly::zoom;
         graph.zoom = -256;
@@ -1825,8 +1880,15 @@ void Display::begin_frame(SDL_Texture* dest)
 
 void Display::draw_layer(int layer)
 {
-    for (const auto& graph : graphs_) {
+    for (std::size_t gno = 0; gno < graphs_.size(); ++gno) {
+        const Graph& graph = graphs_[gno];
         if (!graph.flag || !graph.disp || graph.layer != layer) {
+            continue;
+        }
+        if (presenter_) {
+            Graph presented = graph;
+            presenter_(static_cast<int>(gno), presented);
+            draw_one(presented, nullptr, global_x_, global_y_);
             continue;
         }
         draw_one(graph, nullptr, global_x_, global_y_);

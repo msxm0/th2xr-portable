@@ -50,17 +50,85 @@ namespace th2app {
 // --cpu-transitions still forces the CPU blend, which is also exact and is
 // what the shader was checked against.
 bool force_cpu_transitions = false;
+// The web build's frame loop: 0 requestAnimationFrame, 1 --frame-step, 2
+// --frame-free (see wait_for_next_frame).
+int web_frame_pacing = 0;
 bool trace_prefetch = false;
 
 namespace {
 
 #ifdef __EMSCRIPTEN__
-// Blocks the frame loop until the browser is ready to paint again.  JSPI
-// suspends the whole call stack on the await, the same mechanism the
-// streaming archive reads rely on, so the loop stays shaped like the native
-// one instead of becoming a callback.
-EM_ASYNC_JS(void, wait_for_animation_frame, (void), {
-    await new Promise(requestAnimationFrame);
+// Blocks the frame loop until the next frame may start.  JSPI suspends the
+// whole call stack on the await, the same mechanism the streaming archive
+// reads rely on, so the loop stays shaped like the native one instead of
+// becoming a callback.
+//
+// Normally that is the browser being ready to paint again.  Two debugging
+// modes take the loop off requestAnimationFrame:
+//   --frame-step  each frame waits for the page to ask for it -
+//                 th2Step(n) runs n more frames and returns a promise that
+//                 settles once they are drawn, so a harness can capture the
+//                 canvas, the trace dumps or the GL state between any two;
+//   --frame-free  frames run back to back, yielding to the event loop only
+//                 (a trace replay at the machine's speed, as natively).
+EM_ASYNC_JS(void, wait_for_next_frame, (int mode), {
+    if (mode === 0) {
+        await new Promise(requestAnimationFrame);
+        return;
+    }
+    if (mode === 2) {
+        await new Promise((resume) => {
+            const channel = new MessageChannel();
+            channel.port1.onmessage = () => resume();
+            channel.port2.postMessage(0);
+        });
+        return;
+    }
+    const step = globalThis.th2Frames || (globalThis.th2Frames = (() => {
+        const state = { drawn: 0, allowed: 0, resume: null, waiters: [] };
+        // Frames drawn so far, and how many may be: th2Step(n) lets n more
+        // run and settles when the last of them is drawn.
+        globalThis.th2Step = (count = 1) => {
+            state.allowed = Math.max(state.allowed, state.drawn) + count;
+            const target = state.allowed;
+            const done = new Promise((settle) =>
+                state.waiters.push({ target, settle }));
+            if (state.resume) {
+                const resume = state.resume;
+                state.resume = null;
+                resume();
+            }
+            return done;
+        };
+        return state;
+    })());
+    // A frame has just been drawn.
+    step.drawn += 1;
+    step.waiters = step.waiters.filter((waiter) => {
+        if (waiter.target <= step.drawn) {
+            waiter.settle(step.drawn);
+            return false;
+        }
+        return true;
+    });
+    if (step.drawn >= step.allowed) {
+        await new Promise((resume) => { step.resume = resume; });
+    }
+});
+
+// The loop has ended: every th2Step still waiting settles (with -1), and
+// any later one does at once, rather than waiting for a frame that will
+// never come.
+EM_JS(void, frames_ended, (void), {
+    const step = globalThis.th2Frames;
+    if (!step) {
+        return;
+    }
+    for (const waiter of step.waiters) {
+        waiter.settle(-1);
+    }
+    step.waiters = [];
+    globalThis.th2Step = () => Promise.resolve(-1);
 });
 #endif
 
@@ -202,6 +270,13 @@ Game::Game(
     if (!window_ || !renderer_) {
         throw std::runtime_error(SDL_GetError());
     }
+#ifndef __EMSCRIPTEN__
+    // Present on the display's own refresh, so frames between ticks are
+    // drawn at its rate rather than at the engine's (see game_subtick.cpp).
+    // Where vsync cannot be had the loop paces itself to the tick instead.
+    // A trace turns it off again in enable_trace.
+    vsync_paced_ = SDL_SetRenderVSync(renderer_, 1);
+#endif
     if (auto icon = th2::load_executable_icon(data / "TOHEART2.EXE")) {
         SDL_SetWindowIcon(window_, icon.get());
     }
@@ -307,6 +382,13 @@ Game::Game(
         SDL_SetTextureBlendMode(title_masked_.get(), SDL_BLENDMODE_BLEND);
     }
     title_started_ = std::chrono::steady_clock::now();
+    // The player's input sampled once a tick, in every run - not only in a
+    // trace.  A recording compares exactly this against the reference;
+    // normal play is the same machine with nobody keeping the file.
+    recorder_.begin_live();
+    // The audio channels stay on the wall clock outside a trace: they also
+    // time when a sound has really finished playing and when a track's
+    // intro hands over to its loop, and the hardware plays in real time.
     if (soak_directory) {
         soak_ = std::make_unique<th2::SoakGameDriver<Game>>(
             *this,
@@ -354,8 +436,12 @@ Game::~Game()
     }
     // All SDL resources are owned by members declared after
     // window_holder_/renderer_holder_, so they are destroyed before the
-    // renderer/window and before SDL_Quit().  Only the config needs an
-    // explicit teardown step.
+    // renderer/window and before SDL_Quit() - except the wipe shader, which
+    // is declared among the transitions and makes raw GL calls in its
+    // destructor.  After the renderer has taken the context with it those
+    // throw in WebGL, and a throw out of a destructor is std::terminate: the
+    // browser build aborted on every exit.  It goes first, explicitly.
+    gl_transition_.reset();
     sync_window_config();
     th2::save_config(config_path_, config_);
 }
@@ -370,23 +456,6 @@ int Game::run()
         }
         throw;
     }
-}
-
-// Which option a key names, 0..9, or -1 for a key that is not a digit.  The
-// engine folds the keypad onto the number row (KeyCond.trg.kJ || .nJ), so
-// both spell the same option.
-int Game::choice_number_key(SDL_Keycode key)
-{
-    if (key >= SDLK_0 && key <= SDLK_9) {
-        return static_cast<int>(key - SDLK_0);
-    }
-    if (key >= SDLK_KP_1 && key <= SDLK_KP_9) {
-        return static_cast<int>(key - SDLK_KP_1) + 1;
-    }
-    if (key == SDLK_KP_0) {
-        return 0;
-    }
-    return -1;
 }
 
 bool Game::is_confirm_key(SDL_Keycode key)
@@ -413,9 +482,12 @@ int Game::run_loop()
     while (running_) {
         iterate();
 #ifdef __EMSCRIPTEN__
-        wait_for_animation_frame();
+        wait_for_next_frame(web_frame_pacing);
 #endif
     }
+#ifdef __EMSCRIPTEN__
+    frames_ended();
+#endif
     SDL_Log("Main loop exited cleanly");
     return 0;
 }
@@ -715,8 +787,12 @@ void Game::iterate()
     }
     if (prefetch_scan_pending_ || prefetch_follow_pending_) {
         const auto now = std::chrono::steady_clock::now();
-        if (now - last_prefetch_scan_ >= std::chrono::milliseconds(50)
-            && !background_budget_.exhausted()) {
+        // A trace throttles by ticks: 50 ms of the host's time is a
+        // different number of ticks on every run.
+        const bool due = trace_mode_
+            ? trace_tick_ % 3 == 0
+            : now - last_prefetch_scan_ >= std::chrono::milliseconds(50);
+        if (due && !background_budget_.exhausted()) {
             prefetch_scan_pending_ = false;
             last_prefetch_scan_ = now;
             background_budget_.spend([&] { prefetch_upcoming_assets(); });
@@ -730,7 +806,7 @@ void Game::iterate()
     // in game coordinates and the recorder's names.  Only for checking that
     // a recording replays as it was played; it goes in where SDL's input
     // would, past the coordinate conversion.
-    if (recorder_.active()) {
+    if (recorder_.recording()) {
         static std::vector<std::pair<std::uint64_t, std::string>> feed = [] {
             std::vector<std::pair<std::uint64_t, std::string>> lines;
             const char* path = std::getenv("TH2_RECORD_FEED");
@@ -768,7 +844,7 @@ void Game::iterate()
     while (SDL_PollEvent(&event)) {
         if (event.type == SDL_EVENT_QUIT) {
             running_ = false;
-            if (recorder_.active()) {
+            if (recorder_.recording()) {
                 recorder_.finish(trace_tick_);
                 SDL_Log("record: finished at tick %llu",
                         static_cast<unsigned long long>(trace_tick_));
@@ -857,14 +933,17 @@ void Game::iterate()
         }
         convert_event_to_logical_coordinates(
             event, window_width, window_height);
-        // Recording: the player's input goes to the recorder and nowhere
-        // else.  The game gets it back through trace_apply_input, sampled
-        // once a tick, exactly as a replay of the file will hand it over -
-        // letting it through here as well would play every click twice and
-        // record a run that no replay could reproduce.
-        if (recorder_.active()) {
+        // The engine is fed once a tick, from the sampler, and from nowhere
+        // else - the same path a recording takes, so what a recording
+        // verifies against the reference is what is played.  Releases and
+        // the pointer always reach it, so a key pressed in the scene and let
+        // go over one of the port's screens does not stay held; presses only
+        // while nothing of the port's is up over the scene.
+        const bool press = event.type == SDL_EVENT_KEY_DOWN
+            || event.type == SDL_EVENT_MOUSE_BUTTON_DOWN
+            || event.type == SDL_EVENT_MOUSE_WHEEL;
+        if (!press) {
             record_input_event(event);
-            continue;
         }
         if (config_.show_script_position
             && imgui_->wants_mouse()
@@ -874,22 +953,9 @@ void Game::iterate()
                 || event.type == SDL_EVENT_MOUSE_WHEEL)) {
             continue;
         }
-        if (event.type == SDL_EVENT_KEY_DOWN && is_alt_enter(event.key)) {
+        if (event.type == SDL_EVENT_KEY_DOWN
+            && (is_alt_enter(event.key) || event.key.key == SDLK_F11)) {
             toggle_fullscreen();
-            continue;
-        }
-        if (clock_state_) {
-            continue;
-        }
-        if (calendar_state_) {
-            const bool dismiss =
-                event.type == SDL_EVENT_MOUSE_BUTTON_DOWN
-                || event.type == SDL_EVENT_KEY_DOWN;
-            if (dismiss && !calendar_state_->dismissing
-                && calendar_state_->frame >= 16) {
-                calendar_state_->dismissing = true;
-                calendar_state_->frame = 0;
-            }
             continue;
         }
         if (movie_) {
@@ -937,181 +1003,25 @@ void Game::iterate()
             }
             continue;
         }
-        if (transition_ || back().br_flag) {
+        if (engine_input_open()) {
+            if (!handle_host_key(event) && !handle_text_scroll_drag(event)
+                && press) {
+                record_input_event(event);
+            }
             continue;
         }
 
-        // UI mode routing
+        // The port's own screens, which have no engine under them.
         if (ui_mode_ == UiMode::title) {
             handle_title_input(event);
-            continue;
-        }
-        if (ui_mode_ == UiMode::cg_gallery) {
+        } else if (ui_mode_ == UiMode::cg_gallery) {
             handle_cg_gallery_input(event);
-            continue;
-        }
-        if (ui_mode_ == UiMode::music_room) {
+        } else if (ui_mode_ == UiMode::music_room) {
             handle_music_room_input(event);
-            continue;
-        }
-        if (ui_mode_ == UiMode::replay_gallery) {
+        } else if (ui_mode_ == UiMode::replay_gallery) {
             handle_replay_gallery_input(event);
-            continue;
-        }
-        if (ui_mode_ == UiMode::system_menu) {
-            handle_system_menu_input(event);
-            continue;
-        }
-        if (ui_mode_ == UiMode::save || ui_mode_ == UiMode::load) {
+        } else if (ui_mode_ == UiMode::save || ui_mode_ == UiMode::load) {
             handle_save_load_input(event);
-            continue;
-        }
-        if (ui_mode_ == UiMode::map) {
-            handle_map_input(event);
-            continue;
-        }
-        if (ui_mode_ == UiMode::backlog) {
-            handle_backlog_input(event);
-            continue;
-        }
-
-        // Message window hidden - any input restores it
-        if (window_hidden_) {
-            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN
-                || event.type == SDL_EVENT_KEY_DOWN) {
-                window_hidden_ = false;
-            }
-            continue;
-        }
-
-        if (event.type == SDL_EVENT_KEY_DOWN) {
-            if (event.key.key == SDLK_PAGEUP) {
-                open_backlog();
-            } else if (choosing_) {
-                // The number row answers a choice outright, which is what
-                // AVG_ControlSelectWindow does with GameKey.num[]: "1" is the
-                // first option.  num[0] resolves to select -1 there and is
-                // thrown away by the `select>=0` guard, so "0" does nothing
-                // here either.
-                const int digit = choice_number_key(event.key.key);
-                if (digit > 0
-                    && digit <= static_cast<int>(choices_.size())) {
-                    answer_choice(digit - 1);
-                } else if (is_confirm_key(event.key.key)) {
-                    answer_choice(choice_highlight_);
-                } else if (event.key.key == SDLK_UP) {
-                    if (choice_highlight_ > 0) {
-                        --choice_highlight_;
-                    }
-                } else if (event.key.key == SDLK_DOWN) {
-                    if (choice_highlight_ + 1
-                        < static_cast<int>(choices_.size())) {
-                        ++choice_highlight_;
-                    }
-                }
-            } else {
-                if (event.key.key == SDLK_ESCAPE) {
-                    open_system_menu();
-                } else if (event.key.key == SDLK_F8
-                           && gamepad_input_.last_event_was_gamepad()) {
-                    skip_mode_ = !skip_mode_;
-                    if (skip_mode_) auto_mode_ = false;
-                } else if (event.key.key == SDLK_F9
-                           && gamepad_input_.last_event_was_gamepad()) {
-                    auto_mode_ = !auto_mode_;
-                    if (auto_mode_) skip_mode_ = false;
-                } else if (event.key.key == SDLK_F10
-                           && gamepad_input_.last_event_was_gamepad()) {
-                    window_hidden_ = !window_hidden_;
-                } else if (event.key.key == SDLK_F5
-                           && !replay_mode_) {
-                    save_snapshot_ = capture_frame_thumbnail(
-    save_thumbnail_width, save_thumbnail_height);
-                    save(0);
-                } else if (event.key.key == SDLK_F7
-                           && !replay_mode_) {
-                    save_snapshot_ = capture_frame_thumbnail(
-    save_thumbnail_width, save_thumbnail_height);
-                    open_save_load(UiMode::load);
-                } else if (event.key.key == SDLK_F11) {
-                    toggle_fullscreen();
-                } else if (is_confirm_key(event.key.key)) {
-                    manual_advance();
-                }
-            }
-        } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
-            if (event.button.button == SDL_BUTTON_RIGHT) {
-                open_system_menu();
-            } else if (event.button.button == SDL_BUTTON_LEFT) {
-                if (handle_sidebar_click(event.button.x, event.button.y)) {
-                    suppress_sidebar_mouse_up_ = true;
-                    continue;
-                }
-                if (handle_message_scroll_press(
-                        event.button.x, event.button.y)) {
-                    suppress_sidebar_mouse_up_ = true;
-                    continue;
-                }
-            }
-        } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
-            if (event.button.button == SDL_BUTTON_LEFT) {
-                if (suppress_sidebar_mouse_up_) {
-                    suppress_sidebar_mouse_up_ = false;
-                    finish_sidebar_drag();
-                    continue;
-                }
-                if (choosing_) {
-                    const float mouse_y = event.button.y;
-                    for (int i = 0;
-                         i < static_cast<int>(choices_.size()); ++i) {
-                        const float y = choice_row_y(i);
-                        if (mouse_y >= y
-                            && mouse_y < y + choice_row_height(i)) {
-                            answer_choice(i);
-                            break;
-                        }
-                    }
-                } else {
-                    manual_advance();
-                }
-            }
-            finish_sidebar_drag();
-        } else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
-            if (event.wheel.y > 0
-                && config_.wheel_opens_backlog) {
-                open_backlog();
-            } else if (event.wheel.y < 0) {
-                manual_advance();
-            }
-        } else if (event.type == SDL_EVENT_MOUSE_MOTION) {
-            if (backlog_handle_dragging_) {
-                set_backlog_from_sidebar_y(event.motion.y);
-                continue;
-            }
-            if (opacity_handle_dragging_) {
-                set_message_alpha_from_sidebar_y(event.motion.y);
-                continue;
-            }
-            if (message_scroll_dragging_) {
-                set_message_scroll_from_y(event.motion.y);
-                continue;
-            }
-            update_sidebar_hover(event.motion.x, event.motion.y);
-            if (choosing_) {
-                const float mouse_y = event.motion.y;
-                for (int i = 0;
-                     i < static_cast<int>(choices_.size()); ++i) {
-                    const float y = choice_row_y(i);
-                    if (mouse_y >= y
-                        && mouse_y < y + choice_row_height(i)) {
-                        choice_highlight_ = i;
-                        break;
-                    }
-                }
-            }
-        } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP
-                   && event.button.button == SDL_BUTTON_LEFT) {
-            finish_sidebar_drag();
         }
     }
     handle_touch_actions();
@@ -1125,79 +1035,43 @@ void Game::iterate()
 #endif
         return;
     }
-    // AVG_GetGameKey is the top of MAIN_SystemControl, which runs once per
-    // frame at sixty of them a second - so every edge it folds is seen by
-    // exactly one control pass.  On a faster display most frames have no
-    // sixtieth in them at all, and folding there would throw the edge away
-    // before AVG_ControlNovelMessage ever looked at it: a click would be
-    // dropped on two frames out of three at 144Hz.  So the fold happens with
-    // the control pass, and trg_ edges accumulate in KeyCond until then.
+    // The title has no engine under it, so the skip key there is the
+    // port's own: it fast-forwards the title's animation.  In the scene it
+    // is only KeyCond.btn.ctrl, which the per-tick sample hands over.
     const bool control_held =
         !config_open_ && !name_input_open_
         && ((SDL_GetModState() & SDL_KMOD_CTRL) != 0
             || touch_input_.skip_held()
             || gamepad_input_.ctrl_skip_held());
-    if (movie_) {
-        // Winmain.cpp stops a movie, it never speeds one up:
-        //     if( AVG_KeySkip() || movPlayerFrm->bEnd ){
-        //         movPlayerFrm->Release(); ... movPlayerFrm=NULL; }
-        // and AVG_KeySkip() reads the click, escape and space keys - not the
-        // skip key, which does nothing to a movie at all.  Running the video
-        // at four times its rate left the audio playing at its own, which is
-        // the desync; the click path below is what actually skips it.
-    } else if (control_held && ui_mode_ == UiMode::title) {
+    if (!movie_ && control_held && ui_mode_ == UiMode::title) {
         title_started_ -= std::chrono::milliseconds(50);
         if (title_exit_started_) {
             *title_exit_started_ -= std::chrono::milliseconds(50);
         }
-    } else if (control_held && ui_mode_ == UiMode::game) {
-        // The engine skips at one instruction per frame whatever else is
-        // going on: Avg.msg_cut collapses every AVG_EffCnt to zero, so the
-        // effects finish themselves and the waits stop holding.  pump_script
-        // below retires the parked ESC_WAIT, so all this has to do is the
-        // half advance() alone can do - turn the page.
-        skip(true);
     }
-    // EXEC_ControlLang.  main.cpp runs it, then MAIN_GameControl - the
-    // AVG_Control* chain, which is the update_ pass below - and only then
-    // MAIN_DrawGraph.  Every resumption of the script goes through here so
-    // that order holds; resuming from inside the control pass put a
-    // character on screen before AVG_ControlChar had given it its first
-    // DRW_BLD, and raised the half tone after AVG_ControlHalfTone had
-    // already run for the frame, which is text over an undarkened plate.
-    //
-    // One tick count for the whole frame, and taken here rather than inside
-    // the control pass below, because the script pass needs it too:
-    // AVG_WaitFrame counts a frame from inside EXEC_ControlLang, and our
-    // pump runs once per drawn frame rather than once per sixtieth, so on a
-    // 144Hz display it would otherwise count more than twice as fast as the
-    // engine does.  control_ticks_due() spends the accumulator, so it may
-    // only be asked once a frame - the two control passes below read this
-    // instead of asking again.
-    control_steps_ = control_ticks_due();
-    // Before the script runs, not after: an ESC_WAIT re-asks its predicate
-    // as part of the script pass.  See Game::refresh_audio_wait.
-    refresh_audio_wait(true);
-    // Before the script pass: the clock and the calendar are waits the script
-    // asks about, so stepping them afterwards left it reading last tick's
-    // frame and leaving one tick late.
-    update_clock_calendar();
-    pump_script();
+    // How many ticks are due.  control_ticks_due() spends the
+    // accumulator, so it is asked once a frame; a trace always gets one.
+    const int ticks = control_ticks_due();
     if (soak_) {
+        // The soak driver plays headless and steps the frame its own way.
+        control_steps_ = ticks;
+        global_count_ += ticks;
+        refresh_audio_wait(true);
+        update_clock_calendar();
+        pump_script();
         soak_->step();
-    }
-    update_audio();
-    update_movie();
-    trace_peek_map_pointer();
-    update_map();
-    update_playback_modes();
-    update_title();
-    if (soak_) {
+        update_audio();
+        update_movie();
+        trace_peek_map_pointer();
+        update_map();
+        update_playback_modes();
+        update_title();
         if (control_steps_ > 0) {
             get_game_key();
         } else {
             game_key_ = {};
         }
+        control_calendar_key();
         control_system2();
         for (int i = 0; i < control_steps_; ++i) {
             msg().control_novel_message(game_key_);
@@ -1208,7 +1082,7 @@ void Game::iterate()
         update_half_tone();
         update_screen_flash();
         update_character_animations(control_steps_);
-            update_sakura(control_steps_);
+        update_sakura(control_steps_);
         retire_soak_gpu_work();
         next_frame_ = std::chrono::steady_clock::now();
         return;
@@ -1267,69 +1141,23 @@ void Game::iterate()
         config_.font_size, framebuffer_scale);
     draw_config();
     draw_name_input();
-    // MAIN_GameControl: AVG_System's chain, in its order.  One tick count
-    // for the whole pass, so the background, the half tone and the
-    // characters all advance by the same number of sixtieths.  Counted at
-    // the top of the frame, next to the script pass.
-    if (control_steps_ > 0) {
-        get_game_key();
-    } else {
-        // No sixtieth has gone by.  The frame is still drawn, but nothing
-        // that counts advances and no edge is consumed.
+    // MAIN_Loop's tick body, once for every tick that is due: the script,
+    // then the control chain, each tick with its own sample of the player's
+    // input.  A frame with no tick in it - most of them on a fast display -
+    // draws the same picture again; a frame after a stall runs
+    // several, as the engine would have.
+    tick_this_frame_ = ticks > 0;
+    for (int i = 0; i < ticks; ++i) {
+        run_tick();
+    }
+    if (ticks == 0) {
+        // Nothing counted, but the decoders still want feeding.
+        control_steps_ = 0;
         game_key_ = {};
-    }
-    // AVG_System's chain, in its order:
-    //     AVG_ControlSystem2();
-    //     AVG_ControlNovelMessage();
-    //     AVG_ControlHalfTone();
-    //     AVG_ControlText();
-    //     AVG_ControlBack();
-    //     AVG_ControlChar();
-    // Before the control chain, which is after everything is drawn: this is
-    // the frame as the screen saw it.  See Game::trace_glyph_drawn_.
-    if (trace_mode_) {
-        trace_glyph_drawn_ = trace_glyph_alpha();
-    }
-    if (engine_config_step_) {
-        // AVG_Main's AVG_CONFIG step: the system menu and the half tone, and
-        // nothing else of the AVG_GAME chain - the characters, the weather
-        // and the message all stand still underneath it.
-        for (int i = 0; i < control_steps_; ++i) {
-            control_engine_config();
-            msg().control_half_tone();
-        }
+        update_audio();
+        update_movie();
         update_audio_decode();
-        update_half_tone();
-    } else {
-    control_system2();
-    for (int i = 0; i < control_steps_; ++i) {
-        msg().control_novel_message(game_key_);
-        msg().control_half_tone();
-    }
-    update_avg_back(control_steps_);
-    update_audio_decode();
-    update_half_tone();
-    update_screen_flash();
-    update_character_animations(control_steps_);
-    if (control_steps_ > 0) {
-        // AVG_ControlWeather sets every petal's graph up again.
-        weather_disp_ = true;
-    }
-    update_sakura(control_steps_);
-    // AVG_System runs AVG_ControlSelectWindow late, after AVG_ControlChar and
-    // the weather and warp passes rather than with the message control.
-    control_select_window();
-    // AVG_ControlSystem, the last of the chain: the system menu opened this
-    // frame gets its first step on the frame it opened.
-    for (int i = 0; engine_config_.flag && i < control_steps_; ++i) {
-        control_engine_config();
-    }
-    }
-    // AVG_RenewSetp: a step change made during the frame takes effect for
-    // the next one.
-    if (engine_config_step_next_) {
-        engine_config_step_ = *engine_config_step_next_;
-        engine_config_step_next_.reset();
+        update_title();
     }
     // main.cpp runs EXEC_ControlLang, then MAIN_GameControl - the AVG_
     // Control* chain - and only then MAIN_DrawGraph.  Drawing before the
@@ -1395,13 +1223,17 @@ void Game::iterate()
 #else
     // A trace tick is a unit of engine progress, not of time: nothing in the
     // run reads a clock, so there is nothing for it to be in step with.
-    // Sleeping here would pace the replay at sixty ticks a second, which is
+    // Sleeping here would pace the replay at the engine's rate, which is
     // the whole cost of getting to a divergence - the engine itself computes
     // a tick in well under a millisecond.
     // A recording is played by a person, so from the hand-over it runs at
-    // the engine's own sixty ticks a second.  Only the pacing reads the
-    // clock; the tick is still the only thing the engine sees.
-    if (!trace_mode_ || record_live()) {
+    // the engine's own rate, a tick every engine_tick_ms.  Only the pacing
+    // reads the clock; the tick is still the only thing the engine sees.
+    if (!trace_mode_ && vsync_paced_) {
+        // SDL_RenderPresent waited for the display; the ticks are counted
+        // off the clock in control_ticks_due.
+        next_frame_ = std::chrono::steady_clock::now();
+    } else if (!trace_mode_ || record_live()) {
         if (record_live() && trace_tick_ == record_from_) {
             next_frame_ = std::chrono::steady_clock::now();
         }
@@ -1410,8 +1242,8 @@ void Game::iterate()
                 "ToHeart2 - recording, tick {}", trace_tick_);
             SDL_SetWindowTitle(window_, title.c_str());
         }
-        constexpr auto frame_duration = std::chrono::nanoseconds(
-            1'000'000'000 / 60);
+        constexpr auto frame_duration =
+            std::chrono::milliseconds(engine_tick_ms);
         next_frame_ += frame_duration;
         const auto now = std::chrono::steady_clock::now();
         if (next_frame_ > now) {
@@ -1423,20 +1255,106 @@ void Game::iterate()
 #endif
 }
 
+void Game::run_tick()
+{
+    // One tick of the engine: EXEC_ControlLang, then MAIN_GameControl -
+    // the AVG_Control* chain - with every counter in it stepped once.
+    // Drawing is the frame's, not the tick's; see iterate().
+    control_steps_ = 1;
+    ++global_count_;
+    // EXEC_ControlLang.  main.cpp runs it, then MAIN_GameControl, and only
+    // then MAIN_DrawGraph.  Every resumption of the script goes through here
+    // so that order holds; resuming from inside the control pass put a
+    // character on screen before AVG_ControlChar had given it its first
+    // DRW_BLD, and raised the half tone after AVG_ControlHalfTone had
+    // already run for the frame, which is text over an undarkened plate.
+    //
+    // Before the script runs, not after: an ESC_WAIT re-asks its predicate
+    // as part of the script pass.  See Game::refresh_audio_wait.
+    refresh_audio_wait(true);
+    // Before the script pass: the clock and the calendar are waits the script
+    // asks about, so stepping them afterwards left it reading last tick's
+    // frame and leaving one tick late.
+    update_clock_calendar();
+    pump_script();
+    update_audio();
+    update_movie();
+    trace_peek_map_pointer();
+    update_map();
+    update_playback_modes();
+    update_title();
+    // AVG_GetGameKey, the top of MAIN_SystemControl: one sample of the
+    // player's hands (or the script's) per tick, so every edge it folds is
+    // seen by exactly one control pass.
+    get_game_key();
+    // AVG_Main's AVG_CALENDER arm: AVG_SetCalender reads it.
+    control_calendar_key();
+    // AVG_System's chain, in its order:
+    //     AVG_ControlSystem2();
+    //     AVG_ControlNovelMessage();
+    //     AVG_ControlHalfTone();
+    //     AVG_ControlText();
+    //     AVG_ControlBack();
+    //     AVG_ControlChar();
+    // Before the control chain, which is after everything is drawn: this is
+    // the frame as the screen saw it.  See Game::trace_glyph_drawn_.
+    if (trace_mode_) {
+        trace_glyph_drawn_ = trace_glyph_alpha();
+    }
+    if (engine_config_step_) {
+        // AVG_Main's AVG_CONFIG step: the system menu and the half tone, and
+        // nothing else of the AVG_GAME chain - the characters, the weather
+        // and the message all stand still underneath it.
+        control_engine_config();
+        msg().control_half_tone();
+        update_audio_decode();
+        update_half_tone();
+    } else {
+        control_system2();
+        msg().control_novel_message(game_key_);
+        msg().control_half_tone();
+        update_avg_back(1);
+        update_audio_decode();
+        update_half_tone();
+        update_screen_flash();
+        update_character_animations(1);
+        // AVG_ControlWeather sets every petal's graph up again.
+        weather_disp_ = true;
+        update_sakura(1);
+        // AVG_System runs AVG_ControlSelectWindow late, after
+        // AVG_ControlChar and the weather and warp passes rather than with
+        // the message control.
+        control_select_window();
+        // AVG_ControlSystem, the last of the chain: the system menu opened
+        // this frame gets its first step on the frame it opened.
+        if (engine_config_.flag) {
+            control_engine_config();
+        }
+    }
+    // AVG_RenewSetp: a step change made during the tick takes effect for
+    // the next one.
+    if (engine_config_step_next_) {
+        engine_config_step_ = *engine_config_step_next_;
+        engine_config_step_next_.reset();
+    }
+}
+
 // SDL input, in the 800x600 game space, as the script's vocabulary: the
-// keys th2ref_input.cpp knows, and the two mouse buttons.  Arrows, the
-// wheel and the middle button have no script name on the reference's side,
-// so they are not recorded - a recording that used them could not be
-// replayed there.
+// keys th2ref_input.cpp knows, and the two mouse buttons.  The wheel and the
+// middle button have no script name on the reference's side, so they reach
+// the engine (live_wheel_, live_middle_) without being recorded - a
+// recording that used them could not be replayed there.
 void Game::record_input_event(const SDL_Event& event)
 {
     switch (event.type) {
     case SDL_EVENT_MOUSE_MOTION:
+        pointer_from_touch_ = event.motion.which == SDL_TOUCH_MOUSEID;
         recorder_.pointer(static_cast<int>(event.motion.x),
                           static_cast<int>(event.motion.y));
         return;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
     case SDL_EVENT_MOUSE_BUTTON_UP: {
+        pointer_from_touch_ = event.button.which == SDL_TOUCH_MOUSEID;
         recorder_.pointer(static_cast<int>(event.button.x),
                           static_cast<int>(event.button.y));
         const bool down = event.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
@@ -1444,9 +1362,25 @@ void Game::record_input_event(const SDL_Event& event)
             recorder_.key("lclick", down);
         } else if (event.button.button == SDL_BUTTON_RIGHT) {
             recorder_.key("rclick", down);
+        } else if (event.button.button == SDL_BUTTON_MIDDLE && down) {
+            live_middle_ = true;
         }
         return;
     }
+    case SDL_EVENT_MOUSE_WHEEL:
+        // Over a page that does not fit, the wheel scrolls the page and
+        // nothing else.
+        if (event.wheel.y != 0 && recorder_.x() < sidebar_left_x
+            && scroll_overflowing_text(event.wheel.y > 0 ? -1 : 1)) {
+            return;
+        }
+        //     wheel = MUS_GetMouseWheel();  ... if( wheel>0 ) GameKey.pup
+        if (event.wheel.y > 0) {
+            live_wheel_ = 1;
+        } else if (event.wheel.y < 0) {
+            live_wheel_ = -1;
+        }
+        return;
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
         if (event.key.repeat) {
@@ -1466,7 +1400,24 @@ void Game::record_input_event(const SDL_Event& event)
         case SDLK_END: name = "end"; break;
         case SDLK_PAGEUP: name = "pup"; break;
         case SDLK_PAGEDOWN: name = "pdown"; break;
+        case SDLK_UP: name = "up"; break;
+        case SDLK_DOWN: name = "down"; break;
+        case SDLK_LEFT: name = "left"; break;
+        case SDLK_RIGHT: name = "right"; break;
         default: break;
+        }
+        // The gamepad's three extra buttons arrive as F8, F9 and F10 (see
+        // GamepadInput) and stand for keys the engine already has: the skip
+        // toggle (shift, GameKey.mes_cut_mode), the bar's auto button, and
+        // hiding the window (space, GameKey.diswin).
+        if (gamepad_input_.last_event_was_gamepad()) {
+            if (event.key.key == SDLK_F8) {
+                name = "shift";
+            } else if (event.key.key == SDLK_F10) {
+                name = "space";
+            } else if (event.key.key == SDLK_F9 && down) {
+                live_bar_button_ = 5;
+            }
         }
         static constexpr const char* digits[10] = {
             "num0", "num1", "num2", "num3", "num4",
@@ -1486,6 +1437,55 @@ void Game::record_input_event(const SDL_Event& event)
     default:
         return;
     }
+}
+
+bool Game::handle_text_scroll_drag(const SDL_Event& event)
+{
+    // The overflow scrollbar at the left edge of the page, the port's: a
+    // press on it is the bar's, not a click in the scene.
+    if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN
+        && event.button.button == SDL_BUTTON_LEFT) {
+        return handle_message_scroll_press(event.button.x, event.button.y);
+    }
+    if (event.type == SDL_EVENT_MOUSE_MOTION && message_scroll_dragging_) {
+        set_message_scroll_from_y(event.motion.y);
+    } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP
+               && event.button.button == SDL_BUTTON_LEFT) {
+        message_scroll_dragging_ = false;
+    }
+    return false;
+}
+
+bool Game::engine_input_open() const
+{
+    if (config_open_ || name_input_open_ || movie_) {
+        return false;
+    }
+    return ui_mode_ == UiMode::game || ui_mode_ == UiMode::map;
+}
+
+bool Game::handle_host_key(const SDL_Event& event)
+{
+    // The port's keys that are not the engine's: quick save and the load
+    // screen.  Everything else in the scene is the sampler's.
+    if (event.type != SDL_EVENT_KEY_DOWN || event.key.repeat
+        || ui_mode_ != UiMode::game || replay_mode_) {
+        return false;
+    }
+    if (event.key.key == SDLK_F5) {
+        save_snapshot_ = capture_frame_thumbnail(
+            save_thumbnail_width, save_thumbnail_height);
+        save(0);
+        return true;
+    }
+    if (event.key.key == SDLK_F7) {
+        // AVG_GoConfig(2), as the bar's load button.
+        if (engine_config_check()) {
+            engine_go_config(2);
+        }
+        return true;
+    }
+    return false;
 }
 
 void Game::draw()
@@ -1609,6 +1609,10 @@ int main(int argc, char** argv)
                 record_from = std::stoull(argv[index]);
             } else if (argument == "--cpu-transitions") {
                 th2app::force_cpu_transitions = true;
+            } else if (argument == "--frame-step") {
+                th2app::web_frame_pacing = 1;
+            } else if (argument == "--frame-free") {
+                th2app::web_frame_pacing = 2;
             } else if (argument == "--trace-prefetch") {
                 th2app::trace_prefetch = true;
             } else if (argument == "--soak") {

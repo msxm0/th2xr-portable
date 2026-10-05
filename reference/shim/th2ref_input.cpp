@@ -379,6 +379,15 @@ extern "C" int th2ref_cursor_pos(POINT *p)
     return 1;
 }
 
+/* SetCursorPos, for MUS_SetMousePosRect: the pointer stays where the engine
+ * put it until the script next moves it - the port does the same. */
+extern "C" int th2ref_set_cursor_pos(int x, int y)
+{
+    g_mouse_x = x;
+    g_mouse_y = y;
+    return 1;
+}
+
 extern "C" short th2ref_async_key(int vk)
 {
     /* 0x8001 is what the engine tests for: `GetAsyncKeyState(k)&0x8001` */

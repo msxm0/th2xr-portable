@@ -6,6 +6,8 @@
 
 #include "game.hpp"
 
+#include <cmath>
+
 namespace th2app {
 
 void Game::build_display()
@@ -230,7 +232,7 @@ void Game::setup_background_graphs(
         }
     }
 
-    const auto view = current_background_view();
+    const auto view = current_background_view(scroll_present_extra_);
     if (wiping && display().graph(th2::grp_back + 1).bno == th2::bmp_back + 1) {
         // The snapshot is a picture of the whole screen, so it goes back
         // one to one rather than through BackStruct's window.
@@ -275,33 +277,59 @@ void Game::setup_background_graphs(
             int bh = 0;
             display().get_graph_bmp_size(th2::grp_back, &bw, &bh);
             int max = std::max(1, effect_frames4(bk.sc_max));
-            int cnt = bk.sc_cnt;
-            switch (bk.sc_type) {
-            case 4:
-                cnt = cnt * cnt;
-                max = max * max;
-                break;
-            case 5:
-                cnt = max - cnt;
-                cnt = cnt * cnt;
-                max = max * max;
-                cnt = max - cnt;
-                break;
-            default:
-                break;
-            }
             const int dw = th2::display_width;
             const int dh = th2::display_height;
-            const int x = -(bk.sx * dw / bk.sw * cnt
-                            + bk.x * dw / bk.w * (max - cnt)) / max;
-            const int y = -(bk.sy * dh / bk.sh * cnt
-                            + bk.y * dh / bk.h * (max - cnt)) / max;
-            const int w = (bw * dw / bk.sw * cnt
-                           + bw * dw / bk.w * (max - cnt)) / max;
-            const int h = (bh * dh / bk.sh * cnt
-                           + bh * dh / bk.h * (max - cnt)) / max;
-            display().set_graph_pos_zoom(
-                th2::grp_back, x, y, w, h, 0, 0, bw, bh);
+            if (scroll_present_extra_ > 0.0) {
+                // A frame between ticks: the same sums at the count the
+                // next tick is heading for.  The per-pixel scale factors
+                // keep the engine's integer divisions; only the count moves.
+                double m = max;
+                double c = bk.sc_cnt + scroll_present_extra_;
+                if (bk.sc_type == 4) {
+                    c = c * c;
+                    m = m * m;
+                } else if (bk.sc_type == 5) {
+                    c = m - c;
+                    c = c * c;
+                    m = m * m;
+                    c = m - c;
+                }
+                const auto at = [&](int to, int from) {
+                    return static_cast<int>((to * c + from * (m - c)) / m);
+                };
+                display().set_graph_pos_zoom(
+                    th2::grp_back,
+                    -at(bk.sx * dw / bk.sw, bk.x * dw / bk.w),
+                    -at(bk.sy * dh / bk.sh, bk.y * dh / bk.h),
+                    at(bw * dw / bk.sw, bw * dw / bk.w),
+                    at(bh * dh / bk.sh, bh * dh / bk.h), 0, 0, bw, bh);
+            } else {
+                int cnt = bk.sc_cnt;
+                switch (bk.sc_type) {
+                case 4:
+                    cnt = cnt * cnt;
+                    max = max * max;
+                    break;
+                case 5:
+                    cnt = max - cnt;
+                    cnt = cnt * cnt;
+                    max = max * max;
+                    cnt = max - cnt;
+                    break;
+                default:
+                    break;
+                }
+                const int x = -(bk.sx * dw / bk.sw * cnt
+                                + bk.x * dw / bk.w * (max - cnt)) / max;
+                const int y = -(bk.sy * dh / bk.sh * cnt
+                                + bk.y * dh / bk.h * (max - cnt)) / max;
+                const int w = (bw * dw / bk.sw * cnt
+                               + bw * dw / bk.w * (max - cnt)) / max;
+                const int h = (bh * dh / bk.sh * cnt
+                               + bh * dh / bk.h * (max - cnt)) / max;
+                display().set_graph_pos_zoom(
+                    th2::grp_back, x, y, w, h, 0, 0, bw, bh);
+            }
         }
     }
 
@@ -545,7 +573,6 @@ th2::AvgMsg::Hooks Game::message_hooks()
     hooks.mes_cut = [this] { return message_cut(); };
     hooks.msg_cnt = [this] { return message_count_step(); };
     hooks.eff_cnt_puls = [this] { return effect_count_pulse(); };
-    hooks.log_start = [this] { open_backlog(); };
     hooks.set_text_disp = [this](bool on) { message_visible_ = on; };
     hooks.reveal_step = [this](int) { message_.reveal_next(); };
     hooks.auto_flag = [this] { return auto_mode_ || demo_mode_; };
@@ -587,23 +614,48 @@ th2::AvgMsg::Hooks Game::message_hooks()
     // The engine's history bar, which a trace run uses in place of ours.
     hooks.select_message_flag = [this] { return choosing_; };
     hooks.go_config = [this](int page) {
-        // AVG_GoConfig( 1..3 ): the engine's own save, load and side-bar
-        // settings screens, which are not transcribed.  Only the engine bar
-        // calls this, and there ours would not stand in for them - they are
-        // a different UI mode with the scene still running - so the click is
-        // reported and nothing opens.
-        if (msg().engine_bar()) {
+        // AVG_GoConfig( 1..3 ), from the bar's save, load and settings
+        // buttons: the engine's own screens, which are not transcribed, so
+        // the port's stand in for them (Game::engine_open_port_screen).  Not
+        // in a trace: a replay could never close them, and the reference
+        // opens a screen ours does not have.
+        if (trace_mode_) {
             SDL_Log("engine config: AVG_GoConfig(%d) opens a screen that is "
                     "not transcribed", page);
             return;
         }
-        if (page == 1 && !replay_mode_) {
-            open_save_load(UiMode::save);
-        } else if (page == 2 && !replay_mode_) {
-            open_save_load(UiMode::load);
-        } else if (page == 3) {
-            open_config();
+        engine_go_config(page);
+    };
+    hooks.set_mouse_pos = [this](int x, int y) { warp_pointer(x, y); };
+    // The autosave's moment: a page finished at the end of a block, picked
+    // up by the next script pass (exec_control_lang).
+    hooks.page_end = [this] {
+        if (message_ends_block_) {
+            just_advanced_past_block_end_ = true;
         }
+    };
+    // In the outline font a log entry is the port's layout of it, so the
+    // voiced lines are clicked where they are drawn.  Not in a trace, and
+    // not in the engine's own font, whose rects are the original's.
+    hooks.log_voice_rects = [this](const std::string& text,
+                                   std::size_t start, std::size_t end,
+                                   std::vector<std::array<int, 4>>& rects) {
+        if (trace_mode_ || font_.authentic()) {
+            return false;
+        }
+        if (log_scroll_text_ != text) {
+            log_scroll_text_ = text;
+            log_scroll_ = 0;
+        }
+        static_cast<void>(end);
+        const auto [from, to] = log_voiced_span(text, start);
+        for (const auto& r : log_span_rects(text, from, to)) {
+            rects.push_back({static_cast<int>(std::floor(r.x)),
+                             static_cast<int>(std::floor(r.y)),
+                             static_cast<int>(std::ceil(r.w)),
+                             static_cast<int>(std::ceil(r.h))});
+        }
+        return true;
     };
     hooks.toggle_auto_flag = [this] { auto_mode_ = !auto_mode_; };
     hooks.msg_cut_mode = [this] { return skip_mode_; };
@@ -614,9 +666,14 @@ th2::AvgMsg::Hooks Game::message_hooks()
     hooks.side_option = [this] { return config_.sidebar_mode; };
     hooks.omake = [this] { return replay_mode_; };
     hooks.set_half_tone_depth = [this](int depth) {
-        config_.message_half_tone = std::clamp(
+        const int clamped = std::clamp(
             depth, th2::GameConfig::min_message_half_tone,
             th2::GameConfig::max_message_half_tone);
+        if (clamped != config_.message_half_tone) {
+            config_.message_half_tone = clamped;
+            // Kept once the slider is let go (trace_apply_input).
+            half_tone_unsaved_ = true;
+        }
     };
     hooks.log_voice = [this](int cno, int sno, int vno, int a_cut) {
         play_log_voice(cno, sno, vno, a_cut != 0);

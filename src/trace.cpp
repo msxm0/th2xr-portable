@@ -314,8 +314,19 @@ void TraceRecorder::begin(const std::filesystem::path& path,
 
 void TraceRecorder::pointer(int x, int y)
 {
-    x_ = std::clamp(x, 0, 799);
-    y_ = std::clamp(y, 0, 599);
+    x = std::clamp(x, 0, 799);
+    y = std::clamp(y, 0, 599);
+    const bool pressed = std::ranges::any_of(went_down_, [](const auto& n) {
+        return n == "lclick" || n == "rclick";
+    });
+    if (pressed) {
+        pointer_deferred_ = true;
+        deferred_x_ = x;
+        deferred_y_ = y;
+        return;
+    }
+    x_ = x;
+    y_ = y;
 }
 
 void TraceRecorder::key(std::string_view name, bool down)
@@ -422,6 +433,11 @@ TraceInputState TraceRecorder::sample(std::uint64_t tick)
         }
     }
     went_down_ = std::move(deferred);
+    if (pointer_deferred_) {
+        pointer_deferred_ = false;
+        x_ = deferred_x_;
+        y_ = deferred_y_;
+    }
     return state;
 }
 

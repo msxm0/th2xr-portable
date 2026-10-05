@@ -3,6 +3,7 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <cmath>
 
 namespace th2 {
 namespace {
@@ -96,6 +97,92 @@ void AvgChar::avg_load_char(int index, int cno, int pose, int in_type)
     display_.set_graph(
         grp_char + index, slot, lay_char + character.layer, true, -2);
     set_char_pos(index, char_locate(character.loc1));
+}
+
+bool AvgChar::present_graph(int gno, double phase, Graph& graph) const
+{
+    const int i = gno - grp_char;
+    if (i < 0 || i >= max_char) {
+        return false;
+    }
+    const CharState& character = chars_[i];
+    if (!character.flag || character.cond == char_cond_nomal
+        || character.cond == char_cond_wait
+        || character.type == char_type_wave) {
+        return false;
+    }
+    const int max = hooks_.eff_cnt ? hooks_.eff_cnt(character.max)
+                                   : character.max;
+    // control_char drew cnt-1 last tick and draws cnt next, unless cnt-1
+    // already reached the end.
+    const int shown = character.cnt - 1;
+    if (max <= 0 || shown < 0 || shown >= max) {
+        return false;
+    }
+    const double c = std::min(static_cast<double>(max), shown + phase);
+    const bool sp = hooks_.level && hooks_.level();
+    // CHAR_COND_IN / LOCATE ease out of the wings: max^3 - (max-cnt)^3.
+    const double m3 = static_cast<double>(max) * max * max;
+    const double ease_in = (m3 - (max - c) * (max - c) * (max - c)) / m3;
+    // CHAR_COND_OUT cubes the remaining count and leaves it so.
+    const double ease_out = (max - c) * (max - c) * (max - c) / m3;
+    const auto place = [&](double x) {
+        graph.dx = static_cast<int>(std::floor(x)) + locate_offset(i);
+    };
+    const auto blend = [&](double rate) {
+        return drw_bld_of(static_cast<int>(std::floor(rate)));
+    };
+    switch (character.cond) {
+    case char_cond_in:
+    case char_cond_out: {
+        const bool in = character.cond == char_cond_in;
+        if (character.type == char_type_move
+            || character.type == char_type_move + 1) {
+            const int locate = character.type == char_type_move ? -600 : 600;
+            const double span = char_locate(character.loc1) - locate;
+            place(locate + span * (in ? ease_in : ease_out));
+            return true;
+        }
+        if (character.type != char_type_cfade) {
+            return false;
+        }
+        if (character.alph1 != 256) {
+            const double rate = character.alph1 * c / max;
+            graph.param = blend(in ? rate : character.alph1 - rate);
+            return true;
+        }
+        if (!sp) {
+            return false;   // the mesh and pattern dissolves stay stepped
+        }
+        const double rate = 256.0 * c / max;
+        graph.param = blend(in ? rate : 256.0 - rate);
+        return true;
+    }
+    case char_cond_pose:
+        if (character.alph1 != 256 || sp) {
+            graph.param2 = blend(256.0 * c / max);
+            return true;
+        }
+        return false;
+    case char_cond_locate: {
+        const double from = char_locate(character.loc2);
+        const double span = char_locate(character.loc1) - from;
+        place(from + span * ease_in);
+        return true;
+    }
+    case char_cond_bright: {
+        const int bright = static_cast<int>(std::floor(
+            (character.fade2 * (max - c) + character.fade1 * c) / max));
+        graph.r = graph.g = graph.b = std::clamp(bright, 0, 255);
+        return true;
+    }
+    case char_cond_alpha:
+        graph.param = blend(
+            (character.alph2 * (max - c) + character.alph1 * c) / max);
+        return true;
+    default:
+        return false;
+    }
 }
 
 void AvgChar::set_char_pos(int index, int x)

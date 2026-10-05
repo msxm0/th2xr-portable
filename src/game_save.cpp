@@ -60,7 +60,11 @@ bool Game::load(int slot)
     if (!file) {
         return false;
     }
-    return load_body(file);
+    if (!load_body(file)) {
+        return false;
+    }
+    engine_config_loaded();
+    return true;
 }
 
 std::filesystem::path Game::save_path(int slot) const
@@ -442,25 +446,8 @@ void Game::save_body(std::ostream& out) const
         write_str(out, event.script, 32);
     }
 
-    // Backlog state. Depth 0 is the current message; 1 is newest history.
-    write_u32(out, static_cast<std::uint32_t>(backlog_.size()));
-    for (const auto& entry : backlog_) {
-        write_u32(out, static_cast<std::uint32_t>(entry.text.size()));
-        out.write(entry.text.data(),
-                  static_cast<std::streamsize>(entry.text.size()));
-        write_u32(out, static_cast<std::uint32_t>(entry.voices.size()));
-        for (const auto& voice : entry.voices) {
-            write_u32(out, static_cast<std::uint32_t>(voice.start));
-            write_u32(out, static_cast<std::uint32_t>(voice.end));
-            write_i32(out, voice.scenario);
-            write_i32(out, voice.voice);
-            write_i32(out, voice.character);
-            write_i32(out, voice.volume);
-            write_i32(out, voice.alternate ? 1 : 0);
-        }
-    }
-    write_i32(out, backlog_depth_);
-    write_i32(out, ui_mode_ == UiMode::backlog ? 1 : 0);
+    // The engine's log: NovelBuf, which is what the log pages through.
+    msg().write_log(out);
     write_i32(out, message_ends_block_ ? 1 : 0);
 
     // Playback and read state
@@ -494,7 +481,6 @@ bool Game::load_body(std::istream& in)
     reset_play_state();
     ui_mode_ = UiMode::game;
     message_visible_ = true;
-    window_hidden_ = false;
 
     // Script identity
     const auto script_name = read_str(in, 64);
@@ -716,41 +702,8 @@ bool Game::load_body(std::istream& in)
         });
     }
 
-    backlog_.clear();
-    current_backlog_voices_.clear();
-    pending_backlog_voice_.reset();
-    backlog_depth_ = 0;
-    const auto backlog_count = read_u32(in);
-    backlog_.reserve(backlog_count);
-    for (std::uint32_t i = 0; i < backlog_count; ++i) {
-        const auto size = read_u32(in);
-        std::string history_text(size, '\0');
-        if (size > 0) {
-            in.read(history_text.data(),
-                    static_cast<std::streamsize>(size));
-        }
-        std::vector<BacklogVoice> voices;
-        if (version >= first_backlog_voice_save_version_) {
-            const auto voice_count = read_u32(in);
-            voices.reserve(voice_count);
-            for (std::uint32_t v = 0; v < voice_count; ++v) {
-                voices.push_back(BacklogVoice{
-                    read_u32(in),
-                    read_u32(in),
-                    read_i32(in),
-                    read_i32(in),
-                    read_i32(in),
-                    read_i32(in),
-                    read_i32(in) != 0,
-                });
-            }
-        }
-        backlog_.push_back({std::move(history_text), std::move(voices)});
-    }
-    backlog_depth_ = std::clamp(
-        read_i32(in), 0, static_cast<int>(backlog_.size()));
-    if (read_i32(in) != 0) {
-        ui_mode_ = UiMode::backlog;
+    if (!msg().read_log(in)) {
+        return false;
     }
     message_ends_block_ = read_i32(in) != 0;
     const auto key_size = read_u32(in);

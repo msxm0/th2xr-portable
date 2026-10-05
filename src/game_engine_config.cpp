@@ -3,6 +3,7 @@
 #include <SDL3/SDL_log.h>
 
 #include <algorithm>
+#include <cmath>
 #include <format>
 
 // GM_Avg.cpp's system menu - AVG_GoConfig(0), AVG_SetConfigWindow,
@@ -19,7 +20,10 @@
 //
 // The three buttons that open another screen - save, load and the side bar
 // settings - lead to GWIN_SetSaveLoadWindow and GWIN_SetSideBarWindow, which
-// are not transcribed.  A click on one of them is reported and ignored.
+// are not transcribed.  The port's own save and load screens and its
+// settings panel stand in for them, in the engine's AVG_SAVE / AVG_LOAD /
+// AVG_SETTING step: the scene stays frozen exactly as the engine leaves it,
+// and the way back is AVG_ControlSystem's.
 
 namespace th2app {
 namespace {
@@ -100,14 +104,69 @@ void Game::engine_go_config(int mode)
             voice_channels_[i].fade_to(0.0f, audio_fade_duration(30), true);
         }
     }
+    // ConfigOpenMode: where AVG_ControlSystem goes back to - the menu, or
+    // straight to the scene.
     engine_config_open_mode_ = mode;
-    if (mode != 0) {
-        SDL_Log("engine config: AVG_GoConfig(%d) opens a screen that is not "
-                "transcribed", mode);
+    // DSP_GetDispBmp( BMP_CAP, ... ): the screen as it was asked from,
+    // which is what a save made from here shows as its thumbnail.
+    save_snapshot_ = capture_frame_thumbnail(
+        save_thumbnail_width, save_thumbnail_height);
+    if (mode == 0) {
+        play_system_se(9002, 150);
+        engine_set_config_window();
+    } else {
+        // GWIN_SetSaveLoadWindow / GWIN_SetSideBarWindow, then
+        // AVG_ChangeSetp( 0, AVG_SAVE / AVG_LOAD / AVG_SETTING ).
+        engine_open_port_screen(mode);
     }
-    play_system_se(9002, 150);
-    engine_set_config_window();
     engine_config_step_next_ = true;            // AVG_ChangeSetp( AVG_CONFIG )
+}
+
+void Game::engine_open_port_screen(int page)
+{
+    // 1 save, 2 load, 3 the side bar settings: AVG_GoConfig's numbering.
+    if (page == 1) {
+        open_save_load(UiMode::save);
+    } else if (page == 2) {
+        open_save_load(UiMode::load);
+    } else {
+        open_config();
+    }
+}
+
+void Game::engine_port_screen_closed()
+{
+    // AVG_ControlSystem, when GWIN_ControlSaveLoadWindow or
+    // GWIN_ControlSideBarWindow reports itself done:
+    //     if(ConfigOpenMode==0){ AVG_ChangeSetp( 0, AVG_CONFIG );
+    //                            Config.mode = CNF_NEXT_CLOSE; }
+    //     else                 { AVG_EndConfig(); }
+    // Only for a screen the engine opened; the title's load screen has no
+    // scene under it.
+    const bool engine_step = engine_config_step_next_.value_or(
+        engine_config_step_);
+    if (!engine_step) {
+        return;
+    }
+    if (engine_config_open_mode_ == 0 && engine_config_.flag) {
+        engine_config_.mode = cnf_next_close;
+        engine_config_.next_cnt = 0;
+    } else {
+        engine_reset_config_window();
+        engine_end_config();
+    }
+}
+
+void Game::engine_config_loaded()
+{
+    // A load from inside the engine's config replaces the scene it was
+    // frozen over; nothing of the menu survives it.
+    if (engine_config_.flag) {
+        engine_reset_config_window();
+    }
+    engine_config_ = {};
+    engine_config_step_ = false;
+    engine_config_step_next_.reset();
 }
 
 void Game::engine_close_back()
@@ -225,6 +284,37 @@ void Game::engine_end_config()
     engine_config_step_next_ = false;  // AVG_ChangeSetp( 0, BackStep )
 }
 
+bool Game::present_engine_config_graph(
+    int gno, double phase, th2::Graph& graph) const
+{
+    // The menu's fade in or out, between ticks: control_engine_config's
+    // rate at the count the next tick is heading for.  The count is stepped
+    // before the rate is worked out, so the screen shows cnt.
+    const auto& c = engine_config_;
+    const int g = th2::grp_system;
+    if (!c.flag || (c.mode != cnf_open && c.mode != cnf_close)
+        || gno < g || gno > g + 6) {
+        return false;
+    }
+    const int cmax = effect_frames(-1);
+    if (cmax <= 0 || c.cnt >= cmax
+        || (c.mode == cnf_close && c.cnt + 1 >= cmax)) {
+        return false;   // the next tick finishes it; closing, it resets
+    }
+    const double at = std::min(static_cast<double>(cmax), c.cnt + phase);
+    const double rate = c.mode == cnf_open
+        ? 256.0 * at / cmax : 256.0 - 256.0 * at / cmax;
+    if (rate >= 256.0) {
+        return false;
+    }
+    static constexpr int start[7] = {0, 64, 80, 96, 112, 128, 128};
+    const int i = gno - g;
+    const double alpha = i == 0
+        ? rate : std::clamp((rate - start[i]) * 2.0, 0.0, 255.0);
+    graph.param = th2::DRW_BLD(static_cast<int>(std::floor(alpha)));
+    return true;
+}
+
 void Game::engine_close_start_config_window(int cmax)
 {
     // void AVG_CloseStartConfigWindow( int cmax ): a close started while
@@ -255,6 +345,30 @@ void Game::control_engine_config()
         break;
     case cnf_another:
         break;
+    case cnf_next_close: {
+        // Back from the port's screen: the menu is up again at once, and
+        // takes clicks after AVG_EffCnt(10) frames.
+        const int next_max = effect_frames(10);
+        c.next_cnt++;
+        if (c.next_cnt >= next_max) {
+            c.mode = cnf_normal;
+            c.next_cnt = 0;
+        }
+        break;
+    }
+    case cnf_next_open: {
+        // The pressed button stays on screen for AVG_EffCnt(10) frames, and
+        // then the other screen takes over.
+        const int next_max = effect_frames(10);
+        c.next_cnt++;
+        if (c.next_cnt >= next_max) {
+            engine_open_port_screen(c.next_mode);
+            c.mode = cnf_another;
+            display().set_graph_disp(g + 3, false);
+            c.next_cnt = 0;
+        }
+        break;
+    }
     case cnf_open:
         c.cnt++;
         if (c.cnt >= cmax) {
@@ -276,6 +390,14 @@ void Game::control_engine_config()
         }
         break;
     case cnf_normal:
+        //     if(GameKey.u) MUS_SetMousePosRect( hwnd, 1, (select<=0)? 0 : select-1 );
+        //     if(GameKey.d) MUS_SetMousePosRect( hwnd, 1, (select<0)? 0 : select+1 );
+        if (game_key_.u) {
+            msg().set_mouse_pos_rect(1, select <= 0 ? 0 : select - 1);
+        }
+        if (game_key_.d) {
+            msg().set_mouse_pos_rect(1, select < 0 ? 0 : select + 1);
+        }
         for (int i = 0; i < 4; ++i) {
             display().set_graph_smove(g + 1 + i, 400 * (i % 2),
                                       82 * 3 * (i / 2) + 0 * 82);
@@ -304,9 +426,19 @@ void Game::control_engine_config()
                 case 0:
                 case 1:
                 case 3:
+                    // CNF_NEXT_SAVE / CNF_NEXT_LOAD / CNF_NEXT_SIDE, kept as
+                    // AVG_GoConfig's page numbers.
                     play_system_se(9014, 255);
-                    SDL_Log("engine config: button %d opens a screen that "
-                            "is not transcribed", select);
+                    if (trace_mode_) {
+                        // See hooks.go_config: a replay could never leave
+                        // the port's screen, and the reference's is not
+                        // ours.
+                        SDL_Log("engine config: button %d opens a screen "
+                                "that is not transcribed", select);
+                        break;
+                    }
+                    c.next_mode = select == 3 ? 3 : select + 1;
+                    c.mode = cnf_next_open;
                     break;
                 case 2:
                     play_system_se(9014, 255);

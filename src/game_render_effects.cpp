@@ -218,6 +218,43 @@ void Game::retire_soak_gpu_work(bool force)
     }
 }
 
+// A pattern wipe with no snapshot under it - a B that landed on the frame a
+// held skip key came up, see begin_transition - is GRP_BACK drawn through
+// the mask straight over the framebuffer:
+//     DSP_SetGraphBSet( GRP_BACK, BMP_BACK+2, rate, BackStruct.fd_vague );
+// where the mask has not reached, the frame keeps whatever the last one
+// left, and that builds up tick by tick.  So the wipe's "outgoing" picture
+// is not the one taken when it began but the target as this pass finds it.
+// Measured on ERRATIC2 at ticks 8074..8080 (pattern 22, pc 2409 of
+// 070000100.sdt): the new picture was on screen whole from the first frame
+// while the reference's grew out of the old street.
+void Game::renew_wipe_backdrop(SDL_Texture* target)
+{
+    if (!transition_ || !transition_->no_snapshot || transition_->type < 0x80
+        || !back().fd_flag || !transition_->previous) {
+        return;
+    }
+    if (transition_->previous_pixels && target == upscaler_->art_target()) {
+        transition_->previous_pixels = capture_frame_pixels(true);
+        transition_->previous = texture_from_surface(
+            transition_->previous_pixels.get());
+        return;
+    }
+    const auto access = SDL_GetNumberProperty(
+        SDL_GetTextureProperties(transition_->previous.get()),
+        SDL_PROP_TEXTURE_ACCESS_NUMBER, -1);
+    if (access != SDL_TEXTUREACCESS_TARGET) {
+        return;
+    }
+    SDL_SetRenderTarget(renderer_, transition_->previous.get());
+    SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
+    SDL_BlendMode blend = SDL_BLENDMODE_BLEND;
+    SDL_GetTextureBlendMode(target, &blend);
+    SDL_SetTextureBlendMode(target, SDL_BLENDMODE_NONE);
+    SDL_RenderTexture(renderer_, target, nullptr, nullptr);
+    SDL_SetTextureBlendMode(target, blend);
+}
+
 bool Game::gl_transition_usable() const
 {
     return !force_cpu_transitions && gl_transition_
@@ -888,8 +925,12 @@ void Game::draw_active_transition()
     if (!transition_) {
         return;
     }
-    if (transition_->frames <= 0) {
-        // Instant: there is no frame of the old screen left to show.
+    if (transition_->frames <= 0 && !transition_->no_snapshot) {
+        // Instant: there is no frame of the old screen left to show.  Not a
+        // wipe that began with no snapshot, though: that one had no length
+        // only because a held skip key was still latched when it began, and
+        // AVG_ControlBackChange re-asks AVG_EffCnt every frame - once the key
+        // is up the wipe runs its full length (fd_cnt and fd_max below).
         return;
     }
     // AVG_ControlBackChange measures the wipe with BackStruct's own counter:
@@ -904,9 +945,18 @@ void Game::draw_active_transition()
     // managed rather than at the engine's, and no two runs agreed.  fd_cnt
     // and fd_max are already in step with the reference tick for tick.
     const int back_max = effect_frames(back().fd_max);
-    const int rate = back_max > 0
+    int rate = back_max > 0
         ? std::clamp(256 * back().fd_cnt / back_max, 0, 256)
         : 256;
+    // Between two ticks, the count the next one is heading for - still a
+    // whole rate, so the mask shader and its CPU twin take it unchanged.
+    if (presentation_phase_ > 0.0 && back_max > 0) {
+        const double fd = avgback().present_fd_cnt(presentation_phase_);
+        if (fd >= 0.0) {
+            rate = std::clamp(
+                static_cast<int>(std::floor(256.0 * fd / back_max)), 0, 256);
+        }
+    }
     const float progress = std::clamp(
         static_cast<float>(rate) / 256.0f, 0.0f, 1.0f);
     if (transition_->type >= 0x80) {
@@ -1015,10 +1065,16 @@ float Game::screen_flash_alpha() const
         return 0.0f;
     }
     const auto& fade = avgback().fade();
+    int r = fade.r;
+    int g = fade.g;
+    int b = fade.b;
+    if (presentation_phase_ > 0.0) {
+        avgback().present_fade(presentation_phase_, r, g, b);
+    }
     const int distance = std::max({
-        std::abs(fade.r - th2::bright_neutral),
-        std::abs(fade.g - th2::bright_neutral),
-        std::abs(fade.b - th2::bright_neutral)});
+        std::abs(r - th2::bright_neutral),
+        std::abs(g - th2::bright_neutral),
+        std::abs(b - th2::bright_neutral)});
     return std::clamp(
         static_cast<float>(distance) / static_cast<float>(th2::bright_neutral),
         0.0f, 1.0f);
@@ -1080,7 +1136,7 @@ Game::ShakeSample Game::shake_sample()
     return result;
 }
 
-Game::BackgroundView Game::current_background_view() const
+Game::BackgroundView Game::current_background_view(double extra) const
 {
     if (!background_scroll_) {
         return background_view_;
@@ -1089,7 +1145,8 @@ Game::BackgroundView Game::current_background_view() const
     // same way it is re-asked there.
     const int back_max = std::max(1, effect_frames4(back().sc_max));
     const float raw = std::clamp(
-        static_cast<float>(back().sc_cnt) / static_cast<float>(back_max),
+        static_cast<float>(back().sc_cnt + extra)
+            / static_cast<float>(back_max),
         0.0f, 1.0f);
     const float progress = background_scroll_->easing == 1
         ? raw * raw

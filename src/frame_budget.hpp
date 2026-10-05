@@ -26,8 +26,18 @@ public:
     // not entitle the next one to overrun.
     void begin_frame() { spent_ = std::chrono::nanoseconds::zero(); }
 
+    // A trace run: no allowance at all, so whatever is queued is done in the
+    // frame it is queued in.  A budget is measured in the host's time, and
+    // anything the host's speed decides - which tick a picture finished
+    // predecoding on - is something two runs of the same script can then
+    // disagree about.
+    void set_unlimited(bool unlimited) { unlimited_ = unlimited; }
+
     std::chrono::nanoseconds remaining() const
     {
+        if (unlimited_) {
+            return std::chrono::hours(1);
+        }
         return allowance_ > spent_
             ? allowance_ - spent_
             : std::chrono::nanoseconds::zero();
@@ -35,6 +45,9 @@ public:
 
     bool exhausted() const
     {
+        if (unlimited_) {
+            return false;
+        }
         return remaining() <= std::chrono::nanoseconds::zero();
     }
 
@@ -59,6 +72,7 @@ public:
 private:
     std::chrono::nanoseconds allowance_;
     std::chrono::nanoseconds spent_{};
+    bool unlimited_ = false;
 };
 
 }  // namespace th2

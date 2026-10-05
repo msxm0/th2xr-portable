@@ -297,6 +297,25 @@ public:
     };
     const ShakeOut& shake_out() const { return shake_out_; }
 
+    // A frame drawn `phase` (0..1) of a tick after the last one.  Each of
+    // these computes what the control function computes, at the count the
+    // next tick is heading for, and says false when nothing is running or
+    // the next tick ends it anyway.  None of them writes anything.
+    //
+    // AVG_ControlBackFade's brightness, for GRP_BACK, the script graphs and
+    // the characters' back planes.
+    bool present_back_fade(double phase, int& r, int& g, int& b) const;
+    // AVG_ColtrolFade's FadeStruct colour (the screen flash).
+    bool present_fade(double phase, int& r, int& g, int& b) const;
+    // AVG_ControlBackChange, for the changes drawn through graphs: the plain
+    // cross-fade, the slides and the second and third zooms.  The wipes are
+    // drawn from fd_cnt directly (Game::draw_active_transition), and the
+    // rest stay stepped.  Changes `graph`, a copy of graph gno.
+    bool present_back_change(int gno, double phase, Graph& graph) const;
+    // fd_cnt where the next tick is heading, for the wipes; -1 when no
+    // change is running or the next tick ends it.
+    double present_fd_cnt(double phase) const;
+
 private:
     Display& display_;
     Hooks hooks_;

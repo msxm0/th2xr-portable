@@ -15,8 +15,7 @@
 
 namespace th2 {
 
-// GAME_KEY.  The fields the retail game actually reads; u/d/l/r are the map
-// screen's, which reads SDL events directly.
+// GAME_KEY.  The fields the retail game actually reads.
 struct GameKey {
     int click = 0;          // enter or left button, on the edge
     int cansel = 0;         // escape, backspace or right button, on the edge
@@ -36,6 +35,13 @@ struct GameKey {
     // that option's text happened to land.  Without it a traced run could not
     // answer a choice at all, and stopped at the first one in the game.
     int num[10] = {};
+    // KeyCond.btrg.up/down/left/right.  AVG_ControlSelectWindow and
+    // AVG_ControlConfigWindow move the pointer onto the next option with
+    // them (MUS_SetMousePosRect).
+    int u = 0;
+    int d = 0;
+    int l = 0;
+    int r = 0;
 };
 
 // The raw device state AVG_GetGameKey folds into a GameKey.  KeyCond in the
@@ -53,6 +59,10 @@ struct KeyCond {
     bool trg_end = false;
     bool btrg_pup = false;
     bool btrg_pdown = false;
+    bool btrg_up = false;
+    bool btrg_down = false;
+    bool btrg_left = false;
+    bool btrg_right = false;
     // KeyCond.trg.k0..k9 || KeyCond.trg.n0..n9, already folded: the engine
     // treats the keypad and the number row as one key per digit.
     bool trg_num[10] = {};
@@ -73,7 +83,9 @@ struct KeyCond {
 };
 
 // AVG_GetGameKey.  `wheel_mode` is Avg.wheel, which decides whether the
-// middle button skips or hides the window.
-void get_game_key(GameKey& key, const KeyCond& cond, int wheel_mode);
+// middle button skips or hides the window; `demo` is Avg.demo, under which
+// the scene takes no click, cancel, hide, skip or paging at all.
+void get_game_key(GameKey& key, const KeyCond& cond, int wheel_mode,
+                  bool demo);
 
 }  // namespace th2

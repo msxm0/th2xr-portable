@@ -30,15 +30,43 @@
 #include <SDL3/SDL_log.h>
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
 
 namespace th2 {
+
+namespace {
+bool strict_gl = false;
+}  // namespace
+
+void GlExactBlend::set_strict(bool strict)
+{
+    strict_gl = strict;
+}
 
 #ifdef TH2_GL_BLEND
 
 namespace {
+
+// See GlExactBlend::set_strict.
+void strict_check(const char* what)
+{
+    if (!strict_gl) {
+        return;
+    }
+    const GLenum error = glGetError();
+    if (error != GL_NO_ERROR) {
+        throw std::runtime_error(
+            std::string("GL error 0x") + std::to_string(error) + " in "
+            + what + " of the exact blend: the frame would be wrong");
+    }
+}
 
 constexpr char vertex_source[] = R"(#version 300 es
 precision highp float;
@@ -352,10 +380,17 @@ void main()
     // fold is keyed on the depth asked for).  The 32 bit blits then add the
     // raw colour as if it had been folded - and the sum wraps, because the
     // channels are unsigned char.  The map's fields are loaded this way.
+    // Mode 3's stored colour is the fold, and DRW_DrawBMP_TT takes the
+    // brightness of what is stored - BrightTable[ fold(c) ], not the fold of
+    // a brightened c.  At 128 the two are the same.
+    ivec3 stored = raw;
     if (u_mode == 3) {
-        src = ivec3(blend_table(texel_alpha, src.r),
-                    blend_table(texel_alpha, src.g),
-                    blend_table(texel_alpha, src.b));
+        stored = ivec3(blend_table(texel_alpha, raw.r),
+                       blend_table(texel_alpha, raw.g),
+                       blend_table(texel_alpha, raw.b));
+        src = ivec3(bright_of(stored.r, u_bright_r),
+                    bright_of(stored.g, u_bright_g),
+                    bright_of(stored.b, u_bright_b));
     }
     int eff, rev;
     if (texel_alpha == 255) {
@@ -370,23 +405,22 @@ void main()
                                            : blend_table(blnd, texel_alpha);
     }
 
-    // Mode 6 - a 32 bit TGA loaded as BMP_FULL, its colour never folded -
-    // under a brightness that is not neutral goes the long way round on a
-    // partially covered texel, in both the NML and the BLD blits of
-    // Draw32.cpp:
+    // A partially covered texel of a 32 bit bitmap under a brightness that
+    // is not neutral goes the long way round, in both the NML and the BLD
+    // blits of Draw32.cpp (DRW_DrawBMP_TT, nuki -2):
     //     alp3_tbl = BlendTable2[a];     // (s<<8)/(a+1): un-premultiply
     //     src = BlendTable[eff][ BrightTable[ alp3_tbl[s] ] ];
-    // with eff the texel's coverage times the blend level.  "Un-premultiplying"
-    // a colour that was never premultiplied brightens it, clamped at 255, and
-    // that is what the edges of the map's fields show while the map fades
-    // out: measured one level off on every antialiased edge until this.  The
-    // same code runs for folded bitmaps too, but there the round trip is not
-    // what ours was missing - applied to modes 0 and 3 it made that same
-    // frame worse, so it is left to the one mode it was measured on.
+    // with s the stored colour and eff the texel's coverage times the blend
+    // level.  Mode 6 stores its colour folded on load, mode 3 has it folded
+    // just above; un-folding either loses what the fold truncated.  Measured
+    // on the map's fields fading out (mode 6) and on the calendar's labels
+    // fading to black (mode 3, cal010): one level off on every antialiased
+    // edge until this.
     bool bright_neutral = u_bright_r == 128 && u_bright_g == 128
                           && u_bright_b == 128;
-    if (!bright_neutral && texel_alpha < 255 && u_mode == 6) {
-        ivec3 unfolded = clamp((raw * 256) / (texel_alpha + 1),
+    if (!bright_neutral && texel_alpha < 255
+        && (u_mode == 3 || u_mode == 6)) {
+        ivec3 unfolded = clamp((stored * 256) / (texel_alpha + 1),
                                ivec3(0), ivec3(255));
         src = ivec3(bright_of(unfolded.r, u_bright_r),
                     bright_of(unfolded.g, u_bright_g),
@@ -520,6 +554,43 @@ struct GlExactBlend::Impl {
     // glCopyTexSubImage2D reads the bound framebuffer directly, which is
     // both simpler and one less full render pass than copying through SDL.
     GLuint scratch_name = 0;
+    // The program's uniforms as last set.  Nothing but this class uses the
+    // program, so a value that has not changed since the last draw does not
+    // need sending again - and in WebGL every call is a command the GPU
+    // process validates and forwards, ~45 of them per glyph before this.
+    bool samplers_set = false;
+    std::unordered_map<GLint, std::array<GLint, 4>> uniform_cache;
+    bool changed(GLint location, std::array<GLint, 4> value)
+    {
+        auto [at, inserted] = uniform_cache.try_emplace(location, value);
+        if (!inserted && at->second == value) {
+            return false;
+        }
+        at->second = value;
+        return true;
+    }
+    void uniform_i(GLint location, GLint a)
+    {
+        if (changed(location, {a, 0, 0, 0})) glUniform1i(location, a);
+    }
+    void uniform_i(GLint location, GLint a, GLint b)
+    {
+        if (changed(location, {a, b, 0, 0})) glUniform2i(location, a, b);
+    }
+    void uniform_i(GLint location, GLint a, GLint b, GLint c)
+    {
+        if (changed(location, {a, b, c, 0})) glUniform3i(location, a, b, c);
+    }
+    void uniform_i(GLint location, GLint a, GLint b, GLint c, GLint d)
+    {
+        if (changed(location, {a, b, c, d})) glUniform4i(location, a, b, c, d);
+    }
+    void uniform_f(GLint location, float a, float b)
+    {
+        if (changed(location, {std::bit_cast<GLint>(a), std::bit_cast<GLint>(b), 0, 0})) {
+            glUniform2f(location, a, b);
+        }
+    }
     int scratch_width = 0;
     int scratch_height = 0;
     bool captured = false;
@@ -675,6 +746,7 @@ bool GlExactBlend::Impl::copy_destination(
         return false;
     }
     glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, x0, y0, x1 - x0, y1 - y0);
+    strict_check("the destination copy");
     glBindTexture(GL_TEXTURE_2D, 0);
     return true;
 }
@@ -848,14 +920,12 @@ bool GlExactBlend::draw(
     const auto bind = [](GLenum unit, GLuint name) {
         glActiveTexture(unit);
         glBindTexture(GL_TEXTURE_2D, name);
-        // Sampling state travels with the texture and these belong to SDL,
-        // so whatever it last set is what applies.  Nearest on both: this is
-        // a one-texel-per-fragment composite and any filtering would be an
-        // error rather than a smoothing.
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        // No sampling state.  The sources are read with texelFetch, which
+        // does not filter (SDL creates every texture with a non-mipmap
+        // filter, so they are complete), and the scratch - the one read
+        // through texture() - was given NEAREST and CLAMP when it was made.
+        // Setting all four on every texture of every draw was a third of
+        // the per-glyph calls.
     };
     bind(GL_TEXTURE0, source_name);
     if (dest_name) {
@@ -869,21 +939,25 @@ bool GlExactBlend::draw(
     if (source2_name) {
         bind(GL_TEXTURE2, source2_name);
     }
-    glUniform1i(impl_->source_location, 0);
-    glUniform1i(impl_->dest_location, 1);
-    glUniform1i(impl_->source2_location, 2);
+    if (!impl_->samplers_set) {
+        glUniform1i(impl_->source_location, 0);
+        glUniform1i(impl_->dest_location, 1);
+        glUniform1i(impl_->source2_location, 2);
+        glUniform1i(impl_->rows_location, 3);
+        impl_->samplers_set = true;
+    }
     // v_uv is normalised against the first bitmap; this rescales it so the
     // second is read at the same texel.
-    glUniform2f(
+    impl_->uniform_f(
         impl_->source2_scale_location,
         source2_name ? source_w / source2_w : 1.0f,
         source2_name ? source_h / source2_h : 1.0f);
-    glUniform1i(impl_->pair_location, std::clamp(pair, 0, 256));
-    glUniform1i(impl_->folded_location,
-                (th2::texture_source_folded(source) ? 1 : 0)
-                    | (th2::texture_source_folded(source2) ? 2 : 0));
-    glUniform1i(impl_->rows_location, 3);
-    glUniform1i(impl_->row_count_location, poly_rows ? poly_row_count : 0);
+    impl_->uniform_i(impl_->pair_location, std::clamp(pair, 0, 256));
+    impl_->uniform_i(impl_->folded_location,
+                     (th2::texture_source_folded(source) ? 1 : 0)
+                         | (th2::texture_source_folded(source2) ? 2 : 0));
+    impl_->uniform_i(impl_->row_count_location,
+                     poly_rows ? poly_row_count : 0);
     if (poly_rows) {
         if (!impl_->rows_name) {
             glGenTextures(1, &impl_->rows_name);
@@ -904,20 +978,21 @@ bool GlExactBlend::draw(
     const auto to_int = [](float value) {
         return static_cast<GLint>(std::lround(value));
     };
-    glUniform4i(impl_->src_rect_location, to_int(src.x), to_int(src.y),
-                to_int(src.w), to_int(src.h));
-    glUniform4i(impl_->dst_rect_location, to_int(dst.x), to_int(dst.y),
-                to_int(dst.w), to_int(dst.h));
-    glUniform2i(impl_->src2_origin_location, to_int(src.x), to_int(src.y));
-    glUniform2i(impl_->flip_location, flip_x ? 1 : 0, flip_y ? 1 : 0);
-    glUniform2f(impl_->target_location, target_w, target_h);
-    glUniform1i(impl_->alpha_location, std::clamp(alpha, 0, 256));
-    glUniform1i(impl_->bright_locations[0], bright_r);
-    glUniform1i(impl_->bright_locations[1], bright_g);
-    glUniform1i(impl_->bright_locations[2], bright_b);
-    glUniform1i(impl_->mode_location, mode);
-    glUniform3i(impl_->ink_location, bright_r, bright_g, bright_b);
-    glUniform1i(impl_->layer_location, layer ? 1 : 0);
+    impl_->uniform_i(impl_->src_rect_location, to_int(src.x), to_int(src.y),
+                     to_int(src.w), to_int(src.h));
+    impl_->uniform_i(impl_->dst_rect_location, to_int(dst.x), to_int(dst.y),
+                     to_int(dst.w), to_int(dst.h));
+    impl_->uniform_i(impl_->src2_origin_location, to_int(src.x),
+                     to_int(src.y));
+    impl_->uniform_i(impl_->flip_location, flip_x ? 1 : 0, flip_y ? 1 : 0);
+    impl_->uniform_f(impl_->target_location, target_w, target_h);
+    impl_->uniform_i(impl_->alpha_location, std::clamp(alpha, 0, 256));
+    impl_->uniform_i(impl_->bright_locations[0], bright_r);
+    impl_->uniform_i(impl_->bright_locations[1], bright_g);
+    impl_->uniform_i(impl_->bright_locations[2], bright_b);
+    impl_->uniform_i(impl_->mode_location, mode);
+    impl_->uniform_i(impl_->ink_location, bright_r, bright_g, bright_b);
+    impl_->uniform_i(impl_->layer_location, layer ? 1 : 0);
 
     // Into the picture the shader has already folded the destination in, so
     // the blend unit must not do it again; on a layer it is the blend unit's
@@ -957,6 +1032,7 @@ bool GlExactBlend::draw(
     glActiveTexture(GL_TEXTURE0);
     glUseProgram(0);
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+    strict_check("the composite");
     // No glGetError: in WebGL it is a synchronous round trip to the GPU
     // process, and this runs for every sprite.  The program and the scratch
     // were checked once, when the path was set up.

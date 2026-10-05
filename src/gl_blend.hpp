@@ -33,6 +33,14 @@ public:
 
     bool available() const;
 
+    // A trace run checks glGetError after every destination copy and every
+    // draw, and throws on one.  The composite reads back a copy of the pixels
+    // it blends onto, and a copy that silently failed leaves last frame's in
+    // the scratch - a glyph blended over itself, up to 63 levels off - in a
+    // frame that would then be recorded as the engine's.  Off in normal play,
+    // where glGetError is a synchronous round trip per sprite in WebGL.
+    static void set_strict(bool strict);
+
     // Asks the next draw() to read the destination: it copies the part of
     // the current render target it covers into an internally held scratch
     // first.  Returns false if there is nothing to copy (drawing straight to

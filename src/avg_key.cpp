@@ -8,6 +8,7 @@ void KeyCond::clear_triggers()
 {
     trg_enter = trg_esc = trg_bs = trg_space = trg_shift = false;
     trg_home = trg_end = btrg_pup = btrg_pdown = false;
+    btrg_up = btrg_down = btrg_left = btrg_right = false;
     mouse_trg_left = mouse_trg_right = mouse_trg_middle = false;
     for (bool& digit : trg_num) {
         digit = false;
@@ -15,7 +16,8 @@ void KeyCond::clear_triggers()
     wheel = 0;
 }
 
-void get_game_key(GameKey& key, const KeyCond& cond, int wheel_mode)
+void get_game_key(GameKey& key, const KeyCond& cond, int wheel_mode,
+                  bool demo)
 {
     const int wclick = cond.btn_enter || cond.mouse_btn_left;
     const int wheel = cond.wheel;
@@ -87,6 +89,30 @@ void get_game_key(GameKey& key, const KeyCond& cond, int wheel_mode)
         key.pup = 1;
         key.pdown = 0;
     }
+
+    //     if(Avg.demo || Flag_MenuSelected){
+    //         GameKey.click = 0;  GameKey.cansel = 0;  GameKey.diswin = 0;
+    //         GameKey.mes_cut = 0;
+    //         GameKey.end = 0;  GameKey.home = 0;
+    //         GameKey.pup = 0;  GameKey.pdown = 0;
+    //     }
+    // mes_cut_mode, the arrows and the number row are left alone.
+    // Flag_MenuSelected is the Windows menu bar's, which the port has not.
+    if (demo) {
+        key.click = 0;
+        key.cansel = 0;
+        key.diswin = 0;
+        key.mes_cut = 0;
+        key.end = 0;
+        key.home = 0;
+        key.pup = 0;
+        key.pdown = 0;
+    }
+
+    key.u = cond.btrg_up;
+    key.d = cond.btrg_down;
+    key.l = cond.btrg_left;
+    key.r = cond.btrg_right;
 }
 
 }  // namespace th2

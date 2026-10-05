@@ -154,8 +154,33 @@ PATCHES = [
     # a trace run takes.
     ("ScriptEngine/src/main.cpp",
      "\tKEY_RenewKeybord( MainWindow.active );\r\n\tMUS_RenewMouse( MainWindow.hwnd, MainWindow.active, 0 );",
-     "#ifdef TH2REF_TRACE\r\n\tth2ref_input();\r\n\tMUS_RenewMouse( MainWindow.hwnd, MainWindow.active, 0 );\r\n#else\r\n\tKEY_RenewKeybord( MainWindow.active );\r\n\tMUS_RenewMouse( MainWindow.hwnd, MainWindow.active, 0 );\r\n#endif",
+     "#ifdef TH2REF_TRACE\r\n\tth2ref_input();\r\n\tMUS_RenewMouse( MainWindow.hwnd, 1, 0 );\t/* never the desktop's focus - see WM_ACTIVATE */\r\n#else\r\n\tKEY_RenewKeybord( MainWindow.active );\r\n\tMUS_RenewMouse( MainWindow.hwnd, MainWindow.active, 0 );\r\n#endif",
      "scripted input replaces the real devices"),
+    # Nor the window's focus.  The mouse code drops every hit and click
+    # while MainWindow.active is 0, so a window opened over Wine's mid-run (a
+    # browser, say) silently stopped the scripted clicks for good - the
+    # reference sat on one message from tick 19735 while ours went on.  In
+    # a trace the window is active throughout, and WM_ACTIVATE's own renew
+    # runs only on the first activation, which is all a run that kept the
+    # focus ever saw.
+    ("ScriptEngine/src/Winmain.cpp",
+     "\t\tcase WM_ACTIVATE:\r\n\t\t\tMainWindow.active = LOWORD(wparam);\r\n",
+     "\t\tcase WM_ACTIVATE:\r\n#ifdef TH2REF_TRACE\r\n"
+     "\t\t\t/* A trace must not answer to the desktop's focus: the mouse code\r\n"
+     "\t\t\t * drops every hit and click while the window is inactive, so a\r\n"
+     "\t\t\t * window opened over Wine's mid-run (a browser, say) silently\r\n"
+     "\t\t\t * stopped the scripted clicks for good.  The window is taken as\r\n"
+     "\t\t\t * active throughout, and this renew runs only on the first\r\n"
+     "\t\t\t * activation - which is all a run that kept the focus ever saw;\r\n"
+     "\t\t\t * a later one would be an extra input pass mid-run. */\r\n"
+     "\t\t\t{\r\n"
+     "\t\t\t\tstatic int activated = 0;\r\n"
+     "\t\t\t\tMainWindow.active = 1;\r\n"
+     "\t\t\t\tif( activated || !LOWORD(wparam) ) break;\r\n"
+     "\t\t\t\tactivated = 1;\r\n"
+     "\t\t\t}\r\n"
+     "#else\r\n\t\t\tMainWindow.active = LOWORD(wparam);\r\n#endif\r\n",
+     "trace input ignores window focus"),
     # The state trace, at the end of the tick body rather than next to the
     # frame dump: MAIN_DrawControl sits behind skip_cnt and can be skipped,
     # and a state line that goes missing exactly when the engine is under

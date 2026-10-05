@@ -38,19 +38,20 @@ struct GameConfig {
     int message_half_tone = 64;
     bool auto_skip_read = false;
     bool skip_unread = false;
-    bool wheel_opens_backlog = true;
     bool autosave_enabled = true;
-#ifdef __ANDROID__
-    int sidebar_mode = 3;  // Hidden by default — touch gestures replace it
-#else
-    int sidebar_mode = 0;  // Fade when away
-#endif
+    // Fade when away.  The engine's bar is the way to the log and the
+    // menu on touch as well, so it is not hidden there by default either.
+    int sidebar_mode = 0;
     bool fullscreen = false;
     int window_x = -1;
     int window_y = -1;
     int window_width = 1600;
     int window_height = 1200;
     bool anime4k = true;
+    // Draw fades, slides and the typewriter between engine ticks on a
+    // display faster than the engine's 62.5Hz.  Presentation only: the
+    // engine's state and every frame that lands on a tick are unchanged.
+    bool smooth_motion = true;
     bool authentic_font = false;
     std::string font_family = "Noto Sans";
     int font_size = 24;

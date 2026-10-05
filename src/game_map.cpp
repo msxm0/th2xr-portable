@@ -65,19 +65,6 @@ void Game::mark_current_text_read()
     }
 }
 
-void Game::manual_advance()
-{
-    // The player clicked.  In the engine this is nothing but an edge in
-    // GameKey: AVG_GetGameKey sets GameKey.click, AVG_ControlSystem2 clears
-    // the skip flags because of it, and AVG_ControlNovelMessage reads it on
-    // the same frame to leave MSG_WAIT.  Nothing runs the script here.
-    key_cond_.trg_enter = true;
-    auto_mode_ = false;
-    skip_mode_ = false;
-    auto_next_time_.reset();
-    advance();
-}
-
 int Game::map_sakura_type() const
 {
     const int month = runtime_.flag(0);
@@ -424,13 +411,13 @@ void Game::trace_peek_map_pointer()
     // the map (update_map) before the input pass, so the pointer is looked
     // up here, without consuming the tick's input: read a tick late, every
     // hover sound over the map came a tick after the reference's.
-    if (!trace_mode_ || ui_mode_ != UiMode::map) {
+    if (ui_mode_ != UiMode::map) {
         return;
     }
     int x = 0;
     int y = 0;
     bool pick = false;
-    if (record_live()) {
+    if (live_input()) {
         x = recorder_.x();
         y = recorder_.y();
     } else {
@@ -495,50 +482,55 @@ void Game::update_clock_calendar()
     }
     if (calendar_state_) {
         calendar_state_->frame += control_steps_;
-
-        if (!calendar_state_->dismissing) {
-            // AVG_SetCalender's step 2:
-            //     if( AVG_GetMesCut() || AVG_GetHitKey() ){ step=3; count=0; }
-            // reached only once step 1 has faded the page in over sixteen
-            // frames.  Read from GameKey rather than an SDL event, because a
-            // trace has no SDL events - driven only by the event loop, a
-            // traced calendar was never dismissed and the script would have
-            // parked on ViewCalender for good.
-            // frame > 16, not >= 16.  The frame the fade-in completes on is
-            // still a case 1 frame: it sets step = 2 and breaks, so it asks
-            // for no key.  Case 2 does the asking from the frame after.
-            // Checking on the completing frame took a click the reference
-            // could not see - and with the harness clicking every thirty
-            // ticks, missing that edge is not one tick of difference but
-            // thirty: measured at the March 8th calendar, where ours
-            // dismissed at tick 169111 and the reference waited to 169141.
-            //
-            // The skip key is not an edge, and reads no lagged GameKey: in
-            // AVG_CALENDER, Avg.msg_cut is the latch AVG_ControlSystem2 left
-            // before the page went up, the same value on every frame of it.
-            // The click above is this frame's game_key_, which the input
-            // pass has not refreshed yet - a tick behind the engine's - and
-            // the release below is a frame ahead of the engine's (it resumes
-            // the script from the next EXEC_ControlLang, ours from this
-            // one).  The two cancel for a click; a held skip key only has
-            // the second, so for the day-change page it is taken a frame
-            // later.  Measured: a skip through the March 2nd page released
-            // the script at S+35 on the reference and S+34 here.
-            const bool cut_ready = calendar_state_->step
-                ? calendar_state_->frame > 17
-                : calendar_state_->frame > 16;
-            if ((calendar_state_->frame > 16 && game_key_.click)
-                || (cut_ready && message_cut())) {
-                calendar_state_->dismissing = true;
-                calendar_state_->frame = 0;
+        // AVG_SetCalender's step 3 ends on count 16 (the page at fade 0) and
+        // step 4 - the frame after - resets the graphs and returns TRUE, from
+        // the control chain, after EXEC_ControlLang: the script goes on from
+        // the frame after that.  So the page is released here, before the
+        // script pass, on the frame after the one that saw count 17.
+        if (calendar_state_->dismissing) {
+            if (calendar_finish_pending_) {
+                calendar_finish_pending_ = false;
+                calendar_state_.reset();
+                advance();
+            } else if (calendar_state_->frame >= 17) {
+                calendar_finish_pending_ = true;
             }
-        } else if (calendar_finish_pending_) {
-            calendar_finish_pending_ = false;
-            calendar_state_.reset();
-            advance();
-        } else if (calendar_state_->frame >= 16) {
-            calendar_finish_pending_ = true;
         }
+    }
+}
+
+void Game::control_calendar_key()
+{
+    // AVG_SetCalender's step 2, in AVG_Main's slot - after MAIN_SystemControl
+    // has sampled this tick's GameKey:
+    //     if( AVG_GetMesCut() || AVG_GetHitKey() ){ step=3; count=0; }
+    // reached only once step 1 has faded the page in over sixteen frames.
+    // Read from GameKey rather than an SDL event, because a trace has no SDL
+    // events - driven only by the event loop, a traced calendar was never
+    // dismissed and the script would have parked on ViewCalender for good.
+    // frame > 16, not >= 16: the frame the fade-in completes on is still a
+    // case 1 frame - it sets step = 2 and breaks, so it asks for no key.
+    // Checking on the completing frame took a click the reference could not
+    // see, and with the harness clicking every thirty ticks that is thirty
+    // ticks of difference: measured at the March 8th calendar, where ours
+    // dismissed at tick 169111 and the reference waited to 169141.
+    //
+    // This used to run before the input pass, on last tick's GameKey, with
+    // the release a tick early to make up for it.  The script came out on
+    // the right tick, but every frame of the fade to black was drawn one tick
+    // late (ticks 45361..45376 of the opening, 98% of the pixels off by up to
+    // 19) - unseen by a comparison that samples every sixtieth tick.
+    //
+    // The skip key is not an edge: in AVG_CALENDER, Avg.msg_cut is the latch
+    // AVG_ControlSystem2 left before the page went up, the same on every
+    // frame of it.
+    if (!calendar_state_ || calendar_state_->dismissing
+        || calendar_state_->frame <= 16) {
+        return;
+    }
+    if (game_key_.click || message_cut()) {
+        calendar_state_->dismissing = true;
+        calendar_state_->frame = 0;
     }
 }
 

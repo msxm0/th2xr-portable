@@ -71,8 +71,6 @@ GameConfig load_config(const std::filesystem::path& path)
             config.auto_skip_read = parse_bool(value);
         } else if (key == "skip_unread") {
             config.skip_unread = parse_bool(value);
-        } else if (key == "wheel_opens_backlog") {
-            config.wheel_opens_backlog = parse_bool(value);
         } else if (key == "autosave_enabled") {
             config.autosave_enabled = parse_bool(value);
         } else if (key == "sidebar_mode") {
@@ -92,6 +90,8 @@ GameConfig load_config(const std::filesystem::path& path)
                 parse_int(value, config.window_height, 480, 16384);
         } else if (key == "anime4k") {
             config.anime4k = parse_bool(value);
+        } else if (key == "smooth_motion") {
+            config.smooth_motion = parse_bool(value);
         } else if (key == "authentic_font") {
             config.authentic_font = parse_bool(value);
         } else if (key == "font_family") {
@@ -144,7 +144,6 @@ void save_config(const std::filesystem::path& path, const GameConfig& config)
            << "message_half_tone=" << config.message_half_tone << '\n'
            << "auto_skip_read=" << config.auto_skip_read << '\n'
            << "skip_unread=" << config.skip_unread << '\n'
-            << "wheel_opens_backlog=" << config.wheel_opens_backlog << '\n'
             << "autosave_enabled=" << config.autosave_enabled << '\n'
             << "sidebar_mode=" << config.sidebar_mode << '\n'
            << "fullscreen=" << config.fullscreen << '\n'
@@ -153,6 +152,7 @@ void save_config(const std::filesystem::path& path, const GameConfig& config)
            << "window_width=" << config.window_width << '\n'
            << "window_height=" << config.window_height << '\n'
            << "anime4k=" << config.anime4k << '\n'
+           << "smooth_motion=" << config.smooth_motion << '\n'
            << "authentic_font=" << config.authentic_font << '\n'
            << "font_family=" << config.font_family << '\n'
            << "font_size=" << config.font_size << '\n'

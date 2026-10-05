@@ -347,6 +347,7 @@ static void note_click(void)
 
 extern "C" void th2ref_dump_state(void)
 {
+    th2ref_tick_done(MainWindow.draw_flag);
     checkpoint_resume();
     pause_at_window();
     note_click();

@@ -406,6 +406,9 @@ public:
                             int sx, int sy, int sw, int sh);
     void set_graph_zoom(int gno, int dx, int dy, int dw, int dh);
     void set_graph_zoom2(int gno, int cx, int cy, int zoom);
+    // DSP_SetGraphZoom2 on a graph that is not in the table - a copy a
+    // presentation pass draws.
+    static void apply_zoom2(Graph& graph, int cx, int cy, int zoom);
     void set_graph_zoom3(int gno, int cx, int cy, int zoom);
     void set_graph_roll(int gno, int cx, int cy, int zoom, int rate,
                         int sx, int sy, int sw, int sh);   // DSP_SetGraphRoll
@@ -448,6 +451,14 @@ public:
     void draw_layer(int layer);
     void end_frame();
 
+    // A presentation pass: while set, every graph a layer draws is first
+    // copied and handed to `presenter`, which may change the copy - a frame
+    // drawn between two ticks puts a ramp's in-between value there.  The
+    // stored graphs are never touched, and a bake (set_graph_target) never
+    // goes through it.
+    using Presenter = std::function<void(int gno, Graph& graph)>;
+    void set_presenter(Presenter presenter) { presenter_ = std::move(presenter); }
+
 private:
     Graph& at(int gno) { return graphs_.at(gno); }
     bool ensure_renderable(int bno);
@@ -464,7 +475,16 @@ private:
 
     SDL_Renderer* renderer_ = nullptr;
     std::array<Graph, graph_max> graphs_{};
+    Presenter presenter_;
     std::array<Bitmap, bitmap_max> bitmaps_{};
+    // Render targets of released bitmaps, for the next create_bmp of the
+    // same size: creating a target makes SDL's GLES2 renderer check the
+    // framebuffer's status, which in WebGL waits for the GPU process to
+    // drain everything queued before it - up to 4 ms a time, on every half
+    // tone and background change.
+    std::vector<Texture> spare_targets_;
+    void retire_bitmap(Bitmap& bitmap);
+    Texture take_spare_target(int width, int height);
 
     int global_x_ = 0;
     int global_y_ = 0;

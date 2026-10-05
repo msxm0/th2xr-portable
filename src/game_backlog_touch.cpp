@@ -31,44 +31,23 @@
 
 namespace th2app {
 
-void Game::open_backlog()
-{
-    if (choosing_) return;
-    play_se(-1, 9012, false, 140);
-    ui_mode_ = UiMode::backlog;
-    backlog_voice_hover_ = -1;
-    backlog_scroll_ = 0;
-    backlog_depth_ = std::min(
-        1, static_cast<int>(backlog_.size()));
-}
-
-void Game::close_backlog()
-{
-    backlog_depth_ = 0;
-    backlog_voice_hover_ = -1;
-    ui_mode_ = UiMode::game;
-}
-
 bool Game::begin_touch_drag(float logical_x, float logical_y)
 {
-    // Only the widgets you drag take the press.  Everything else waits for
+    // Only the things you drag take the press.  Everything else waits for
     // the release, so pressing a button and sliding off it does nothing,
     // which is how a touch UI is expected to behave.
     if (config_open_ || name_input_open_ || imgui_->wants_mouse()) {
         return false;  // the panel on top owns this touch.
     }
-    if (ui_mode_ == UiMode::game || ui_mode_ == UiMode::backlog) {
-        handle_sidebar_click(logical_x, logical_y, false);
-        if (backlog_handle_dragging_ || opacity_handle_dragging_) {
-            return true;
-        }
-    }
     if (ui_mode_ == UiMode::game
         && handle_message_scroll_press(logical_x, logical_y)) {
         return true;
     }
-    if (ui_mode_ == UiMode::backlog
-        && handle_backlog_scroll_press(logical_x, logical_y)) {
+    // The engine's bar is worked by holding the button down - the log's
+    // handle (MSG_DRAG) and the half-tone slider follow the pointer while
+    // it is held - so a finger on it is a press from the moment it lands.
+    if (engine_input_open() && logical_x >= sidebar_left_x) {
+        touch_bar_press_ = true;
         return true;
     }
     return false;
@@ -124,13 +103,29 @@ void Game::push_touch_mouse_event(
 
     const auto [logical_x, logical_y] =
         logical_coordinates(x, y, window_width, window_height);
+    const auto push_button = [&](bool down) {
+        SDL_Event button{};
+        button.type = down
+            ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
+        button.button.button = SDL_BUTTON_LEFT;
+        button.button.clicks = 1;
+        button.button.down = down;
+        button.button.which = SDL_TOUCH_MOUSEID;
+        button.button.x = x;
+        button.button.y = y;
+        SDL_PushEvent(&button);
+    };
     if (event.type == SDL_EVENT_FINGER_DOWN) {
+        touch_bar_press_ = false;
         touch_mouse_dragging_ = begin_touch_drag(logical_x, logical_y);
         if (touch_mouse_dragging_) {
             // The handle owns the finger now; without this the same drag
-            // would still read as a backlog swipe and page the log while
-            // the slider moved.
+            // would still read as a scroll of the page while the slider
+            // moved.
             touch_input_.claim_touch();
+        }
+        if (touch_bar_press_) {
+            push_button(true);
         }
         return;
     }
@@ -141,27 +136,20 @@ void Game::push_touch_mouse_event(
     touch_mouse_active_ = false;
     if (touch_mouse_dragging_) {
         // The drag was started here rather than by a press event, so end it
-        // here too; a drag never counts as a click.
+        // here too; a scroll drag never counts as a click.
         touch_mouse_dragging_ = false;
-        finish_sidebar_drag();
-        suppress_sidebar_mouse_up_ = false;
+        message_scroll_dragging_ = false;
+        if (touch_bar_press_) {
+            touch_bar_press_ = false;
+            push_button(false);
+        }
     } else if (event.type != SDL_EVENT_FINGER_CANCELED
                && !touch_input_.last_touch_was_gesture()
                && !touch_input_.last_touch_moved()) {
         // A tap: a still finger lifted from where it landed, and not part of
         // a swipe.  Deliver it as a whole click where it was released.
-        for (const bool down : {true, false}) {
-            SDL_Event button{};
-            button.type = down
-                ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
-            button.button.button = SDL_BUTTON_LEFT;
-            button.button.clicks = 1;
-            button.button.down = down;
-            button.button.which = SDL_TOUCH_MOUSEID;
-            button.button.x = x;
-            button.button.y = y;
-            SDL_PushEvent(&button);
-        }
+        push_button(true);
+        push_button(false);
     }
 
     // A touch that ends on the sidebar leaves it up: it only fades once a
@@ -198,15 +186,10 @@ void Game::push_touch_mouse_event(
 
 void Game::clear_pointer_highlights()
 {
-    // A finger that has lifted is not hovering anything, so nothing should
-    // stay lit under it.  The sidebar's fade is deliberately not part of
-    // this: the bar itself stays up until a touch lands off it.
-    sidebar_hover_ = -1;
-    backlog_handle_hover_ = false;
-    opacity_handle_hover_ = false;
-    backlog_voice_hover_ = -1;
+    // A finger that has lifted is not hovering anything, so nothing of the
+    // port's own screens should stay lit under it.  The scene's pointer is
+    // the engine's, and has already been moved off.
     title_highlight_ = -1;
-    menu_highlight_ = -1;
     save_hover_ = -1;
     map_hover_ = -1;
 }
@@ -227,105 +210,62 @@ void Game::handle_touch_actions()
         return;
     }
 
+    // A key the engine already has, pressed and let go within the tick.
+    const auto tap_key = [this](const char* name) {
+        recorder_.key(name, true);
+        recorder_.key(name, false);
+    };
+    const bool scene = engine_input_open();
     switch (action) {
     case Action::BacklogOlder:
-        if (ui_mode_ == UiMode::backlog) {
-            backlog_older();
-        } else if (ui_mode_ == UiMode::game) {
-            open_backlog();
+        // A drag, which scrolls text that does not fit and nothing else -
+        // there is no swipe into the log.
+        if (scene) {
+            scroll_overflowing_text(-1);
         }
         break;
     case Action::BacklogNewer:
-        if (ui_mode_ == UiMode::backlog) {
-            backlog_newer();
+        if (scene) {
+            scroll_overflowing_text(1);
         }
         break;
     case Action::BacklogOrHideTextbox:
-        if (ui_mode_ == UiMode::backlog) {
-            close_backlog();
-        } else if (ui_mode_ == UiMode::game) {
-            window_hidden_ = true;
+        // Two fingers: the space key, GameKey.diswin.
+        if (scene) {
+            tap_key("space");
         }
         break;
     case Action::MenuToggle:
+        // The back button: closes whichever of the port's screens is up,
+        // and in the scene is the escape key, GameKey.cansel - the engine's
+        // menu, or out of it.
         if (ui_mode_ == UiMode::save || ui_mode_ == UiMode::load) {
             close_save_load();
-        } else if (ui_mode_ == UiMode::system_menu) {
-            close_system_menu();
-        } else if (ui_mode_ == UiMode::game || ui_mode_ == UiMode::backlog) {
-            open_system_menu();
         } else if (config_open_) {
             close_config();
+        } else if (scene) {
+            tap_key("esc");
         }
         break;
     case Action::SkipToggle:
-        if (ui_mode_ == UiMode::game) {
-            skip_mode_ = !skip_mode_;
-            if (skip_mode_) {
-                auto_mode_ = false;
-            }
-            play_se(-1, 9104, false, 255);
+        // The shift key, GameKey.mes_cut_mode.
+        if (scene) {
+            tap_key("shift");
         }
         break;
     case Action::AutoModeToggle:
-        if (ui_mode_ == UiMode::game) {
-            auto_mode_ = !auto_mode_;
-            if (auto_mode_) {
-                skip_mode_ = false;
-            }
-            play_se(-1, 9104, false, 255);
+        // The bar's auto button; there is no key for it.
+        if (scene) {
+            live_bar_button_ = 5;
         }
         break;
     case Action::Tap:
         // Nothing to do: taps reach the game as a synthesized press and
         // release (see push_touch_mouse_event), the same way a mouse click
-        // would, so the sidebar, the backlog and the text handlers have all
-        // already seen this one.
+        // would.
         break;
     default:
         break;
-    }
-}
-
-bool Game::backlog_older()
-{
-    if (backlog_depth_ >= static_cast<int>(backlog_.size())) {
-        return false;
-    }
-    play_se(-1, 9012, false, 140);
-    ++backlog_depth_;
-    backlog_scroll_ = 0;
-    ui_mode_ = UiMode::backlog;
-    return true;
-}
-
-bool Game::backlog_newer()
-{
-    if (backlog_depth_ <= 0) {
-        return false;
-    }
-    play_se(-1, 9012, false, 140);
-    backlog_scroll_ = 0;
-    if (backlog_depth_ > 1) {
-        --backlog_depth_;
-    } else {
-        close_backlog();
-    }
-    return true;
-}
-
-void Game::execute_menu_item(int index)
-{
-    switch (index) {
-    case 0:
-        if (!replay_mode_) open_save_load(UiMode::save);
-        break;
-    case 1:
-        if (!replay_mode_) open_save_load(UiMode::load);
-        break;
-    case 2: window_hidden_ = !window_hidden_; break;
-    case 3: open_config(); break;
-    case 4: break;
     }
 }
 
@@ -357,6 +297,7 @@ void Game::close_save_load()
     load_error_.clear();
     begin_transition(1, 12, 128, false, EffectTiming::menu);
     ui_mode_ = save_return_mode_;
+    engine_port_screen_closed();
 }
 
 void Game::draw_save_digit_sheet_text(
@@ -410,82 +351,6 @@ void Game::draw_save_digit_number(float x, float y, int number, int digits)
                 renderer_, ui_save_digits_.get(), &src, &dst);
         }
         x += glyph_width;
-    }
-}
-
-void Game::draw_system_menu()
-{
-    // Background
-    if (ui_sys_menu_bg_) {
-        SDL_RenderTexture(renderer_, ui_sys_menu_bg_.get(),
-                          nullptr, nullptr);
-    } else {
-        SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
-        SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 180);
-        SDL_RenderFillRect(renderer_, nullptr);
-    }
-
-    draw_save_digit_sheet_text(
-        138.0f, 12.0f,
-        std::format("{}A{}B", runtime_.flag(0), runtime_.flag(1)));
-
-    // 4 main buttons from sys0110.tga
-    // Layout: Save(0,0) Load(400,0) Hide(0,246) Settings(400,246)
-    // Each: w=400, h=82, 3 states stacked vertically (0,82,164)
-    const int btn_x[4] = {0, 400, 0, 400};
-    const int btn_y[4] = {0, 0, 246, 246};
-    const int dst_x[4] = {200, 200, 200, 200};
-    const int dst_y[4] = {112, 200, 288, 376};
-
-    for (int i = 0; i < 4; ++i) {
-        const bool disabled = replay_mode_ && (i == 0 || i == 1);
-        const int state = (i == menu_highlight_) ? 82 : 0;
-        const SDL_FRect src{
-            static_cast<float>(btn_x[i]),
-            static_cast<float>(btn_y[i] + state), 400.0f, 82.0f};
-        const SDL_FRect dst{
-            static_cast<float>(dst_x[i]),
-            static_cast<float>(dst_y[i]), 400.0f, 82.0f};
-        if (ui_sys_menu_btns_) {
-            SDL_SetTextureAlphaMod(
-                ui_sys_menu_btns_.get(), disabled ? 64 : 255);
-            SDL_RenderTexture(renderer_, ui_sys_menu_btns_.get(),
-                              &src, &dst);
-            SDL_SetTextureAlphaMod(ui_sys_menu_btns_.get(), 255);
-        } else {
-            // Fallback: draw text
-            const char* labels[4] = {"Save", "Load", "Hide Text", "Settings"};
-            const float tw = std::strlen(labels[i]) * 12.0f;
-            const float tx = dst_x[i] + (400.0f - tw) / 2.0f;
-            const float ty = dst_y[i] + (82.0f - 24.0f) / 2.0f;
-            font_.draw(renderer_, tx + 2, ty + 2, labels[i], 0, 0, 0);
-            if (i == menu_highlight_) {
-                SDL_SetRenderDrawColor(renderer_, 255, 255, 255, 40);
-                SDL_RenderFillRect(renderer_, &dst);
-                font_.draw(renderer_, tx, ty, labels[i], 255, 255, 255);
-            } else {
-                font_.draw(renderer_, tx, ty, labels[i], 128, 128, 128);
-            }
-        }
-    }
-
-    // sys0111.tga stores normal, hover and pressed states horizontally.
-    const float cs = menu_highlight_ == 4 ? 188.0f : 0.0f;
-    const SDL_FRect csrc{cs, 0.0f, 188.0f, 32.0f};
-    const SDL_FRect cdst{306.0f, 480.0f, 188.0f, 32.0f};
-    if (ui_sys_cancel_) {
-        SDL_RenderTexture(renderer_, ui_sys_cancel_.get(), &csrc, &cdst);
-    } else {
-        SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
-        if (menu_highlight_ == 4) {
-            SDL_SetRenderDrawColor(renderer_, 255, 255, 255, 40);
-            SDL_RenderFillRect(renderer_, &cdst);
-        }
-        font_.draw(renderer_, 356.0f, 484.0f, "Close", 0, 0, 0);
-        font_.draw(renderer_, 354.0f, 482.0f, "Close",
-                   menu_highlight_ == 4 ? 255 : 128,
-                   menu_highlight_ == 4 ? 255 : 128,
-                   menu_highlight_ == 4 ? 255 : 128);
     }
 }
 

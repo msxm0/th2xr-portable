@@ -31,6 +31,7 @@
 
 #include <array>
 #include <functional>
+#include <utility>
 #include <iosfwd>
 #include <string>
 #include <vector>
@@ -136,6 +137,9 @@ struct NovelBufState {
     std::array<std::string, nlog_max> buf{};
     std::array<std::vector<NovelVoice>, nlog_max> nv{};
     std::array<std::string, nlog_v_max> vv_mes{};
+    // Where each voiced line of the entry on screen runs in its raw text,
+    // [first, second) - for a presentation that measures its own rects.
+    std::array<std::pair<std::size_t, std::size_t>, nlog_v_max> vv_span{};
     int sno = 0;        // SetNovelMessageVoice1's pending voice
     int vno = 0;
     int cno = 0;
@@ -185,10 +189,6 @@ public:
         std::function<bool()> mes_cut;             // AVG_GetMesCut
         std::function<int()> msg_cnt;              // AVG_MsgCnt
         std::function<int()> eff_cnt_puls;         // AVG_EffCntPuls
-        // Paging up into the backlog without the engine bar: the port's own
-        // UI, which stands in for AVG_NovelLogStart and the four states of
-        // the machine it leads to.
-        std::function<void()> log_start;
         // DSP_SetTextDisp( TXT_WINDOW, disp ) - hides the text without
         // closing the window, which is what lets AVG_ControlChar put it back
         // after an animation.
@@ -227,6 +227,19 @@ public:
         std::function<void()> close_select_window;
         // AVG_GoConfig( 1 save, 2 load, 3 config ).
         std::function<void(int)> go_config;
+        // The voice rects of a log entry in a presentation's own units: the
+        // rects covering raw text [start, end) of `text` as it is drawn.
+        // Unset, or answering false, leaves the original's units, which is
+        // what the reference answers a click with.
+        std::function<bool(const std::string& text, std::size_t start,
+                           std::size_t end,
+                           std::vector<std::array<int, 4>>& rects)>
+            log_voice_rects;
+        // MSG_STOP left for MSG_NEXT: the reader has finished a page.
+        std::function<void()> page_end;
+        // MUS_SetMousePos: put the pointer at (x, y) in the 800x600 space,
+        // where the next MUS_RenewMouse finds it.
+        std::function<void(int, int)> set_mouse_pos;
         // Avg.auto_flag = !Avg.auto_flag, and Avg.msg_cut_mode.
         std::function<void()> toggle_auto_flag;
         std::function<bool()> msg_cut_mode;
@@ -283,19 +296,26 @@ public:
     // rects on layer 0, AVG_ControlNovelMessage answers them from MSG_WAIT,
     // MSG_STOP and MSG_NEXT, and paging back through the log is four more
     // states of step1 (MSG_UP, MSG_LOG, MSG_DOWN, MSG_DRAG) with the text
-    // drawn from NovelBuf.  The port has a UI of its own for all of that,
-    // which is what normal play still uses; set_engine_bar(true) - a trace
-    // run - puts the engine's in charge instead, so a recorded run that
-    // works the bar replays against the reference at all.
-    void set_engine_bar(bool on) { engine_bar_ = on; }
-    bool engine_bar() const { return engine_bar_; }
+    // drawn from NovelBuf.  Every run uses it, so a recorded run that works
+    // the bar replays against the reference, and what that verifies is what
+    // is played.
     // MUS_RenewMouse: the pointer and the left button for this frame.
     void renew_mouse(int x, int y, bool left);
+    // A press of bar button `no` (1..9) this tick, as if its rect had been
+    // clicked, for an input with no pointer behind it - the gamepad's auto
+    // button, the touch swipe.  The bar's own answer to it runs unchanged,
+    // only in the states that answer the bar at all.  Lasts until the next
+    // renew_mouse.
+    void press_bar_button(int no) { bar_press_ = no; }
     const EngineMouse& mouse() const { return mouse_; }
     // MUS_GetMouseNoEx( button, lno ): the rect under the pointer on layer
     // lno, if that is the current layer and `button` has its edge this
     // frame (mouse_any asks for no edge at all).
     int mouse_no_ex(int button, int lno) const;
+    // MUS_SetMousePosRect( hwnd, lno, no ): the pointer onto the bottom-left
+    // of rect `no` of layer `lno`, if it is flagged - how the arrow keys
+    // walk the menu and the choices.
+    void set_mouse_pos_rect(int lno, int no);
     // MUS_GetMouseNo( -1 ): the rect under the pointer on the current layer.
     int mouse_no() const { return mouse_.no; }
     // MUS_SetMouseLayer / MUS_GetMouseLayer / MUS_SetMouseRect /
@@ -318,15 +338,34 @@ public:
     // NovelMessage.disp: the log hides the line without taking the bar down.
     bool main_text_disp() const { return main_text_disp_; }
     const EngineText& log_text() const { return log_text_; }
+    // The log entry on screen: its voiced spans, the one under the pointer
+    // (-1 for none), and its rects again - after the presentation's own
+    // layout of it has moved, say by scrolling.
+    const std::array<std::pair<std::size_t, std::size_t>, nlog_v_max>&
+    log_voice_spans() const { return novel_buf_.vv_span; }
+    int log_voice_hover() const
+    {
+        return log_text_.flag && mouse_.no >= 32 ? mouse_.no - 32 : -1;
+    }
+    void refresh_log_voice_rects()
+    {
+        if (log_text_.flag) {
+            set_history_voice_mouse_rect();
+        }
+    }
     const EngineText& log_voice_text() const { return log_voice_text_; }
     const HistoryBar& history_bar() const { return history_bar_; }
     const NovelBufState& novel_buf() const { return novel_buf_; }
     // A trace checkpoint carries all of it: bmax alone moves the handle.
     void write_history(std::ostream& out) const;
     bool read_history(std::istream& in);
-    // Seed bmax for a checkpoint written before the log was carried: the
-    // handle only needs the count, and the texts are not there to restore.
-    void seed_history_depth(int bmax);
+    // NovelBuf alone - the log's entries and their voices - for a save.  A
+    // save is made from the engine's config, whose mouse layer and rects
+    // are no part of the scene it goes back to.
+    void write_log(std::ostream& out) const;
+    bool read_log(std::istream& in);
+    // A new game: an empty log.
+    void clear_log();
 
     // --- the half tone, also GM_AvgMsg.cpp ------------------------------
     void set_half_tone();          // AVG_SetHalfTone
@@ -409,6 +448,19 @@ public:
     // alph2 = LIM( text_cnt - cnt2, 0, 16 ) * 16, the per-character fade
     // TXT_DrawTextEx applies while a line is still arriving.
     int glyph_alpha(std::size_t index) const;
+
+    // A frame drawn `phase` (0..1) of a tick after the last one.  The
+    // typewriter's count moves on by msg_cnt every tick while it types, so
+    // between ticks visible_glyphs and glyph_alpha read it that far along -
+    // never past NovelMessage.max, where the next tick stops it - until the
+    // phase is set back to 0.  Nothing the machine keeps is changed.
+    void set_presentation_phase(double phase);
+    // AVG_ControlHalfTone's brightness for GRP_BACK at the next tick's
+    // count; false when the wash is not fading in.
+    bool present_half_tone(double phase, int& r, int& g, int& b) const;
+    // ControlHistorySystem's fade on its way to the next tick's value, from
+    // the pointer as it stands.
+    double present_bar_fade(double phase) const;
     // TXT_GetTextEndKeyWait over the current text.
     bool text_end_key_wait() const { return end_key_wait_; }
 
@@ -427,6 +479,7 @@ private:
     // them there at every wait while the NovelMessage fields carry on
     // holding live values.
     int text_cnt_ = 0;
+    double present_extra_ = 0.0;   // see set_presentation_phase
     int text_step_ = 0;
     HalfToneState half_tone_{};
     TextCount counted_{};
@@ -445,7 +498,7 @@ private:
     int wstep_ = 0;
     int demo_cnt_ = 0;   // Avg.demo_cnt
 
-    bool engine_bar_ = false;
+    int bar_press_ = -1;
     EngineMouse mouse_{};
     // MouseCheck[lno][no], and MouseStruct.lno.
     std::array<std::array<MouseRect, mouse_rest_max>, mouse_layers> rects_{};

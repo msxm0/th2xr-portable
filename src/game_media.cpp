@@ -159,17 +159,18 @@ bool Game::character_animation_active() const
 
 int Game::control_ticks_due()
 {
-    // MAIN_GameControl runs the AVG_Control* chain once a frame at sixty
-    // frames a second, and every counter in it - CharStruct.cnt,
-    // BackStruct.fd_cnt, HalfTone.tcount - is a whole number of those.  On a
-    // display that refreshes faster the chain has to be stepped by elapsed
-    // time instead, or every animation runs at the refresh rate rather than
-    // at the speed the script asked for.
+    // MAIN_GameControl runs the AVG_Control* chain once a tick, every
+    // engine_tick_ms (62.5 a second), and every counter in it -
+    // CharStruct.cnt, BackStruct.fd_cnt, HalfTone.tcount - is a whole number
+    // of those.  The display refreshes at its own rate, so the chain is
+    // stepped by elapsed time, or every animation would run at the refresh
+    // rate rather than at the speed the script asked for.
+    //
+    // Only counts them: Game::run_tick steps GlobalCount, once per tick.
     if (trace_mode_) {
         // A tick is the frame.  No accumulator, no clamp, no clock - so a
         // frame that takes four hundred milliseconds to decode a background
-        // still advances the engine by exactly one sixtieth.
-        ++global_count_;
+        // still advances the engine by exactly one tick.
         return 1;
     }
     const auto now = std::chrono::steady_clock::now();
@@ -177,13 +178,12 @@ int Game::control_ticks_due()
         character_control_time_ = now;
     }
     character_control_debt_ += std::chrono::duration<double>(
-        now - character_control_time_).count() * 60.0;
+        now - character_control_time_).count() * (1000.0 / engine_tick_ms);
     character_control_time_ = now;
     // A long stall must not be made up all at once, or an animation jumps.
     character_control_debt_ = std::min(character_control_debt_, 8.0);
     const int steps = static_cast<int>(character_control_debt_);
     character_control_debt_ -= steps;
-    global_count_ += steps;
     return steps;
 }
 
@@ -193,13 +193,12 @@ void Game::update_character_animations(int steps)
     // every character's counters, bakes the settled ones into BMP_BACK, and
     // closes and reopens the message window around an animation.
     //
-    // The original calls it once a frame at sixty frames a second and counts
-    // in whole frames, so on a faster display it has to be stepped by
-    // elapsed time instead - otherwise every character animation runs at the
+    // The original calls it once a tick and counts in whole ticks, so on a
+    // display of another rate it has to be stepped by elapsed time instead - otherwise every character animation runs at the
     // refresh rate rather than at the speed the script asked for.
     const bool was_animating = character_animation_active();
     if (steps <= 0) {
-        // No sixtieth has gone by, but the frame is about to be drawn and
+        // No tick has gone by, but the frame is about to be drawn and
         // the engine would have run AVG_ControlChar before it.  Everything
         // that decides what is on screen runs; only the counters wait.
         chars().control_char(false);
@@ -613,9 +612,6 @@ void Game::play_voice(const th2::Event& event)
             return;
         }
     }
-    const bool alternate = name != standard_name;
-    pending_backlog_voice_ = BacklogVoice{
-        0, 0, scenario, voice, character, volume, alternate};
     const auto* voice_entry = voice_archive_.find(name);
     if (!voice_entry) {
         voice_sound_[channel] = -1;
@@ -668,32 +664,6 @@ void Game::play_log_voice(int character, int scenario, int voice, bool a_cut)
     voice_character_[0] = character;
     voice_scenario_[0] = scenario;
     voice_volume_[0] = 255;
-    voice_loop_[0] = false;
-}
-
-void Game::replay_backlog_voice(const Game::BacklogVoice& voice)
-{
-    auto name = std::format(
-        "K{:09d}_{:03d}{:03d}{}.OGG",
-        voice.scenario, voice.voice, voice.character,
-        voice.alternate ? "A" : "");
-    if (!voice_archive_.find(name) && voice.alternate) {
-        name = std::format(
-            "K{:09d}_{:03d}{:03d}.OGG",
-            voice.scenario, voice.voice, voice.character);
-    }
-    if (!voice_archive_.find(name)) {
-        return;
-    }
-    voice_channels_[0].stop();
-    note_sound_started(se_channels_.size() + transient_se_.size());
-    voice_channels_[0].play_streaming(
-        ready_audio_decoder(voice_archive_, name), false,
-        voice_gain(voice.volume, voice.character));
-    voice_sound_[0] = voice.voice;
-    voice_character_[0] = voice.character;
-    voice_scenario_[0] = voice.scenario;
-    voice_volume_[0] = voice.volume;
     voice_loop_[0] = false;
 }
 

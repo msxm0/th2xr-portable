@@ -139,7 +139,6 @@ bool Game::voice_playing() const
 void Game::update_playback_modes()
 {
     if (config_open_ || ui_mode_ != UiMode::game || choosing_) {
-        auto_next_time_.reset();
         return;
     }
     // Skipping and auto mode are both AVG_ControlNovelMessage's, and both
@@ -562,7 +561,11 @@ void Game::answer_choice(int select)
     choice_selected_ = select;
     trace_choice_answered_ = true;
     msg().set_novel_message_disp(false);
-    manual_advance();
+    // The click that answered has ended auto and skip mode as any click does
+    // (AVG_ControlSystem2); advance() resolves the branch.
+    auto_mode_ = false;
+    skip_mode_ = false;
+    advance();
 }
 
 void Game::control_select_window()
@@ -581,37 +584,38 @@ void Game::control_select_window()
         for (int step = 0; step < control_steps_; ++step) {
             choice_reveal_cnt_ += message_count_step();
         }
-        if (msg().engine_bar() && choice_reveal_finished()) {
+        if (choice_reveal_finished()) {
             // ...and on that same frame each option becomes a mouse rect on
-            // layer 0, slot 16+i:
-            //     len = min( 26, TXT_GetTextCount(SelectWindow.mes[i],0) );
-            //     MUS_SetMouseRect( 0, 16+i, 32, py + SYS_FONT*2 + 13*i+h,
-            //                       len*SYS_FONT, DSP_GetTextDispH(..), ON );
-            for (int i = 0; i < options; ++i) {
-                const auto counted = th2::txt_count_text(choice_engine_text(i));
-                const int len =
-                    std::min(26, th2::txt_get_text_count(counted, 0));
-                msg().set_mouse_rect(
-                    0, 16 + i, 32, static_cast<int>(choice_row_y(i)),
-                    len * th2::message_text_box.font,
-                    static_cast<int>(choice_row_height(i)), true);
-            }
+            // layer 0, slot 16+i.
+            register_choice_rects(false);
         }
         return;
     }
-    // case 0.  With the engine bar the option under the pointer is the
-    // selection - lit in FCT_NORMAL, the rest FCT_GLAY - and a click
-    // answers it; a number key answers outright either way:
+    // A finger is not a mouse: the engine's rects are one line of text
+    // tall, a few millimetres on a phone.  Under touch they widen to the
+    // whole row and meet halfway across the gaps, and go back to the
+    // engine's own the moment the mouse is used.  Never in a trace.
+    if (!trace_mode_ && pointer_from_touch_ != choice_rects_for_touch_) {
+        register_choice_rects(pointer_from_touch_);
+    }
+    // case 0.  The option under the pointer is the selection - lit in
+    // FCT_NORMAL, the rest FCT_GLAY - and a click answers it; a number key
+    // answers outright:
     //     select = MUS_GetMouseNoEx( -1, 0 )-16;  click = GameKey.click;
     //     for(j=0;j<mnum+1;j++) if(GameKey.num[j]){ select = j-1; click = 1; }
-    int select = -1;
-    bool click = false;
-    if (msg().engine_bar()) {
-        select = msg().mouse_no_ex(th2::mouse_any, 0) - 16;
-        if (select >= options) {
-            select = -1;
-        }
-        click = game_key_.click != 0;
+    int select = msg().mouse_no_ex(th2::mouse_any, 0) - 16;
+    if (select >= options) {
+        select = -1;
+    }
+    bool click = game_key_.click != 0;
+    //     if(GameKey.u) MUS_SetMousePosRect( hwnd, 0, (select<0)? 16 : select+16-1 );
+    //     if(GameKey.d) MUS_SetMousePosRect( hwnd, 0, (select<0)? 16 : select+16+1 );
+    // The pointer moves; the highlight follows it on the next tick.
+    if (game_key_.u) {
+        msg().set_mouse_pos_rect(0, select < 0 ? 16 : select + 16 - 1);
+    }
+    if (game_key_.d) {
+        msg().set_mouse_pos_rect(0, select < 0 ? 16 : select + 16 + 1);
     }
     for (int j = 0; j <= options && j < 10; ++j) {
         if (game_key_.num[j]) {
@@ -619,26 +623,56 @@ void Game::control_select_window()
             click = true;
         }
     }
-    if (msg().engine_bar()) {
-        choice_highlight_ = select;
-    }
+    choice_highlight_ = select;
     if (click && select >= 0 && select < options) {
-        if (msg().engine_bar()) {
-            // AVG_ResetSelectWindow's MUS_ResetMouseRect( 0, 16+i ), and
-            //     Avg.msg_cut = OFF;
-            for (int i = 0; i < 10; ++i) {
-                msg().set_mouse_rect(0, 16 + i, 0, 0, 0, 0, false);
-            }
-            skip_held_ = false;
+        // AVG_ResetSelectWindow's MUS_ResetMouseRect( 0, 16+i ), and
+        //     Avg.msg_cut = OFF;
+        for (int i = 0; i < 10; ++i) {
+            msg().set_mouse_rect(0, 16 + i, 0, 0, 0, 0, false);
         }
+        skip_held_ = false;
         answer_choice(select);
+    }
+}
+
+void Game::register_choice_rects(bool touch)
+{
+    //     len = min( 26, TXT_GetTextCount(SelectWindow.mes[i],0) );
+    //     MUS_SetMouseRect( 0, 16+i, 32, py + SYS_FONT*2 + 13*i+h,
+    //                       len*SYS_FONT, DSP_GetTextDispH(..), ON );
+    // For touch, each band runs from the screen's edge to the bar and down
+    // to halfway to the next option, at least `touch_min` tall at the ends.
+    constexpr int touch_min = 56;
+    const int options = static_cast<int>(choices_.size());
+    choice_rects_for_touch_ = touch;
+    for (int i = 0; i < options; ++i) {
+        const int top = static_cast<int>(choice_row_y(i));
+        const int height = static_cast<int>(choice_row_height(i));
+        if (!touch) {
+            const auto counted = th2::txt_count_text(choice_engine_text(i));
+            const int len = std::min(26, th2::txt_get_text_count(counted, 0));
+            msg().set_mouse_rect(0, 16 + i, 32, top,
+                                 len * th2::message_text_box.font, height,
+                                 true);
+            continue;
+        }
+        const int pad = std::max(0, (touch_min - height) / 2);
+        const int band_top = i == 0
+            ? top - pad
+            : (static_cast<int>(choice_row_y(i - 1) + choice_row_height(i - 1))
+               + top) / 2;
+        const int band_bottom = i + 1 == options
+            ? top + height + pad
+            : (top + height + static_cast<int>(choice_row_y(i + 1))) / 2;
+        msg().set_mouse_rect(0, 16 + i, 0, band_top,
+                             static_cast<int>(sidebar_left_x),
+                             band_bottom - band_top, true);
     }
 }
 
 void Game::start_text_reveal(std::size_t start)
 {
     text_reveal_start_ = start;
-    text_reveal_started_ = std::chrono::steady_clock::now();
     text_reveal_complete_ = config_.text_speed_ms == 0;
     text_fade_complete_ = text_reveal_complete_;
 }
@@ -660,10 +694,6 @@ void Game::enable_trace(
     std::uint64_t ticks, std::uint64_t first, std::uint64_t lead)
 {
     trace_mode_ = true;
-    // The engine's history bar and log in place of the port's: a trace is
-    // compared against the reference, and a recorded run that works the bar
-    // only means anything if the bar is the engine's.
-    msg().set_engine_bar(true);
     // The audio channels' own clock, so a fade advances with the tick
     // counter rather than with however fast this machine replays.  See
     // AudioChannel::set_clock: AVG_WaitBGM asks whether a fade has finished,
@@ -685,6 +715,13 @@ void Game::enable_trace(
     if (renderer_ && !SDL_SetRenderVSync(renderer_, SDL_RENDERER_VSYNC_DISABLED)) {
         SDL_Log("trace: could not disable vsync: %s", SDL_GetError());
     }
+    vsync_paced_ = false;
+    // Every frame of a trace is recorded as the engine's, so a GL call that
+    // failed must stop the run rather than leave a wrong frame in the file.
+    th2::GlExactBlend::set_strict(true);
+    // And nothing the host's speed decides may reach the frame: background
+    // decoding is done whole in the tick it is queued in.
+    background_budget_.set_unlimited(true);
     std::filesystem::create_directories(trace_dir_);
     if (input) {
         trace_script_.load(*input);
@@ -793,7 +830,7 @@ std::string Game::trace_glyph_alpha() const
     if (!avg_msg_ || !message_visible_ || msg().state().disp == 0
         || ui_mode_ != UiMode::game || message_.empty()
         // The engine's log hides TXT_WINDOW while an older entry is up.
-        || (msg().engine_bar() && !msg().main_text_disp())) {
+        || !msg().main_text_disp()) {
         return "-";
     }
     return trace_glyph_string();
@@ -1203,10 +1240,9 @@ void Game::trace_checkpoint_resume()
                 : std::nullopt;
             pending_sound_ages_ = std::move(sound_ages);
         }
-        // Appended last.  A checkpoint from before it was carried has the
-        // count the port's own backlog kept, which is all the handle needs.
-        if (!file || !msg().read_history(file)) {
-            msg().seed_history_depth(novel_log_depth());
+        // Appended last: the engine's log, its mouse rects and the bar.
+        if (file && !msg().read_history(file)) {
+            SDL_Log("trace: checkpoint has no engine history");
         }
         if (file && read_state_i32(file) == 0x5350414d) {
             const bool in_map = read_state_i32(file) != 0;
@@ -1294,14 +1330,17 @@ void Game::trace_checkpoint_resume()
 
 std::chrono::steady_clock::time_point Game::engine_now() const
 {
-    if (!trace_mode_) {
-        return std::chrono::steady_clock::now();
-    }
     // 1000/60 == 16, integer divided, exactly as MAIN_Loop steps next_time
-    // and as th2ref_time() reports it.  Deriving it from trace_tick_ rather
-    // than accumulating keeps the two sides' arithmetic identical.
+    // and as th2ref_time() reports it.  Deriving it from the tick rather
+    // than accumulating keeps the two sides' arithmetic identical - and in
+    // normal play keeps every wait, fade and flash counted in the same
+    // ticks the rest of the engine is, rather than in whatever the host's
+    // clock did between them.
+    const auto ticks = trace_mode_
+        ? trace_tick_
+        : static_cast<std::uint64_t>(std::max(global_count_, 0));
     return std::chrono::steady_clock::time_point{}
-        + std::chrono::milliseconds(trace_tick_ * (1000 / 60));
+        + std::chrono::milliseconds(ticks * engine_tick_ms);
 }
 
 void Game::trace_dump_state()
@@ -1390,14 +1429,43 @@ void Game::trace_dump_state()
 
 void Game::trace_apply_input()
 {
-    // The script is the only input.  Same file, same semantics as the
+    // The only way input reaches the engine.  Same semantics as the
     // reference's th2ref_input.cpp: trg on the first tick of a press, btn
     // for its whole duration.
-    // Recording: the player's hands, sampled for this tick and written out,
-    // so the file replays exactly what was played.  Before the hand-over,
-    // and always when replaying, the script.
-    const auto state = record_live() ? recorder_.sample(trace_tick_)
-                                     : trace_script_.at(trace_tick_);
+    //
+    // Live - normal play, and a recording past its lead-in - the player's
+    // hands, sampled for this tick (and written out when recording, so the
+    // file replays exactly what was played).  Otherwise the script.
+    const bool live = live_input();
+    auto state = live
+        ? recorder_.sample(trace_mode_
+                               ? trace_tick_
+                               : static_cast<std::uint64_t>(global_count_))
+        : trace_script_.at(trace_tick_);
+    if (!live && pointer_warp_) {
+        // The reference's SetCursorPos stands until the script moves the
+        // pointer somewhere else.
+        if (state.mouse_x == pointer_warp_->from_x
+            && state.mouse_y == pointer_warp_->from_y) {
+            state.mouse_x = pointer_warp_->x;
+            state.mouse_y = pointer_warp_->y;
+        } else {
+            pointer_warp_.reset();
+        }
+    }
+    script_mouse_x_ = state.mouse_x;
+    script_mouse_y_ = state.mouse_y;
+    const bool open = !live || engine_input_open();
+    if (!open) {
+        // One of the port's own screens is up over the scene.  Its presses
+        // never reached the sampler; what is left is the pointer, which the
+        // engine may as well keep following.
+        const int x = state.mouse_x;
+        const int y = state.mouse_y;
+        state = {};
+        state.mouse_x = x;
+        state.mouse_y = y;
+    }
     key_cond_ = {};
     key_cond_.trg_enter   = state.is_pressed("enter");
     key_cond_.btn_enter   = state.is_held("enter");
@@ -1412,65 +1480,85 @@ void Game::trace_apply_input()
     key_cond_.trg_end     = state.is_pressed("end");
     key_cond_.btrg_pup    = state.is_pressed("pup");
     key_cond_.btrg_pdown  = state.is_pressed("pdown");
+    key_cond_.btrg_up     = state.is_pressed("up");
+    key_cond_.btrg_down   = state.is_pressed("down");
+    key_cond_.btrg_left   = state.is_pressed("left");
+    key_cond_.btrg_right  = state.is_pressed("right");
     // num0..num9, which is how a traced run answers a choice at all.
     for (int digit = 0; digit < 10; ++digit) {
         const std::string name = "num" + std::to_string(digit);
         key_cond_.trg_num[digit] = state.is_pressed(name);
     }
+    if (live && open) {
+        // The port's devices that have no name in a script: the wheel, the
+        // middle button, and the touch and gamepad gestures standing in for
+        // the skip key.  A recording that uses them does not replay.
+        key_cond_.wheel = std::exchange(live_wheel_, 0);
+        key_cond_.mouse_trg_middle = std::exchange(live_middle_, false);
+        key_cond_.btn_ctrl = key_cond_.btn_ctrl
+            || touch_input_.skip_held() || gamepad_input_.ctrl_skip_held();
+    }
+    live_wheel_ = 0;
+    live_middle_ = false;
     trace_mouse_x_ = state.mouse_x;
     trace_mouse_y_ = state.mouse_y;
     // MUS_RenewMouse, for the history bar and AVG_GetHitKey's rect test:
     // the engine bar takes its rects, edges and repeats from this.
     msg().renew_mouse(trace_mouse_x_, trace_mouse_y_, state.click_held);
+    // A gesture standing in for one of the bar's buttons (the left swipe,
+    // the gamepad's auto button): pressed as the bar would be, so it goes
+    // through the engine's own answer to it.
+    if (live && open && live_bar_button_ >= 0) {
+        msg().press_bar_button(live_bar_button_);
+    }
+    live_bar_button_ = -1;
+    // The half-tone slider is the player's setting as well as the engine's,
+    // and is written out when the button that dragged it comes up.
+    if (half_tone_unsaved_ && !state.click_held && !trace_mode_) {
+        half_tone_unsaved_ = false;
+        th2::save_config(config_path_, config_);
+    }
     key_cond_.mouse_trg_left  = state.click;
     key_cond_.mouse_btn_left  = state.click_held;
     key_cond_.mouse_trg_right = state.cancel;
-    th2::get_game_key(game_key_, key_cond_, 0);
+    th2::get_game_key(game_key_, key_cond_, 0, demo_mode_);
     trace_drive_map(state.map_pick);
     key_cond_.clear_triggers();
 }
 
-void Game::get_game_key()
+void Game::warp_pointer(int x, int y)
 {
-    if (trace_mode_) {
-        trace_apply_input();
-        // See the note below the fold: demo mode swallows the click edge.
-        if (demo_mode_) {
-            game_key_.click = 0;
-        }
+    // MUS_SetMousePos: the engine moves the cursor, and the next tick's
+    // MUS_RenewMouse finds it there.  Live, the sampler's pointer moves and
+    // stays until the mouse does; the system cursor is left where it is,
+    // since a warp rounded back through the window's scale can land a pixel
+    // off the one-pixel row MUS_SetMousePosRect aims at.
+    if (live_input()) {
+        recorder_.pointer(x, y);
         return;
     }
-    // void AVG_GetGameKey(void).  The device state is SDL's rather than
-    // KeyCond's, but the fold is the original's: click and cansel are edges,
-    // mes_cut is a level, and a click always beats a held skip key.
-    const bool blocked = config_open_ || name_input_open_;
-    key_cond_.btn_ctrl = !blocked
-        && ((SDL_GetModState() & SDL_KMOD_CTRL) != 0
-            || touch_input_.skip_held()
-            || gamepad_input_.ctrl_skip_held());
-    key_cond_.btn_alt = (SDL_GetModState() & SDL_KMOD_ALT) != 0;
-    th2::get_game_key(game_key_, key_cond_, 0);
-    // Avg.demo swallows the click edge.  Measured rather than traced: while
-    // SetDemoFlag is on, the reference converts *no* scripted click into
-    // GameKey.click - 28 consecutive 30-tick bursts at pc 18540..18884 of
-    // 040426300.sdt, with the button level asserted on every one of them and
-    // every burst either side of that span converting normally.  The engine
-    // reaches this below AVG_GetGameKey, which has no demo test of its own:
-    // GameKey.click comes from MUS_GetMouseTrigger, and that is gated on
-    // MouseStruct.active.  Exactly how demo mode clears it is NOT traced, so
-    // this reproduces the observed behaviour rather than the mechanism.
+    // A replay: see trace_apply_input.  The script's own position is what
+    // the warp stands in front of.
+    const int from_x = pointer_warp_ ? pointer_warp_->from_x : script_mouse_x_;
+    const int from_y = pointer_warp_ ? pointer_warp_->from_y : script_mouse_y_;
+    pointer_warp_ = PointerWarp{x, y, from_x, from_y};
+}
+
+void Game::get_game_key()
+{
+    // void AVG_GetGameKey(void), for every run: the script's input in a
+    // replay, the player's otherwise.
     //
-    // It matters because demo mode also drives auto-advance (hooks.auto_flag),
-    // so the engine walks a demo scene on the auto timer alone.  Ours took
-    // the auto timer *and* the clicks, and finished a line at tick 764340
-    // that the reference was still typing.
-    if (demo_mode_) {
-        game_key_.click = 0;
-    }
-    // The edges have now been consumed by exactly one control pass, so they
-    // are cleared - KEY_RenewKeybord does this at the top of
-    // MAIN_SystemControl, which in the original is every frame.
-    key_cond_.clear_triggers();
+    // Avg.demo swallows the click edge, and with it the cancel, hide, skip
+    // and paging keys - the tail of AVG_GetGameKey, now in th2::get_game_key.
+    // Measured before it was read: while SetDemoFlag is on, the reference
+    // converts *no* scripted click into GameKey.click - 28 consecutive
+    // 30-tick bursts at pc 18540..18884 of 040426300.sdt.  It matters
+    // because demo mode also drives auto-advance (hooks.auto_flag), so the
+    // engine walks a demo scene on the auto timer alone; ours took the auto
+    // timer *and* the clicks, and finished a line at tick 764340 that the
+    // reference was still typing.
+    trace_apply_input();
 }
 
 void Game::control_system2()
@@ -1512,9 +1600,7 @@ void Game::control_system2()
         auto_mode_ = false;
     }
     //     if( cansel && AVG_ConfigCheck() ){ ... AVG_GoConfig(0); }
-    // The engine's system menu, for the engine bar; normal play opens ours
-    // from the input handler instead.
-    if (msg().engine_bar() && game_key_.cansel && !engine_config_step_
+    if (game_key_.cansel && !engine_config_step_
         && ui_mode_ == UiMode::game && engine_config_check()) {
         engine_go_config(0);
     }
@@ -1547,13 +1633,11 @@ void Game::skip(bool force_unread)
     if (waiting_for_input_) {
         mark_current_text_read();
         if (finish_text_reveal()) {
-            auto_next_time_.reset();
             return;
         }
         const auto reveal_start = message_.visible().size();
         if (message_.reveal_next() && message_.has_hidden_segments()) {
             start_text_reveal(reveal_start);
-            auto_next_time_.reset();
             return;
         }
         waiting_for_input_ = false;

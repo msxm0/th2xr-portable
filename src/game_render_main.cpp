@@ -112,9 +112,21 @@ bool Game::on_scrollbar(float x, float y) const
 
 void Game::set_message_scroll_from_y(float y)
 {
+    if (log_entry_shown()) {
+        log_scroll_ = scroll_from_y(
+            y, display_lines(log_display(msg().log_text().str).text).size());
+        msg().refresh_log_voice_rects();
+        return;
+    }
     message_scroll_follow_ = false;
     message_scroll_ =
         scroll_from_y(y, display_lines(message_.visible()).size());
+}
+
+bool Game::log_entry_shown() const
+{
+    const auto& entry = msg().log_text();
+    return entry.flag && entry.disp && !entry.str.empty();
 }
 
 Uint8 Game::message_backdrop_alpha() const
@@ -157,6 +169,25 @@ void Game::reset_half_tone()
     msg().reset_half_tone();
 }
 
+namespace {
+
+// text.cpp's FCT, the colours DSP_SetTextColor indexes - RGB32, which is
+// {b, g, r, a}: FCT[10], the log, is orange and FCT[11] a sea green.
+const std::array<std::uint8_t, 3>& engine_fct(int color)
+{
+    static constexpr std::array<std::array<std::uint8_t, 3>, 18> fct{{
+        {255, 255, 255}, {192, 192, 192}, {80, 80, 80}, {0, 0, 0},
+        {0, 0, 255}, {0, 255, 0}, {255, 0, 0}, {0, 255, 255},
+        {255, 255, 0}, {255, 0, 255}, {0, 128, 255}, {128, 255, 0},
+        {255, 0, 128}, {0, 255, 128}, {255, 128, 0}, {128, 0, 255},
+        {223, 230, 172}, {255, 225, 197},
+    }};
+    return fct[static_cast<std::size_t>(
+        std::clamp(color, 0, static_cast<int>(fct.size()) - 1))];
+}
+
+}  // namespace
+
 void Game::draw_engine_text(const th2::EngineText& text)
 {
     // A TEXT_STRUCT the way DrawGraphText draws one: laid out in the message
@@ -165,17 +196,7 @@ void Game::draw_engine_text(const th2::EngineText& text)
     if (!text.flag || !text.disp || text.str.empty()) {
         return;
     }
-    // text.cpp's FCT, the colours DSP_SetTextColor indexes - RGB32, which
-    // is {b, g, r, a}: FCT[10], the log, is orange and FCT[11] a sea green.
-    static constexpr std::array<std::array<std::uint8_t, 3>, 18> fct{{
-        {255, 255, 255}, {192, 192, 192}, {80, 80, 80}, {0, 0, 0},
-        {0, 0, 255}, {0, 255, 0}, {255, 0, 0}, {0, 255, 255},
-        {255, 255, 0}, {255, 0, 255}, {0, 128, 255}, {128, 255, 0},
-        {255, 0, 128}, {0, 255, 128}, {255, 128, 0}, {128, 0, 255},
-        {223, 230, 172}, {255, 225, 197},
-    }};
-    const auto& rgb = fct[static_cast<std::size_t>(
-        std::clamp(text.color, 0, static_cast<int>(fct.size()) - 1))];
+    const auto& rgb = engine_fct(text.color);
     auto box = th2::message_text_box;
     box.sx = text.x;
     box.sy = text.y;
@@ -208,6 +229,157 @@ void Game::draw_engine_text(const th2::EngineText& text)
     }
 }
 
+Game::LogDisplay Game::log_display(const std::string& raw) const
+{
+    // A NovelBuf entry is the line as the script gave it, escapes and all:
+    // \n breaks the line and \k (a page's wait) takes no room.  `raw_of`
+    // maps each displayed byte back to the entry, so the engine's voiced
+    // spans can be found in the port's layout of it.
+    LogDisplay out;
+    for (std::size_t pos = 0; pos < raw.size();) {
+        if (raw.compare(pos, 2, "\\n") == 0) {
+            out.text.push_back('\n');
+            out.raw_of.push_back(pos);
+            pos += 2;
+        } else if (raw.compare(pos, 2, "\\k") == 0) {
+            pos += 2;
+        } else {
+            out.text.push_back(raw[pos]);
+            out.raw_of.push_back(pos);
+            ++pos;
+        }
+    }
+    out.raw_of.push_back(raw.size());
+    return out;
+}
+
+std::pair<std::size_t, std::size_t> Game::log_voiced_span(
+    const std::string& raw, std::size_t start) const
+{
+    // The voiced line as drawn: from its first visible character - a voice
+    // is noted where the line was added, which can be on the break before
+    // it - to its closing bracket, or the next break or wait.
+    std::size_t from = std::min(start, raw.size());
+    while (raw.compare(from, 2, "\\n") == 0 || raw.compare(from, 2, "\\k") == 0) {
+        from += 2;
+    }
+    constexpr std::string_view close = "\xE3\x80\x8D";   // the closing bracket
+    std::size_t to = from;
+    while (to < raw.size()) {
+        if (raw.compare(to, close.size(), close) == 0) {
+            to += close.size();
+            break;
+        }
+        if (raw.compare(to, 2, "\\n") == 0 || raw.compare(to, 2, "\\k") == 0) {
+            break;
+        }
+        ++to;
+    }
+    return {from, to};
+}
+
+std::vector<SDL_FRect> Game::log_span_rects(
+    const std::string& raw, std::size_t start, std::size_t end) const
+{
+    // The rects covering raw [start, end) of a log entry as the outline font
+    // lays it out, one per line it touches, scrolled by log_scroll_.
+    std::vector<SDL_FRect> result;
+    const auto display = log_display(raw);
+    const auto to_display = [&](std::size_t raw_pos) {
+        const auto it = std::lower_bound(display.raw_of.begin(),
+                                         display.raw_of.end(), raw_pos);
+        return static_cast<std::size_t>(it - display.raw_of.begin());
+    };
+    const auto first = to_display(start);
+    const auto last = std::max(first, to_display(end));
+    const std::string_view text = display.text;
+    std::size_t cursor = 0;
+    float y = message_text_y()
+        - static_cast<float>(log_scroll_) * text_line_height();
+    for (const auto& line : display_lines(display.text)) {
+        auto line_start = text.find(line, cursor);
+        if (line_start == std::string_view::npos) {
+            line_start = cursor;
+        }
+        const auto line_end = line_start + line.size();
+        const auto from = std::max(first, line_start);
+        const auto to = std::min(last, line_end);
+        if (from < to && y >= message_text_y() - 0.5f
+            && y + text_line_height() <= message_bottom_y + 0.5f) {
+            const std::string_view view = line;
+            const float left = message_text_x()
+                + font_.text_width(view.substr(0, from - line_start));
+            const float right = message_text_x()
+                + font_.text_width(view.substr(0, to - line_start));
+            result.push_back({left, y, right - left, text_line_height()});
+        }
+        cursor = line_end;
+        y += text_line_height();
+    }
+    return result;
+}
+
+void Game::draw_log_modern()
+{
+    // The engine's log entry in the outline font: the entry, its colour
+    // and which voiced line is lit are the engine's (MSG_LOG, NovelBuf,
+    // TXT_WINDOW+1/+2); the wrap and the scrolling of an entry too long
+    // for the box are the port's, as the main message's are.
+    const auto& entry = msg().log_text();
+    if (!entry.flag || !entry.disp || entry.str.empty()) {
+        log_scroll_text_.clear();
+        return;
+    }
+    if (log_scroll_text_ != entry.str) {
+        // A new entry starts at its top.
+        log_scroll_text_ = entry.str;
+        log_scroll_ = 0;
+    }
+    const auto display = log_display(entry.str);
+    const auto lines = display_lines(display.text);
+    log_scroll_ = std::clamp(log_scroll_, 0, message_scroll_limit(lines.size()));
+    const auto& rgb = engine_fct(entry.color);
+    const float x = message_text_x();
+    float y = message_text_y();
+    for (std::size_t index = static_cast<std::size_t>(log_scroll_);
+         index < lines.size() && y + text_line_height() <= message_bottom_y
+                                     + 0.5f;
+         ++index) {
+        font_.draw(renderer_, x + 2.0f, y + 2.0f, lines[index], 0, 0, 0);
+        font_.draw(renderer_, x, y, lines[index], rgb[2], rgb[1], rgb[0]);
+        y += text_line_height();
+    }
+    // TXT_WINDOW+2: the voiced line under the pointer, over the entry in
+    // FCT[11].
+    const int hover = msg().log_voice_hover();
+    const auto& spans = msg().log_voice_spans();
+    if (hover >= 0 && hover < static_cast<int>(spans.size())) {
+        const auto& voiced = engine_fct(msg().log_voice_text().color);
+        const auto [from, to] = log_voiced_span(
+            entry.str, spans[static_cast<std::size_t>(hover)].first);
+        for (const auto& rect : log_span_rects(entry.str, from, to)) {
+            const auto row = static_cast<std::size_t>(std::lround(
+                (rect.y - message_text_y()) / text_line_height()))
+                + static_cast<std::size_t>(log_scroll_);
+            if (row >= lines.size()) {
+                continue;
+            }
+            const SDL_Rect clip{
+                static_cast<int>(std::floor(rect.x)),
+                static_cast<int>(std::floor(rect.y)),
+                static_cast<int>(std::ceil(rect.w)) + 1,
+                static_cast<int>(std::ceil(rect.h))};
+            SDL_SetRenderClipRect(renderer_, &clip);
+            font_.draw(renderer_, x + 2.0f, rect.y + 2.0f, lines[row], 0, 0,
+                       0);
+            font_.draw(renderer_, x, rect.y, lines[row], voiced[2],
+                       voiced[1], voiced[0]);
+            SDL_SetRenderClipRect(renderer_, nullptr);
+        }
+    }
+    draw_scrollbar(lines.size(), log_scroll_, message_scroll_dragging_);
+}
+
 void Game::raise_half_tone()
 {
     // AVG_SetHalfTone(), in avg_msg.cpp.
@@ -220,38 +392,58 @@ void Game::update_half_tone()
     // calls it from AVG_GAME and AVG_CONFIG and from nowhere else, so the
     // save and load menus freeze the wash where it is rather than resetting
     // it - which is why opening the save menu used to take the wash away.
-    if (ui_mode_ != UiMode::game && ui_mode_ != UiMode::system_menu
-        && ui_mode_ != UiMode::backlog) {
+    if (ui_mode_ != UiMode::game) {
         return;
     }
 }
 
+bool Game::scroll_overflowing_text(int direction)
+{
+    // The port's one extra on the text: at a size where a page no longer
+    // fits, it scrolls.  Only within the page - at either end it stops,
+    // and the wheel never carries on into the log.  False when there is
+    // nothing overflowing here, so the input is the engine's after all.
+    if (ui_mode_ != UiMode::game || font_.authentic()) {
+        return false;
+    }
+    if (log_entry_shown()) {
+        const int limit = message_scroll_limit(
+            display_lines(log_display(msg().log_text().str).text).size());
+        if (limit <= 0) {
+            return false;
+        }
+        log_scroll_ = std::clamp(log_scroll_ + direction, 0, limit);
+        msg().refresh_log_voice_rects();
+        return true;
+    }
+    if (!message_shown() || message_.empty()) {
+        return false;
+    }
+    const int limit =
+        message_scroll_limit(display_lines(message_.visible()).size());
+    if (limit <= 0) {
+        return false;
+    }
+    message_scroll_ = std::clamp(message_scroll_ + direction, 0, limit);
+    // Back at the bottom it follows the newest text again.
+    message_scroll_follow_ = message_scroll_ == limit;
+    return true;
+}
+
 bool Game::handle_message_scroll_press(float x, float y)
 {
-    if (ui_mode_ != UiMode::game || !message_shown() || message_.empty()
-        || !on_scrollbar(x, y)
-        || message_scroll_limit(
-               display_lines(message_.visible()).size()) <= 0) {
+    if (ui_mode_ != UiMode::game || font_.authentic() || !on_scrollbar(x, y)) {
+        return false;
+    }
+    const std::size_t lines = log_entry_shown()
+        ? display_lines(log_display(msg().log_text().str).text).size()
+        : (message_shown() && !message_.empty()
+               ? display_lines(message_.visible()).size() : 0);
+    if (message_scroll_limit(lines) <= 0) {
         return false;
     }
     message_scroll_dragging_ = true;
     set_message_scroll_from_y(y);
-    return true;
-}
-
-void Game::set_backlog_scroll_from_y(float y)
-{
-    backlog_scroll_ = scroll_from_y(y, backlog_view_lines().size());
-}
-
-bool Game::handle_backlog_scroll_press(float x, float y)
-{
-    if (!on_scrollbar(x, y)
-        || message_scroll_limit(backlog_view_lines().size()) <= 0) {
-        return false;
-    }
-    backlog_scroll_dragging_ = true;
-    set_backlog_scroll_from_y(y);
     return true;
 }
 
@@ -696,6 +888,34 @@ void Game::trace_dump_frame()
     }
 }
 
+void Game::trace_dump_subtick_frame()
+{
+    // TH2_SUBTICK_DUMP=dir: the frame drawn between this tick and the next
+    // (TH2_SUBTICK_TEST_PHASE), as sNNNNNN.bmp, on the ticks the trace dumps.
+    static const char* const dir = SDL_getenv("TH2_SUBTICK_DUMP");
+    if (!dir || !subtick_drawn_ || trace_tick_ < trace_first_tick_) {
+        return;
+    }
+    static const long frame_step = [] {
+        const char* v = SDL_getenv("TH2_FRAME_STEP");
+        const long n = v ? std::strtol(v, nullptr, 10) : 1;
+        return n < 1 ? 1 : n;
+    }();
+    if ((static_cast<long>(trace_tick_) % frame_step) != 0) {
+        return;
+    }
+    SDL_SetRenderTarget(renderer_, subtick_art_.get());
+    const SDL_Rect rect{0, 0, 800, 600};
+    Surface pixels(SDL_RenderReadPixels(renderer_, &rect));
+    SDL_SetRenderTarget(renderer_, nullptr);
+    if (pixels) {
+        char name[32];
+        std::snprintf(name, sizeof name, "/s%06llu.bmp",
+                      static_cast<unsigned long long>(trace_tick_));
+        SDL_SaveBMP(pixels.get(), (std::string(dir) + name).c_str());
+    }
+}
+
 void Game::present_frame()
 {
     // The art layer is 800x600, which is exactly what the reference build
@@ -705,6 +925,7 @@ void Game::present_frame()
     // correctness is carried by NovelMessage.count rather than by glyphs.
     if (trace_mode_) {
         trace_dump_frame();
+        trace_dump_subtick_frame();
         // and then fall through and present like any other frame.
         //
         // Returning here instead looked free - nothing watches the window in
@@ -752,6 +973,7 @@ void Game::reset_render_state()
         upscaler_->reset();
     }
     shake_target_.reset();
+    subtick_art_.reset();
     display().release_bmp(th2::bmp_back);
     background_baked_dirty_ = true;
     art_cleared_for_ = nullptr;
@@ -922,6 +1144,12 @@ void Game::rebuild_baked_background()
 
 void Game::draw_frame()
 {
+    // Whatever a frame between ticks set up for drawing, it is gone again
+    // before anything else - the next tick above all - can see it.
+    struct EndPresentation {
+        Game& game;
+        ~EndPresentation() { game.end_presentation(); }
+    } end_presentation_guard{*this};
 
     // present() composites these two layers over the art on every path, so
     // they have to start empty here rather than in the game-mode branch
@@ -957,11 +1185,24 @@ void Game::draw_frame()
     // background's source offset for free and nothing needs saying.
     const bool shake_characters = back().sk_flag
         && (back().sk_type == 0 || back().sk_type == 15);
-    if (shake_characters) {
+    // One draw into the art target per tick, as MAIN_DrawControl is one per
+    // MAIN_Loop tick.  The target is never cleared, and some draws blend
+    // onto what the last one left - a background zoom with no snapshot, the
+    // map's frame, the calendar's page building up over the last picture -
+    // so drawing the same tick a second time over its own result is not a
+    // repaint: at 120Hz it ran those effects twice as fast.  A frame with no
+    // tick in it leaves the art as the tick drew it; the layers over it are
+    // rebuilt from state, which is the same every time.  The port's own
+    // screens animate on the wall clock and always draw.
+    const bool art_current = !tick_this_frame_
+        && art_cleared_for_ == art_target
+        && (ui_mode_ == UiMode::game || ui_mode_ == UiMode::map)
+        && !movie_ && !name_input_open_;
+    if (shake_characters && !art_current) {
         chars().set_char_pos_shake(
             static_cast<int>(shake.x), static_cast<int>(shake.y), 1);
     }
-    if (background_baked_dirty_) {
+    if (background_baked_dirty_ && !art_current) {
         rebuild_baked_background();
     }
     // SHAKE_ALL_* is DSP_SetGraphGlobalPos( x, y ) in AVG_ControlShake and
@@ -1046,7 +1287,9 @@ void Game::draw_frame()
     // frame's DRW_BLD landed on the last one's clock and the fade-out never
     // faded.
     if (ui_mode_ == UiMode::map && !clock_state_) {
-        draw_map(false);
+        if (!art_current) {
+            draw_map(false);
+        }
         begin_overlay();
         draw_map(true);
         draw_script_position();
@@ -1054,65 +1297,142 @@ void Game::draw_frame()
         present_frame();
         return;
     }
-    // GRP_WORK, at layer 0:
-    //     DSP_SetGraphPrim( GRP_WORK, PRM_FLAT, POL_RECT, 0, ON );
-    //     DSP_SetGraphPosRect( GRP_WORK, 0, 0, DISP_X, DISP_Y );
-    //     DSP_SetGraphFade( GRP_WORK, 0 );
-    // A black rectangle under the background, for the shakes that move it.
-    if (shake_work_rect) {
-        display().set_graph_prim(
-            th2::grp_work, th2::GraphType::flat, th2::Poly::rect, 0, true);
-        display().set_graph_pos_rect(
-            th2::grp_work, 0, 0, th2::display_width, th2::display_height);
-        display().set_graph_fade(th2::grp_work, 0);
-    } else {
-        display().reset_graph(th2::grp_work);
+    // The calendar's page is the engine's art too: it builds up over the
+    // last picture (see below), so outside a trace it is drawn here rather
+    // than on the overlay, which is cleared every frame.  In a trace the
+    // overlay already is the art target.
+    const bool calendar_in_art = calendar_state_ && !clock_state_
+        && !trace_mode_;
+    // The art pass, into `target`: the art target on a tick, its copy on a
+    // frame between ticks (see below).
+    const auto draw_art = [&](SDL_Texture* target) {
+        renew_wipe_backdrop(target);
+        SDL_SetRenderTarget(renderer_, target);
+        SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
+        // GRP_WORK, at layer 0:
+        //     DSP_SetGraphPrim( GRP_WORK, PRM_FLAT, POL_RECT, 0, ON );
+        //     DSP_SetGraphPosRect( GRP_WORK, 0, 0, DISP_X, DISP_Y );
+        //     DSP_SetGraphFade( GRP_WORK, 0 );
+        // A black rectangle under the background, for the shakes that move it.
+        if (shake_work_rect) {
+            display().set_graph_prim(
+                th2::grp_work, th2::GraphType::flat, th2::Poly::rect, 0, true);
+            display().set_graph_pos_rect(
+                th2::grp_work, 0, 0, th2::display_width, th2::display_height);
+            display().set_graph_fade(th2::grp_work, 0);
+        } else {
+            display().reset_graph(th2::grp_work);
+        }
+        // GRP_BACK at LAY_BACK, with the shake's transform on it, and the
+        // darkened copy next door at LAY_BACK+2 with the same transform.
+        setup_background_graphs(shake, shake_background, shake_characters);
+        // Not under a calendar: AVG_SetCalender's AVG_ResetBack( 0 ) leaves no
+        // background at all, and the engine draws nothing where there is none -
+        // its framebuffer keeps the last frame, which is what the page's
+        // DRW_BLD( count*16 ) fade-in builds up on.  Painted black here instead,
+        // every frame of the fade was the page over black: 3/4 brightness on its
+        // twelfth frame, where the reference's was all but solid.
+        if (!display().bmp_flag(th2::bmp_back2) && bg_scene_ == 0
+            && !calendar_state_) {
+            SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
+            const SDL_FRect game_area{0.0f, 0.0f, 800.0f, 600.0f};
+            SDL_RenderFillRect(renderer_, &game_area);
+        }
+        // DSP_DrawGraph: layers 0 to LAYER_MAX, every visible graph on each.
+        // Everything in the art pass is a graph now - GRP_WORK at 0, GRP_BACK at
+        // LAY_BACK, the script's overlays wherever SetBmpEx put them, GRP_BACK+1
+        // at LAY_BACK+2 and the live characters at LAY_CHAR - so the ordering is
+        // the layer numbers rather than a sequence of bands written out here.
+        //
+        // A wipe is the one thing that is not a graph yet.  It goes in at
+        // LAY_BACK, where AVG_SetBack parks the outgoing snapshot: the
+        // characters and overlays of the new moment draw over it rather than
+        // fading in with it.
+        display().draw(
+            target,
+            [this](int layer) {
+                // The wipes the display layer can express are already on screen
+                // by now - the snapshot is a graph at LAY_BACK and the incoming
+                // background one at LAY_BACK+1.  What is left here is the
+                // pattern wipes, which need their mask, and the handful of
+                // types no script uses.
+                if (layer == th2::lay_back && !transition_drives_graphs()) {
+                    draw_active_transition();
+                }
+            });
+        if (calendar_in_art) {
+            draw_clock_calendar();
+        }
+    };
+    if (!art_current) {
+        draw_art(art_target);
     }
-    // GRP_BACK at LAY_BACK, with the shake's transform on it, and the
-    // darkened copy next door at LAY_BACK+2 with the same transform.
-    setup_background_graphs(shake, shake_background, shake_characters);
-    // Not under a calendar: AVG_SetCalender's AVG_ResetBack( 0 ) leaves no
-    // background at all, and the engine draws nothing where there is none -
-    // its framebuffer keeps the last frame, which is what the page's
-    // DRW_BLD( count*16 ) fade-in builds up on.  Painted black here instead,
-    // every frame of the fade was the page over black: 3/4 brightness on its
-    // twelfth frame, where the reference's was all but solid.
-    if (!display().bmp_flag(th2::bmp_back2) && bg_scene_ == 0
-        && !calendar_state_) {
-        SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
-        const SDL_FRect game_area{0.0f, 0.0f, 800.0f, 600.0f};
-        SDL_RenderFillRect(renderer_, &game_area);
+    // A frame between two ticks: the ramps that are running, `phase` of
+    // the way to the next tick (src/game_subtick.cpp).  Drawn into a copy
+    // of the art target, never into it - the next tick builds on exactly
+    // what the last one drew, as the original's framebuffer does.
+    const double phase = presentation_phase();
+    if (phase > 0.0) {
+        present_scene_ = subtick_scene_steps();
+        present_menu_ = subtick_menu_steps();
     }
-    // DSP_DrawGraph: layers 0 to LAYER_MAX, every visible graph on each.
-    // Everything in the art pass is a graph now - GRP_WORK at 0, GRP_BACK at
-    // LAY_BACK, the script's overlays wherever SetBmpEx put them, GRP_BACK+1
-    // at LAY_BACK+2 and the live characters at LAY_CHAR - so the ordering is
-    // the layer numbers rather than a sequence of bands written out here.
-    //
-    // A wipe is the one thing that is not a graph yet.  It goes in at
-    // LAY_BACK, where AVG_SetBack parks the outgoing snapshot: the
-    // characters and overlays of the new moment draw over it rather than
-    // fading in with it.
-    display().draw(
-        art_target,
-        [this](int layer) {
-            // The wipes the display layer can express are already on screen
-            // by now - the snapshot is a graph at LAY_BACK and the incoming
-            // background one at LAY_BACK+1.  What is left here is the
-            // pattern wipes, which need their mask, and the handful of
-            // types no script uses.
-            if (layer == th2::lay_back && !transition_drives_graphs()) {
-                draw_active_transition();
+    const bool art_moving = present_menu_
+        || (present_scene_
+            && (character_animation_active() || back().fd_flag
+                || back().br_flag || back().sc_flag
+                || msg().half_tone().tstep == th2::tone_fadeout));
+    if (art_moving) {
+        if (SDL_Texture* const scratch = ensure_subtick_art()) {
+            SDL_SetRenderTarget(renderer_, scratch);
+            SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
+            SDL_BlendMode blend = SDL_BLENDMODE_BLEND;
+            SDL_GetTextureBlendMode(art_target, &blend);
+            SDL_SetTextureBlendMode(art_target, SDL_BLENDMODE_NONE);
+            SDL_RenderTexture(renderer_, art_target, nullptr, nullptr);
+            SDL_SetTextureBlendMode(art_target, blend);
+            presentation_phase_ = phase;
+            const auto& bk = back();
+            scroll_present_extra_ = present_scene_ && bk.sc_flag
+                    && bk.sc_cnt + 1 < effect_frames4(bk.sc_max)
+                ? phase : 0.0;
+            display().set_presenter(
+                [this](int gno, th2::Graph& graph) {
+                    present_graph(gno, graph);
+                });
+            draw_art(scratch);
+            display().set_presenter({});
+            if (scroll_present_extra_ > 0.0) {
+                // setup_background_graphs writes the graphs it sets up;
+                // put them back as a tick leaves them.
+                scroll_present_extra_ = 0.0;
+                setup_background_graphs(
+                    shake, shake_background, shake_characters);
             }
-        });
-    if (ui_mode_ == UiMode::system_menu) {
-        draw_system_menu();
-    } else if (ui_mode_ == UiMode::save || ui_mode_ == UiMode::load) {
+            upscaler_->set_art_source(scratch);
+            subtick_drawn_ = true;
+        }
+    }
+    if (present_scene_ && !trace_mode_) {
+        // The text and the screen's own layers, which are drawn afresh
+        // every frame anyway - except in a trace, where they are drawn into
+        // the art target itself.
+        presentation_phase_ = phase;
+        msg().set_presentation_phase(phase);
+        if (choosing_ && !choice_reveal_finished()) {
+            const int step = message_count_step();
+            if (step > 0 && step < 9999) {
+                choice_present_extra_ = phase * step;
+            }
+        }
+    }
+    if (ui_mode_ == UiMode::save || ui_mode_ == UiMode::load) {
         draw_save_load();
     }
     begin_overlay();
     if (clock_state_ || calendar_state_) {
-        draw_clock_calendar();
+        if (!calendar_in_art) {
+            draw_clock_calendar();
+        }
         draw_script_position();
 
         present_frame();
@@ -1127,7 +1447,7 @@ void Game::draw_frame()
         && message_shown() && !message_.empty()
         // DSP_SetTextDisp( TXT_WINDOW, ... ), which the engine's log turns
         // off while an older entry is up in its place.
-        && (!msg().engine_bar() || msg().main_text_disp())) {
+        && msg().main_text_disp()) {
         // The engine's layout goes with the engine's font: the box, the
         // wrap and the overflow clip are all in units of SYS_FONT, so they
         // only mean anything at that size.
@@ -1350,12 +1670,16 @@ void Game::draw_frame()
             lines.size(), message_scroll_, message_scroll_dragging_);
         }
     }
-    if (ui_mode_ == UiMode::game && msg().engine_bar()) {
+    if (ui_mode_ == UiMode::game) {
         // The engine's log: TXT_WINDOW+1 at LAY_WINDOW+1, the entry being
         // read, and TXT_WINDOW+2 at LAY_WINDOW+2, the voiced line under the
         // pointer drawn over it in another colour.
-        draw_engine_text(msg().log_text());
-        draw_engine_text(msg().log_voice_text());
+        if (font_.authentic()) {
+            draw_engine_text(msg().log_text());
+            draw_engine_text(msg().log_voice_text());
+        } else {
+            draw_log_modern();
+        }
     }
     if (ui_mode_ == UiMode::game
         && message_shown() && choosing_ && !choices_.empty()) {
@@ -1386,8 +1710,16 @@ void Game::draw_frame()
             const std::string text = choice_engine_text(i);
             for (std::size_t k = 0; k < counted.glyph_x.size()
                  && k < counted.glyph_off.size(); ++k) {
+                // Between ticks the count is choice_present_extra_ further
+                // on (see draw_frame); on a tick it is exactly the engine's.
                 const int alpha = count < 0 ? 256
-                    : std::clamp(count - counted.glyph_count[k], 0, 16) * 16;
+                    : choice_present_extra_ > 0.0
+                        ? static_cast<int>(std::floor(std::clamp(
+                              count + choice_present_extra_
+                                  - counted.glyph_count[k],
+                              0.0, 16.0) * 16))
+                        : std::clamp(count - counted.glyph_count[k], 0, 16)
+                            * 16;
                 if (alpha <= 0) {
                     continue;
                 }
@@ -1445,18 +1777,10 @@ void Game::draw_frame()
     if (ui_mode_ == UiMode::game) {
         draw_click_indicator();
     }
-    if (ui_mode_ == UiMode::backlog) {
-        draw_backlog();
-    }
     select_sidebar();
     // ControlHistorySystem: if( NovelMessage.disp && !Avg.demo ) - the bar
     // is not put up while a demo (SetDemoFlag) is running the scene.
-    if (msg().engine_bar()) {
-        if (ui_mode_ == UiMode::game && msg().history_bar().shown) {
-            draw_sidebar();
-        }
-    } else if ((ui_mode_ == UiMode::game || ui_mode_ == UiMode::backlog)
-               && message_shown() && !demo_mode_) {
+    if (ui_mode_ == UiMode::game && msg().history_bar().shown) {
         draw_sidebar();
     }
     select_overlay();
