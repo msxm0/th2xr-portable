@@ -168,7 +168,12 @@ public:
     void run_tick();
 private:
     // 27: the engine's NovelBuf replaces the port's backlog.
-    static constexpr std::uint32_t save_version_ = 27;
+    // 28: the message as the engine's own save keeps it (AvgMsg::SaveData)
+    // in place of the port's Message.
+    // 29: no auto or skip mode - a load always comes back with both off,
+    // as the original's does (neither is in AVG_SAVE_DATA).
+    // 30: whether the map was up (MapStep).
+    static constexpr std::uint32_t save_version_ = 30;
     static constexpr std::uint32_t oldest_supported_save_version_ = 27;
     static bool is_confirm_key(SDL_Keycode key);
     static bool is_alt_enter(const SDL_KeyboardEvent& key);
@@ -286,6 +291,9 @@ private:
         // AVG_EffCnt(fd_max) as it stands at that moment - zero under a held
         // skip key.  See begin_transition.
         bool no_snapshot = false;
+        // A cross-fade of the port's own screens (EffectTiming::menu), not a
+        // change of the scene: save() does not wait for it.
+        bool menu = false;
     };
     struct BackgroundFade {
         std::array<float, 3> from{128.0f, 128.0f, 128.0f};
@@ -561,6 +569,9 @@ private:
     int bgm_track_ = -1;
     bool bgm_loop_ = false;
     int bgm_volume_ = 255;
+    // PlayMusicVol: the volume the track was started at, which is what a
+    // save keeps - AVG_SetVolumeBGM (MV) changes the playing volume only.
+    int play_music_vol_ = 255;
     std::array<th2::AudioChannel, 8> transient_se_{};
     std::array<int, 8> transient_se_volume_{};
     std::array<th2::AudioChannel, 16> se_channels_{};
@@ -834,6 +845,13 @@ private:
     std::optional<ShakeState> shake_;
     Texture shake_target_;
     Texture pose_blend_target_;
+    // FadeStruct's GRP_DISP in a trace: the frame so far, drawn back over
+    // itself with the fade's brightness through BrightTable.
+    Texture fade_scratch_;
+    bool draw_exact_fade();
+    // The save/load window while it fades: drawn here, then put down at
+    // the window's DRW_BLD.
+    Texture save_layer_target_;
     // Set while a character animation has the message window hidden.
     float half_tone_count_ = 0.0f;
     // AVG_SetHalfTone() is called when a message is set, not every frame the
@@ -1437,6 +1455,10 @@ private:
     // and the slots whose thumbnail file waits for it.
     bool snapshot_keep_ = false;
     std::vector<int> snapshot_slots_;
+    // An autosave's thumbnail, taken once the frame it was made in has been
+    // drawn (capture_autosave_thumbnail, after draw()).
+    bool snapshot_after_draw_ = false;
+    void capture_autosave_thumbnail();
     static constexpr int save_thumbnail_width = 160;
     static constexpr int save_thumbnail_height = 120;
     Texture texture_from_surface(SDL_Surface* surface);
@@ -1526,6 +1548,14 @@ private:
     EngineConfigState engine_config_{};
     int engine_config_select_back_ = 0;   // AVG_ControlConfigWindow's static
     int engine_config_open_mode_ = 0;     // ConfigOpenMode
+    // BackStep == AVG_MAP: the menu was opened over the map, which it hides
+    // and goes back to, with nothing of the scene to close or reopen.
+    bool engine_config_from_map_ = false;
+    // MapEventConfigFlag: the map is in its step 3, taking clicks.
+    bool map_config_ready() const;
+    // A save made on the map (AVG_SAVE_DATA's MapStep): a load of it goes
+    // back to the map rather than the scene.
+    bool loaded_on_map_ = false;
     int engine_config_mouse_ = 0;         // Config.mouse
     // AvgStep[0] == AVG_CONFIG, and AVG_ChangeSetp's pending change, which
     // AVG_RenewSetp applies at the end of the frame.
@@ -1581,7 +1611,24 @@ private:
     // resume_script() asked for, before any of the update_ pass.
     void pump_script();
     void save(int slot);
+    bool steady_for_save() const;
+    // AVG_SetLoad / AVG_ControlLoad: a load fades the screen to black, swaps
+    // the scene while it is black, and fades back in before the script runs.
+    enum class LoadStep { none, fadeout, work, fadein };
+    LoadStep load_step_ = LoadStep::none;
+    // AVG_ChangeSetp( 1, ... ) from outside AVG_ControlLoad: it takes effect
+    // at AVG_RenewSetp, the end of the tick.
+    std::optional<LoadStep> load_step_next_;
+    // LOAD_WORK turns every graph below GRP_DISP off, the bar and the petals
+    // with the rest, for the tick it runs on; their own control passes put
+    // them back on the next.
+    bool load_work_tick_ = false;
+    int load_slot_ = -1;
+    bool save_loadable(int slot) const;
+    void begin_load(int slot);
+    void control_load();
     bool load(int slot);
+    std::filesystem::path save_directory() const;
     std::filesystem::path save_path(int slot) const;
     std::filesystem::path thumbnail_path(int slot) const;
     std::filesystem::path metadata_path(int slot) const;
@@ -1734,7 +1781,6 @@ private:
     // Drops the hover highlights a lifted finger left behind.
     void clear_pointer_highlights();
     void open_save_load(UiMode mode);
-    void close_save_load();
     void draw_save_digit_sheet_text(
         float x, float y, std::string_view text,
         std::uint8_t red = 255, std::uint8_t green = 255,
@@ -1836,12 +1882,44 @@ private:
     void activate_replay_gallery_item();
     void handle_replay_gallery_input(const SDL_Event& event);
     void draw_save_load();
-    int save_load_hit(float x, float y) const;
     bool save_load_item_enabled(int item) const;
     void ensure_save_load_focus();
     void move_save_load_focus(SDL_Keycode key);
-    void activate_save_load_item(int item);
     void handle_save_load_input(const SDL_Event& event);
+
+    // GM_Window.cpp's save and load window, transcribed: SAVE_WINDOW and
+    // GWIN_*SaveLoadWindow.  The machine is the engine's - its counts, its
+    // mouse rects on the engine's layers, GameKey for its input - so a trace
+    // drives it as the reference's is driven.  The picture is still the
+    // port's own (draw_save_load), which reads the machine's state.
+    struct SaveWindowState {
+        bool flag = false;
+        bool load = false;          // type: SW_LOAD_MODE
+        bool title_load = false;    // TitleLoad
+        int cnt = 0;
+        int mode = 0;
+        int select = -1;            // SaveWindow.select: the slot asked about
+        bool load_flag = false;
+        bool save_flag = false;
+        int page = 0;
+        int new_no = 0;
+        int mouse_layer = 1;        // MouseLayer
+        int mouse_layer_back = 0;   // MouseLayerBack
+        int rate = 0;               // the window's own fade, 0..256
+        int rate2 = 0;              // the confirmation's
+    };
+    SaveWindowState save_window_;
+    void gwin_set_save_load_window(bool load, int mouse_layer,
+                                   int mouse_layer_back, bool title_load);
+    void gwin_renew_save_load_window();
+    void gwin_reset_save_load_window();
+    bool gwin_set_save_load_check(int select);
+    void gwin_reset_save_load_check();
+    int gwin_control_save_load_window();
+    // AVG_ControlSystem: the menu's window, then the save/load window, and
+    // what the latter's answer means for the step.
+    void control_system();
+    void engine_open_config_window();   // AVG_OpenConfigWindow
     void change_map_field(int direction);
     void update_map_hover(float x, float y);
     bool map_hover_on_page() const;
@@ -1967,6 +2045,14 @@ private:
     // the original blends the pair inside one sprite.  False when the
     // renderer cannot do it, so the caller falls back.
     bool ensure_pose_blend_target();
+    // Draws `draw` at DRW_BLD(alpha), alpha 0..256, through
+    // save_layer_target_ when it is not opaque.
+    template <typename Draw>
+    void draw_save_layer(int alpha, Draw&& draw);
+    void draw_save_load_frame();
+    void draw_save_load_buttons();
+    void draw_save_load_slots();
+    void draw_save_load_prompt();
     bool draw_pose_dissolve(
         SDL_Texture* next, SDL_Texture* previous, float progress,
         Uint8 brightness, int alpha, const SDL_FRect& destination);

@@ -85,18 +85,38 @@ bool Game::engine_config_check() const
     const bool novel_config = m.step1 == th2::msg_wait
         || m.step1 == th2::msg_stop
         || (m.step1 == th2::msg_next && select);
-    const bool go_flag = (select || m.flag != 0) && novel_config;
+    // go_flag = AVG_ChexkMapEventConfig() || go_flag;
+    const bool go_flag = map_config_ready()
+        || ((select || m.flag != 0) && novel_config);
     return bk_flag && char_flag && sl_flag && fd_flag && wf_flag && go_flag;
+}
+
+bool Game::map_config_ready() const
+{
+    // AVG_ControlMapEvent sets MapEventConfigFlag at the top of case 3 - the
+    // map up and taking clicks, rolling between pages or not - and clears it
+    // on every other step.
+    return ui_mode_ == UiMode::map && !clock_state_ && map_enter_ticks_ == 0
+        && !map_enter_finished_this_frame_ && map_fade_ticks_ == 0
+        && !map_finish_pending_ && map_selected_ < 0;
 }
 
 void Game::engine_go_config(int mode)
 {
-    // void AVG_GoConfig( int mode ), from AVG_GAME.
-    script_flag_ = false;                       // MAIN_SetScriptFlag( OFF )
-    msg().close_window_for_config();            // AVG_CloseWindow(1)
-    chars().close_char();                       // AVG_CloseChar()
-    msg().set_half_tone();                      // AVG_SetHalfTone()
-    engine_close_back();                        // AVG_CloseBack()
+    // void AVG_GoConfig( int mode ):
+    //     if(AvgStep[0]==AVG_MAP){ AVG_CloseMapEvent(); }
+    //     if(AvgStep[0]==AVG_GAME){ MAIN_SetScriptFlag( OFF ); ...
+    // AVG_CloseMapEvent turns the map's graphs off; ours stops drawing the
+    // map while the menu's window is up (draw_frame) and stops stepping it
+    // while the engine is in the config step (run_tick).
+    engine_config_from_map_ = ui_mode_ == UiMode::map;
+    if (!engine_config_from_map_) {
+        script_flag_ = false;                   // MAIN_SetScriptFlag( OFF )
+        msg().close_window_for_config();        // AVG_CloseWindow(1)
+        chars().close_char();                   // AVG_CloseChar()
+        msg().set_half_tone();                  // AVG_SetHalfTone()
+        engine_close_back();                    // AVG_CloseBack()
+    }
     // AVG_FadeOutVoiceAll( 30 ): every voice that is playing, down to
     // nothing over thirty frames.
     for (std::size_t i = 0; i < voice_channels_.size(); ++i) {
@@ -166,6 +186,7 @@ void Game::engine_config_loaded()
     engine_config_ = {};
     engine_config_step_ = false;
     engine_config_step_next_.reset();
+    engine_config_from_map_ = false;
 }
 
 void Game::engine_close_back()
@@ -249,10 +270,14 @@ void Game::engine_set_config_window()
             display().set_graph_fade(g + 1 + i, 64);
         }
     }
-    // MapStep: the menu was opened from the map, where hiding the text
-    // means nothing.  A trace only opens it from a message.
+    //     if(MapStep){ MUS_SetMouseRect( 1, 2, ..., OFF );
+    //                  DSP_SetGraphFade( GRP_SYSTEM+1+2, 64 ); }
+    // Hiding the text means nothing on the map.
     m.set_mouse_rect(1, 2, cnf_cons[2].x, cnf_cons[2].y, cnf_cons[2].w,
-                     cnf_cons[2].h, true);
+                     cnf_cons[2].h, !engine_config_from_map_);
+    if (engine_config_from_map_) {
+        display().set_graph_fade(g + 1 + 2, 64);
+    }
     for (int i = 3; i < 5; ++i) {
         m.set_mouse_rect(1, i, cnf_cons[i].x, cnf_cons[i].y, cnf_cons[i].w,
                          cnf_cons[i].h, true);
@@ -276,10 +301,17 @@ void Game::engine_reset_config_window()
 
 void Game::engine_end_config()
 {
-    // void AVG_EndConfig( void ), BackStep == AVG_GAME.
-    script_flag_ = true;
-    msg().open_window_for_config();   // AVG_OpenWindow( ON, 1 )
-    engine_open_back();
+    // void AVG_EndConfig( void ):
+    //     if(BackStep==AVG_GAME){ MAIN_SetScriptFlag( ON ); ...OpenWindow,
+    //                             AVG_OpenBack(); }
+    //     AVG_ChangeSetp( 0, BackStep );
+    // Back to the map, the map's step 3 shows its graphs again by itself.
+    if (!engine_config_from_map_) {
+        script_flag_ = true;
+        msg().open_window_for_config();   // AVG_OpenWindow( ON, 1 )
+        engine_open_back();
+    }
+    engine_config_from_map_ = false;
     engine_config_step_next_ = false;  // AVG_ChangeSetp( 0, BackStep )
 }
 
@@ -428,10 +460,10 @@ void Game::control_engine_config()
                     // CNF_NEXT_SAVE / CNF_NEXT_LOAD / CNF_NEXT_SIDE, kept as
                     // AVG_GoConfig's page numbers.
                     play_system_se(9014, 255);
-                    if (trace_mode_) {
+                    if (trace_mode_ && select == 3) {
                         // See hooks.go_config: a replay could never leave
-                        // the port's screen, and the reference's is not
-                        // ours.
+                        // the port's settings screen, and the reference's
+                        // is not ours.
                         SDL_Log("engine config: button %d opens a screen "
                                 "that is not transcribed", select);
                         break;

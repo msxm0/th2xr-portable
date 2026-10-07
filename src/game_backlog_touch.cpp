@@ -239,9 +239,7 @@ void Game::handle_touch_actions()
         // The back button: closes whichever of the port's screens is up,
         // and in the scene is the escape key, GameKey.cansel - the engine's
         // menu, or out of it.
-        if (ui_mode_ == UiMode::save || ui_mode_ == UiMode::load) {
-            close_save_load();
-        } else if (config_open_) {
+        if (config_open_) {
             close_config();
         } else if (scene) {
             tap_key("esc");
@@ -274,29 +272,15 @@ void Game::open_save_load(UiMode mode)
     if (!has_save_snapshot()) {
         capture_save_snapshot();
     }
-    save_return_mode_ =
-        ui_mode_ == UiMode::title ? UiMode::title : UiMode::game;
-    begin_transition(1, 12, 128, false, EffectTiming::menu);
+    save_return_mode_ = ui_mode_ == UiMode::title ? UiMode::title
+        : ui_mode_ == UiMode::map ? UiMode::map : UiMode::game;
     ui_mode_ = mode;
-    save_confirm_slot_ = -1;
-    save_hover_ = -1;
-    load_error_.clear();
-    refresh_save_page();
-    if (newest_save_slot_ >= 0) {
-        save_page_ = newest_save_slot_ >= 100
-            ? 10 : newest_save_slot_ / 10;
-        refresh_save_page();
-    }
-    ensure_save_load_focus();
-}
-
-void Game::close_save_load()
-{
-    save_confirm_slot_ = -1;
-    load_error_.clear();
-    begin_transition(1, 12, 128, false, EffectTiming::menu);
-    ui_mode_ = save_return_mode_;
-    engine_port_screen_closed();
+    // GWIN_SetSaveLoadWindow's mouse layers: the menu's window owns layer 1
+    // (CNF_NEXT_OPEN passes 2, 1); the bar and the title, 1 and 0.
+    const bool title = save_return_mode_ == UiMode::title;
+    const bool from_menu = !title && engine_config_open_mode_ == 0;
+    gwin_set_save_load_window(mode == UiMode::load, from_menu ? 2 : 1,
+                              from_menu ? 1 : 0, title);
 }
 
 void Game::draw_save_digit_sheet_text(

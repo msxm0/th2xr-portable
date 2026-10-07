@@ -1285,15 +1285,16 @@ void Game::exec_control_lang(bool skipping)
             // stamps last_save_time_ off the same clock.
             const auto now = std::chrono::steady_clock::now();
             constexpr auto minimum_interval = std::chrono::minutes(2);
-            if (last_save_time_.time_since_epoch().count() == 0
-                || now - last_save_time_ >= minimum_interval) {
-                if (!has_save_snapshot()) {
-                    capture_save_snapshot();
-                }
-                perform_autosave();
-                // Refresh the save snapshot so the next autosave has an
-                // up-to-date thumbnail.
+            if ((last_save_time_.time_since_epoch().count() == 0
+                 || now - last_save_time_ >= minimum_interval)
+                && steady_for_save()) {
+                // The thumbnail is of this frame once it has been drawn, not
+                // of the art target as it stands mid-script: the first
+                // autosave comes at the first block end, before the scene
+                // has drawn anything, and its picture was the title screen.
                 reset_save_snapshot();
+                snapshot_after_draw_ = true;
+                perform_autosave();
             }
         }
     }

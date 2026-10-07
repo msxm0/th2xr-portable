@@ -45,6 +45,8 @@ public:
         authentic_text_content_ = authentic_text;
         sidebar_content_ = sidebar;
     }
+    bool authentic_text_content() const { return authentic_text_content_; }
+    bool sidebar_content() const { return sidebar_content_; }
 
     // The art to composite this frame instead of art_target(): a frame
     // drawn between two ticks is drawn into a copy, so the art target keeps

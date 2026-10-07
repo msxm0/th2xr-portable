@@ -73,6 +73,13 @@ struct NovelMessageState {
     int count = 0;      // the typewriter cursor, in TXT_GetTextCount units
     int kstep = 0;      // which \k step is being revealed
     int max = 0;        // the count this step stops at
+    // NovelMessage.str: written only by AVG_AddNovelMessage, with the log
+    // entry as it stood *before* the addition, and cleared with the rest by
+    // every AVG_SetNovelMessage.  It is what a save keeps as the line on
+    // screen (AVG_SetSaveDataNovelMessage), so a line with no \k addition
+    // is saved empty and comes back from a load as an empty window.  Not in
+    // a trace checkpoint (write_history).
+    std::string str;
 };
 
 // HALF_TONE
@@ -86,8 +93,13 @@ inline constexpr int nlog_max = 256;
 inline constexpr int nlog_v_max = 32;
 inline constexpr int mouse_rest_max = 64;
 // The mouse layers in use: 0 for the history bar and the log, 1 for the
-// system menu (MOUSE_LAYER_MAX is 48; nothing a trace reaches uses more).
-inline constexpr int mouse_layers = 2;
+// system menu, and the save/load window's 1..3 - its slots on 1 or 2, its
+// question one above (MOUSE_LAYER_MAX is 48; nothing a trace reaches uses
+// more).
+inline constexpr int mouse_layers = 4;
+// The layers a trace checkpoint carries: the bar's and the menu's, as the
+// format always has.  The save/load window is never up across one.
+inline constexpr int mouse_layers_saved = 2;
 // MUS_GetMouseNo's button argument.
 inline constexpr int mouse_any = -1;
 inline constexpr int mouse_lbutton = 0;
@@ -183,6 +195,8 @@ public:
         // page-end mark, over BMP_KEYWAIT+1, the line-end one.
         std::function<void(bool page)> set_keywait;
         std::function<void()> reset_keywait;
+        // AVG_GetLaodFlag(): AvgStep[1]!=LOAD_NOT, a load under way.
+        std::function<bool()> load_flag;
         std::function<void(int, int)> play_se;     // AVG_PlaySE3
         std::function<bool()> wait_voice;          // AVG_WaitVoice(0)
         std::function<bool()> hit_key;             // AVG_GetHitKey
@@ -363,7 +377,8 @@ public:
     // save is made from the engine's config, whose mouse layer and rects
     // are no part of the scene it goes back to.
     void write_log(std::ostream& out) const;
-    bool read_log(std::istream& in);
+    // With apply false the log is read past and dropped.
+    bool read_log(std::istream& in, bool apply = true);
     // A new game: an empty log.
     void clear_log();
 
@@ -465,6 +480,22 @@ public:
     bool text_end_key_wait() const { return end_key_wait_; }
 
     void init();  // InitNovelMessage
+
+    // AVG_SAVE_DATA's message fields, as AVG_SetSaveDataNovelMessage fills
+    // them - not the machine's state.  The engine's save normalises: the
+    // step is the one before a config took the window down (step2), the
+    // text loses its \k stops, and a load shows the whole of it at once.
+    struct SaveData {
+        int flag = 0;           // ms_flag
+        int add_flag = 0;       // ms_add
+        int step = msg_nodisp;  // ms_step1, which holds NovelMessage.step2
+        int count = 0;          // ms_count
+        int kstep = 0;          // ms_kstep
+        int max = 0;            // ms_max
+        std::string str;        // ms_str
+    };
+    SaveData save_data() const;                    // AVG_SetSaveDataNovelMessage
+    void load_save_data(const SaveData& data);     // AVG_SetLoadDataNovelMessage
 
 private:
     Display& display_;

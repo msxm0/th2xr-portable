@@ -88,6 +88,10 @@ cd "$HERE/run" || exit 1
 # fixed state or it is not a function of its input at all.  Harness scratch,
 # regenerated every run - not anybody's saved game.
 rm -f "$HERE/run/Sys.sav"
+# The same for the slots: GWIN_SetSaveLoadWindow opens on the newest save's
+# page and a save into an occupied slot asks first, so a run that inherits
+# the last run's saves takes different input paths.
+rm -f "$HERE"/run/save_*.sav
 stop_ref || exit 1
 # Whoever parks a reference says which one it is (window.sh); a fresh start
 # from here is nobody's until they do.

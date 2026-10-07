@@ -274,6 +274,7 @@ public:
 
     // AVG_SetFade / AVG_SetFlash / AVG_ColtrolFade / AVG_WaitFade.
     void set_fade(int r, int g, int b, int disp, int fade);
+    void set_bright(int r, int g, int b);                        // AVG_SetBright
     void set_flash(int r, int g, int b, int fade1, int fade2);
     void control_fade();
     bool wait_fade() const { return fade_.flag != 0; }

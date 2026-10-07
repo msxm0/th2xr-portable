@@ -1036,6 +1036,51 @@ bool Game::draw_pose_dissolve(
     return true;
 }
 
+bool Game::draw_exact_fade()
+{
+    // AVG_SetFade( ..., disp ON ): the screen goes into BMP_DISP and GRP_DISP
+    // shows it with DSP_SetGraphBright( GRP_DISP, FadeStruct.r, g, b ) - a
+    // DRW_NML blit through BrightTable, which an alpha fill over the frame
+    // misses by a level on most pixels.  In a trace the whole frame is the
+    // art target, so it is copied out and drawn back with that brightness by
+    // the same exact path DSP_CopyBmp2 takes.  Elsewhere the text and the
+    // overlay are layers of their own, and the fill is what darkens them.
+    auto* const gl = display().gl_exact_blend();
+    if (!gl || !gl->available() || !avg_back_) {
+        return false;
+    }
+    SDL_Texture* const art = upscaler_->art_target();
+    if (!fade_scratch_) {
+        fade_scratch_.reset(SDL_CreateTexture(
+            renderer_, art->format, SDL_TEXTUREACCESS_TARGET, art->w,
+            art->h));
+        if (!fade_scratch_) {
+            return false;
+        }
+    }
+    const auto& fade = avgback().fade();
+    int r = fade.r;
+    int g = fade.g;
+    int b = fade.b;
+    if (presentation_phase_ > 0.0) {
+        avgback().present_fade(presentation_phase_, r, g, b);
+    }
+    SDL_BlendMode held_mode = SDL_BLENDMODE_NONE;
+    SDL_GetTextureBlendMode(art, &held_mode);
+    SDL_SetTextureBlendMode(art, SDL_BLENDMODE_NONE);
+    SDL_SetRenderTarget(renderer_, fade_scratch_.get());
+    SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
+    SDL_RenderTexture(renderer_, art, nullptr, nullptr);
+    SDL_SetTextureBlendMode(art, held_mode);
+    SDL_SetRenderTarget(renderer_, art);
+    SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
+    const SDL_FRect whole{0.0f, 0.0f, static_cast<float>(art->w),
+                          static_cast<float>(art->h)};
+    return gl->capture_destination(renderer_)
+        && gl->draw(renderer_, fade_scratch_.get(), whole, whole, false,
+                    false, 0, 256, r, g, b);
+}
+
 bool Game::ensure_pose_blend_target()
 {
     if (pose_blend_target_) {
@@ -1292,7 +1337,10 @@ void Game::draw_frame()
     // ordinary path below.  Drawn over the map's empty frame instead, each
     // frame's DRW_BLD landed on the last one's clock and the fade-out never
     // faded.
-    if (ui_mode_ == UiMode::map && !clock_state_) {
+    // Not while the menu is up over it: AVG_CloseMapEvent turned the map's
+    // graphs off, and the menu's own come up by the ordinary path below.
+    if (ui_mode_ == UiMode::map && !clock_state_ && !engine_config_.flag
+        && !engine_config_step_) {
         if (!art_current) {
             draw_map(false);
         }
@@ -1786,18 +1834,13 @@ void Game::draw_frame()
     if (ui_mode_ == UiMode::game) {
         draw_click_indicator();
     }
-    select_sidebar();
-    // ControlHistorySystem: if( NovelMessage.disp && !Avg.demo ) - the bar
-    // is not put up while a demo (SetDemoFlag) is running the scene.
-    if (ui_mode_ == UiMode::game && msg().history_bar().shown) {
-        draw_sidebar();
-    }
+    // FadeStruct: GRP_DISP, the screen as it was, under every graph below it
+    // turned off.  The bar and the petals are not under it: their control
+    // passes (ControlHistorySystem, AVG_ControlWeather) turn their graphs
+    // back on every tick, so they stand over the fade at their own alpha -
+    // the bar fading itself in over a load's fade from black.
     select_overlay();
-    // The petals sit at LAY_WINDOW+10 in the original, above the characters
-    // and the message window alike, so they are drawn after the text rather
-    // than back with the scene.
-    draw_sakura();
-    if (screen_flash_) {
+    if (screen_flash_ && !(trace_mode_ && draw_exact_fade())) {
         SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
         SDL_SetRenderDrawColor(
             renderer_,
@@ -1806,6 +1849,20 @@ void Game::draw_frame()
             static_cast<Uint8>(screen_flash_->blue),
             static_cast<Uint8>(screen_flash_alpha() * 255.0f));
         SDL_RenderFillRect(renderer_, nullptr);
+    }
+    select_sidebar();
+    // ControlHistorySystem: if( NovelMessage.disp && !Avg.demo ) - the bar
+    // is not put up while a demo (SetDemoFlag) is running the scene.
+    if (ui_mode_ == UiMode::game && msg().history_bar().shown
+        && !load_work_tick_) {
+        draw_sidebar();
+    }
+    select_overlay();
+    // The petals sit at LAY_WINDOW+10 in the original, above the characters
+    // and the message window alike, so they are drawn after the text rather
+    // than back with the scene.
+    if (!load_work_tick_) {
+        draw_sakura();
     }
     draw_script_position();
     present_frame();

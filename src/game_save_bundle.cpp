@@ -48,6 +48,7 @@ void Game::reset_play_state()
     bgm_track_ = -1;
     bgm_loop_ = false;
     bgm_volume_ = 255;
+    play_music_vol_ = 255;
     for (auto& channel : transient_se_) {
         channel.stop();
     }

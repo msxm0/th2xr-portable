@@ -89,7 +89,23 @@ SDL_Texture* Game::draw_frame_thumbnail(int width, int height)
     SDL_GetRenderScale(renderer_, &scale_x, &scale_y);
     SDL_SetRenderTarget(renderer_, thumbnail_target_.get());
     SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
-    const bool drawn = SDL_RenderTexture(renderer_, art, nullptr, nullptr);
+    bool drawn = SDL_RenderTexture(renderer_, art, nullptr, nullptr);
+    // And the layers present() puts over it, in its order: the engine's
+    // thumbnail is DSP_GetDispBmp's screen as it was last shown, the text
+    // and the side bar included.  They hold the last frame drawn, which is
+    // the frame AVG_GoConfig's capture saw.
+    if (drawn) {
+        if (upscaler_->authentic_text_content()) {
+            SDL_RenderTexture(renderer_, upscaler_->authentic_text_target(),
+                              nullptr, nullptr);
+        }
+        SDL_RenderTexture(renderer_, upscaler_->overlay_target(), nullptr,
+                          nullptr);
+        if (upscaler_->sidebar_content()) {
+            SDL_RenderTexture(renderer_, upscaler_->sidebar_target(), nullptr,
+                              nullptr);
+        }
+    }
     SDL_SetRenderTarget(renderer_, previous_target);
     SDL_SetRenderScale(renderer_, scale_x, scale_y);
     SDL_SetTextureScaleMode(art, art_scale);
@@ -144,6 +160,29 @@ void Game::capture_save_snapshot()
     }
     save_snapshot_ = capture_frame_thumbnail(
         save_thumbnail_width, save_thumbnail_height);
+}
+
+void Game::capture_autosave_thumbnail()
+{
+    snapshot_after_draw_ = false;
+    auto slots = std::move(snapshot_slots_);
+    snapshot_slots_.clear();
+    capture_save_snapshot();
+    if (thumbnail_readback_ && thumbnail_readback_->pending()) {
+        // The saves made this frame get their files when the pixels land;
+        // nothing keeps the picture after that, so the next save takes its
+        // own.
+        snapshot_slots_ = std::move(slots);
+        snapshot_keep_ = false;
+        return;
+    }
+    if (save_snapshot_) {
+        for (const int slot : slots) {
+            SDL_SaveBMP(save_snapshot_.get(),
+                        thumbnail_path(slot).string().c_str());
+        }
+    }
+    save_snapshot_.reset();
 }
 
 bool Game::has_save_snapshot() const
@@ -586,6 +625,7 @@ void Game::begin_transition(
     // at DRW_BLD(2, 4, 6, 8...) and never called GetGraph.
     transition.no_snapshot = timing != EffectTiming::menu
         && effective_frames == 0;
+    transition.menu = timing == EffectTiming::menu;
     end_transition();   // one still running hands its targets back first
     transition_ = std::move(transition);
     // AVG_SetBack's tail: fd_flag on, fd_cnt zeroed, fd_max left as the raw
@@ -1124,8 +1164,14 @@ void Game::update_background_fade()
 void Game::update_screen_flash()
 {
     // AVG_ColtrolFade owns FadeStruct.cnt and starts the return leg itself,
-    // so all that is left is letting go of the overlay once flag clears.
-    if (screen_flash_ && !avgback().wait_fade()) {
+    // so all that is left is letting go of the overlay once flag clears -
+    // and only back at neutral.  A disp fade that ends anywhere else leaves
+    // GRP_DISP up at that brightness: AVG_SetLoad's fade to black holds the
+    // screen black on the tick after it lands, until the load replaces it.
+    const auto& fade = avgback().fade();
+    if (screen_flash_ && !avgback().wait_fade()
+        && fade.r == th2::bright_neutral && fade.g == th2::bright_neutral
+        && fade.b == th2::bright_neutral) {
         screen_flash_.reset();
     }
 }

@@ -564,6 +564,7 @@ th2::AvgMsg::Hooks Game::message_hooks()
         keywait_page_end_ = page;
     };
     hooks.reset_keywait = [this] { keywait_visible_ = false; };
+    hooks.load_flag = [this] { return load_step_ != LoadStep::none; };
     hooks.play_se = [this](int number, int volume) {
         play_system_se(number, volume);
     };
@@ -615,11 +616,11 @@ th2::AvgMsg::Hooks Game::message_hooks()
     hooks.select_message_flag = [this] { return choosing_; };
     hooks.go_config = [this](int page) {
         // AVG_GoConfig( 1..3 ), from the bar's save, load and settings
-        // buttons: the engine's own screens, which are not transcribed, so
-        // the port's stand in for them (Game::engine_open_port_screen).  Not
-        // in a trace: a replay could never close them, and the reference
-        // opens a screen ours does not have.
-        if (trace_mode_) {
+        // buttons.  The save and load window runs the engine's own machine
+        // (GWIN_ControlSaveLoadWindow) under the port's drawing; the settings
+        // are the port's alone, so not in a trace: a replay could never
+        // close them, and the reference opens a screen ours does not have.
+        if (trace_mode_ && page == 3) {
             SDL_Log("engine config: AVG_GoConfig(%d) opens a screen that is "
                     "not transcribed", page);
             return;

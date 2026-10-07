@@ -1522,7 +1522,10 @@ void Game::trace_apply_input()
     key_cond_.mouse_btn_left  = state.click_held;
     key_cond_.mouse_trg_right = state.cancel;
     th2::get_game_key(game_key_, key_cond_, 0, demo_mode_);
-    trace_drive_map(state.map_pick);
+    // The map's step does not run while the menu is up over it.
+    if (!engine_config_step_) {
+        trace_drive_map(state.map_pick);
+    }
     key_cond_.clear_triggers();
 }
 
@@ -1601,7 +1604,8 @@ void Game::control_system2()
     }
     //     if( cansel && AVG_ConfigCheck() ){ ... AVG_GoConfig(0); }
     if (game_key_.cansel && !engine_config_step_
-        && ui_mode_ == UiMode::game && engine_config_check()) {
+        && (ui_mode_ == UiMode::game || ui_mode_ == UiMode::map)
+        && engine_config_check()) {
         engine_go_config(0);
     }
 }

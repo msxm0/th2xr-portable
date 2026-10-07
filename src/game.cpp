@@ -1006,6 +1006,9 @@ void Game::iterate()
             continue;
         }
         if (engine_input_open()) {
+            if (ui_mode_ == UiMode::save || ui_mode_ == UiMode::load) {
+                handle_save_load_input(event);
+            }
             if (!handle_host_key(event) && !handle_text_scroll_drag(event)
                 && press) {
                 record_input_event(event);
@@ -1022,8 +1025,6 @@ void Game::iterate()
             handle_music_room_input(event);
         } else if (ui_mode_ == UiMode::replay_gallery) {
             handle_replay_gallery_input(event);
-        } else if (ui_mode_ == UiMode::save || ui_mode_ == UiMode::load) {
-            handle_save_load_input(event);
         }
     }
     handle_touch_actions();
@@ -1080,6 +1081,9 @@ void Game::iterate()
             msg().control_half_tone();
         }
         update_avg_back(control_steps_);
+        for (int i = 0; i < control_steps_; ++i) {
+            avgback().control_fade();
+        }
         update_audio_decode();
         update_half_tone();
         update_screen_flash();
@@ -1194,6 +1198,9 @@ void Game::iterate()
     }
     if (!frame_undrawn_) {
         draw();
+        if (snapshot_after_draw_) {
+            capture_autosave_thumbnail();
+        }
     }
     // After the whole tick, not before it - which is where the reference
     // writes its line, at the end of MAIN_Loop's tick body.  Taken at the
@@ -1265,6 +1272,7 @@ void Game::run_tick()
     // Drawing is the frame's, not the tick's; see iterate().
     control_steps_ = 1;
     ++global_count_;
+    load_work_tick_ = false;
     // EXEC_ControlLang.  main.cpp runs it, then MAIN_GameControl, and only
     // then MAIN_DrawGraph.  Every resumption of the script goes through here
     // so that order holds; resuming from inside the control pass put a
@@ -1283,7 +1291,11 @@ void Game::run_tick()
     update_audio();
     update_movie();
     trace_peek_map_pointer();
-    update_map();
+    // AVG_Main runs AVG_ControlMapEvent only in the AVG_MAP step: the map
+    // stands still while the menu is up over it.
+    if (!engine_config_step_) {
+        update_map();
+    }
     update_playback_modes();
     update_title();
     // AVG_GetGameKey, the top of MAIN_SystemControl: one sample of the
@@ -1307,8 +1319,9 @@ void Game::run_tick()
     if (engine_config_step_) {
         // AVG_Main's AVG_CONFIG step: the system menu and the half tone, and
         // nothing else of the AVG_GAME chain - the characters, the weather
-        // and the message all stand still underneath it.
-        control_engine_config();
+        // and the message all stand still underneath it.  AVG_SAVE, AVG_LOAD
+        // and AVG_SETTING run the same AVG_ControlSystem.
+        control_system();
         msg().control_half_tone();
         update_audio_decode();
         update_half_tone();
@@ -1319,7 +1332,6 @@ void Game::run_tick()
         update_avg_back(1);
         update_audio_decode();
         update_half_tone();
-        update_screen_flash();
         update_character_animations(1);
         // AVG_ControlWeather sets every petal's graph up again.
         weather_disp_ = true;
@@ -1330,15 +1342,24 @@ void Game::run_tick()
         control_select_window();
         // AVG_ControlSystem, the last of the chain: the system menu opened
         // this frame gets its first step on the frame it opened.
-        if (engine_config_.flag) {
-            control_engine_config();
-        }
+        control_system();
     }
+    // AVG_Main's tail, after the step's own control and for every step:
+    //     AVG_ControlLoad(); AVG_ControlGotoTitle(); AVG_ColtrolFade();
+    // The load looks at FadeStruct before this tick's count, so it lets go
+    // the tick after the fade lands, not the tick it lands on.
+    control_load();
+    avgback().control_fade();
+    update_screen_flash();
     // AVG_RenewSetp: a step change made during the tick takes effect for
     // the next one.
     if (engine_config_step_next_) {
         engine_config_step_ = *engine_config_step_next_;
         engine_config_step_next_.reset();
+    }
+    if (load_step_next_) {
+        load_step_ = *load_step_next_;
+        load_step_next_.reset();
     }
 }
 
@@ -1464,7 +1485,10 @@ bool Game::engine_input_open() const
     if (config_open_ || name_input_open_ || movie_) {
         return false;
     }
-    return ui_mode_ == UiMode::game || ui_mode_ == UiMode::map;
+    // The save and load window is the engine's too (GWIN_ControlSaveLoad-
+    // Window reads GameKey), over the scene or over the title.
+    return ui_mode_ == UiMode::game || ui_mode_ == UiMode::map
+        || ui_mode_ == UiMode::save || ui_mode_ == UiMode::load;
 }
 
 bool Game::handle_host_key(const SDL_Event& event)
@@ -1476,6 +1500,10 @@ bool Game::handle_host_key(const SDL_Event& event)
         return false;
     }
     if (event.key.key == SDLK_F5) {
+        // Only where the engine's own menu could have been opened.
+        if (!steady_for_save() || !engine_config_check()) {
+            return true;
+        }
         capture_save_snapshot();
         save(0);
         return true;

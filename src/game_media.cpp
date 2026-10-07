@@ -531,6 +531,7 @@ void Game::play_bgm(int music, bool loop, int volume, int fade, bool change)
     bgm_track_ = music;
     bgm_loop_ = loop;
     bgm_volume_ = volume;
+    play_music_vol_ = volume;
     const auto gain = bgm_gain(volume);
     const auto single = std::format("BGM_{:03d}.OGG", music);
     if (bgm_archive_.find(single)) {

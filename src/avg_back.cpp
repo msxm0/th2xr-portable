@@ -46,9 +46,8 @@ void AvgBack::control_back()
     control_back_change();
     control_back_scroll();
     control_shake();
-    // AVG_ColtrolFade is called from AVG_System's tail rather than from
-    // AVG_ControlBack, but it is one more counter in the same pass.
-    control_fade();
+    // AVG_ColtrolFade is not part of this: AVG_Main calls it for every step
+    // at the very end of the tick, after AVG_ControlLoad (Game::run_tick).
 }
 
 // --------------------------------------------------- AVG_ControlBackChange -
@@ -926,6 +925,16 @@ void AvgBack::set_fade(int r, int g, int b, int disp, int fade)
     // without DSP_GetGraphBrightFlag is hidden for the duration.  Ours tints
     // the composited frame instead, so there is nothing to hide - but the
     // two legs and their counters are the same.
+}
+
+void AvgBack::set_bright(int r, int g, int b)
+{
+    // void AVG_SetBright( int r, int g, int b ): the fade's whole ramp
+    // pinned to one colour, so the next AVG_SetFade starts from it.
+    fade_.sr = fade_.er = fade_.r = r;
+    fade_.sg = fade_.eg = fade_.g = g;
+    fade_.sb = fade_.eb = fade_.b = b;
+    set_draw_flag_on();
 }
 
 void AvgBack::set_flash(int r, int g, int b, int fade1, int fade2)

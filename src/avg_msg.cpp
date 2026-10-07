@@ -97,6 +97,85 @@ void AvgMsg::init()
     log_voice_text_ = {};
 }
 
+AvgMsg::SaveData AvgMsg::save_data() const
+{
+    // void AVG_SetSaveDataNovelMessage( AVG_SAVE_DATA *sdata ):
+    //
+    //     sdata->ms_flag  = NovelMessage.flag;
+    //     sdata->ms_add   = NovelMessage.add_flag;
+    //     sdata->ms_disp  = ON;
+    //     sdata->ms_step1 = NovelMessage.step2;
+    //     sdata->ms_count = NovelMessage.count;
+    //     sdata->ms_kstep = NovelMessage.kstep;
+    //     sdata->ms_max   = NovelMessage.max;
+    //     if( AVG_GetSelectMessageFlag() )
+    //         strncpy( buf, NovelBuf.buf[ (NovelBuf.bpoint-1+NLOG_MAX)%NLOG_MAX ], NLOG_BUF );
+    //     else
+    //         strncpy( buf, NovelMessage.str, NLOG_BUF );
+    //     ... then buf into ms_str with every "\k" dropped.
+    //
+    // ms_disp is not kept: the load always passes ON.
+    SaveData data;
+    data.flag = message_.flag;
+    data.add_flag = message_.add_flag;
+    data.step = message_.step2;
+    data.count = message_.count;
+    data.kstep = message_.kstep;
+    data.max = message_.max;
+    const bool select_up =
+        hooks_.select_message_flag && hooks_.select_message_flag();
+    const std::string& source = select_up
+        ? novel_buf_.buf[static_cast<std::size_t>(
+              (novel_buf_.bpoint - 1 + nlog_max) % nlog_max)]
+        : message_.str;
+    data.str.reserve(source.size());
+    for (std::size_t i = 0; i < source.size(); ++i) {
+        if (source[i] == '\\' && i + 1 < source.size()
+            && source[i + 1] == 'k') {
+            ++i;
+            continue;
+        }
+        data.str += source[i];
+    }
+    return data;
+}
+
+void AvgMsg::load_save_data(const SaveData& data)
+{
+    // void AVG_SetLoadDataNovelMessage( AVG_SAVE_DATA *sdata ):
+    //
+    //     ZeroMemory( &NovelBuf, sizeof(NOVEL_BUF) );
+    //     ZeroMemory( &NovelMessage, sizeof(NOVEL_MESSEGE) );
+    //     NovelMessage.flag     = sdata->ms_flag;
+    //     NovelMessage.add_flag = sdata->ms_add;
+    //     AVG_SetNovelMessageDisp( sdata->ms_disp );       // ON
+    //     NovelMessage.step2  = NovelMessage.step1  = sdata->ms_step1;
+    //     NovelMessage.max    = TXT_GetTextCount( sdata->ms_str, 0 )+8;
+    //     NovelMessage.count  = NovelMessage.max;
+    //     DSP_SetText( TXT_WINDOW, ..., sdata->ms_str ); ...
+    //     DSP_SetTextCount( TXT_WINDOW, -1 );
+    //     DSP_SetTextStep( TXT_WINDOW, 0 );
+    //     if(sdata->ms_str[0]!='\0') SetNovelMessageHistory(sdata->ms_str);
+    //
+    // So the line comes back whole, with no typewriter, in the step it was
+    // saved in - waiting for the reader if it was.
+    novel_buf_ = {};
+    message_ = {};
+    message_.flag = data.flag;
+    message_.add_flag = data.add_flag;
+    set_novel_message_disp(true);
+    message_.step1 = message_.step2 = data.step;
+    restore_raw(data.str);
+    end_key_wait_ = txt_get_text_end_key_wait(raw_);
+    message_.max = text_count(0) + 8;
+    message_.count = message_.max;
+    text_cnt_ = -1;
+    text_step_ = 0;
+    if (!data.str.empty()) {
+        set_novel_message_history(data.str);
+    }
+}
+
 // ---------------------------------------------------------- the messages --
 
 void AvgMsg::set_novel_message(const std::string& raw, int add_flag)
@@ -161,9 +240,12 @@ void AvgMsg::add_novel_message(const std::string& raw, int cr)
     set_novel_message_voice2(false);
     set_draw_flag_on();   // MainWindow.draw_flag=ON;
     //     sp = (NovelBuf.bpoint-1+NLOG_MAX)%NLOG_MAX;
+    //     strcpy( NovelMessage.str, NovelBuf.buf[sp] );
     //     strcat( NovelBuf.buf[sp], buf2 );
-    novel_buf_.buf[static_cast<std::size_t>(
-        (novel_buf_.bpoint - 1 + nlog_max) % nlog_max)] += "\\k" + raw;
+    auto& log_entry = novel_buf_.buf[static_cast<std::size_t>(
+        (novel_buf_.bpoint - 1 + nlog_max) % nlog_max)];
+    message_.str = log_entry;
+    log_entry += "\\k" + raw;
     raw_ += "\\k";
     raw_ += raw;
     counted_ = txt_count_text(raw_);
@@ -333,17 +415,22 @@ void AvgMsg::control_wait(const GameKey& key)
     //         DSP_SetGraph( GRP_KEYWAIT, BMP_KEYWAIT+1, ... );
     //     else
     //         DSP_SetGraph( GRP_KEYWAIT, BMP_KEYWAIT+0, ... );
-    if (hooks_.set_keywait) {
-        const bool page =
-            !(message_.step1 == msg_wait || message_.add_flag != 2);
-        hooks_.set_keywait(page);
+    //
+    // All of it, and the two counters, inside if( !AVG_GetLaodFlag() ): the
+    // line a load brings back waits under the load's fade with no mark up.
+    if (!(hooks_.load_flag && hooks_.load_flag())) {
+        if (hooks_.set_keywait) {
+            const bool page =
+                !(message_.step1 == msg_wait || message_.add_flag != 2);
+            hooks_.set_keywait(page);
+        }
+        //     DSP_GetTextDispPos( TXT_WINDOW, &px, &py );
+        if (hooks_.measure_text) {
+            hooks_.measure_text();
+        }
+        key_wait_count_ = std::min(key_wait_count_ + 1, 10);
+        key_wait_count2_ = std::min(key_wait_count2_ + 1, 30);
     }
-    //     DSP_GetTextDispPos( TXT_WINDOW, &px, &py );
-    if (hooks_.measure_text) {
-        hooks_.measure_text();
-    }
-    key_wait_count_ = std::min(key_wait_count_ + 1, 10);
-    key_wait_count2_ = std::min(key_wait_count2_ + 1, 30);
 
     // Read once, at the top, as the original's two locals are:
     //     command_btrg = MUS_GetMouseNoEx(MOUSE_LBTRIGGER,0);
@@ -1314,8 +1401,8 @@ void AvgMsg::write_history(std::ostream& out) const
                             nb.bpoint, nb.bcount}) {
         write_i32(out, field);
     }
-    for (const auto& layer : rects_) {
-        for (const auto& rect : layer) {
+    for (int lno = 0; lno < mouse_layers_saved; ++lno) {
+        for (const auto& rect : rects_[static_cast<std::size_t>(lno)]) {
             for (const int field : {rect.flag ? 1 : 0, rect.sx, rect.sy,
                                     rect.w, rect.h, rect.rect_no}) {
                 write_i32(out, field);
@@ -1362,7 +1449,7 @@ void AvgMsg::write_log(std::ostream& out) const
     }
 }
 
-bool AvgMsg::read_log(std::istream& in)
+bool AvgMsg::read_log(std::istream& in, bool apply)
 {
     if (read_i32(in) != log_magic || !in) {
         return false;
@@ -1397,7 +1484,9 @@ bool AvgMsg::read_log(std::istream& in)
     }
     // Loaded at the current line, not paging back through the log.
     nb.bcount = 0;
-    novel_buf_ = std::move(nb);
+    if (apply) {
+        novel_buf_ = std::move(nb);
+    }
     return true;
 }
 
@@ -1436,8 +1525,8 @@ bool AvgMsg::read_history(std::istream& in)
     nb.bpoint = read_i32(in);
     nb.bcount = read_i32(in);
     std::array<std::array<MouseRect, mouse_rest_max>, mouse_layers> rects{};
-    for (auto& layer : rects) {
-        for (auto& rect : layer) {
+    for (int lno = 0; lno < mouse_layers_saved; ++lno) {
+        for (auto& rect : rects[static_cast<std::size_t>(lno)]) {
             rect.flag = read_i32(in) != 0;
             rect.sx = read_i32(in);
             rect.sy = read_i32(in);
