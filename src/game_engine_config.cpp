@@ -96,7 +96,8 @@ bool Game::map_config_ready() const
     // AVG_ControlMapEvent sets MapEventConfigFlag at the top of case 3 - the
     // map up and taking clicks, rolling between pages or not - and clears it
     // on every other step.
-    return ui_mode_ == UiMode::map && !clock_state_ && map_enter_ticks_ == 0
+    return ui_mode_ == UiMode::map && !clock_state_ && map_clock_instant_ == 0
+        && map_enter_ticks_ == 0
         && !map_enter_finished_this_frame_ && map_fade_ticks_ == 0
         && !map_finish_pending_ && map_selected_ < 0;
 }

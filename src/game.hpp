@@ -1103,6 +1103,9 @@ private:
     int map_anim_frames_ = 0;
     // map_anim_frames_ on the frame the characters' sprites were set.
     int map_sprite_start_ = -1;
+    // Steps until an already-set clock reports done; see update_map.
+    int map_clock_instant_ = 0;
+    void map_clock_done();
     float map_pointer_x_ = 0.0f;
     float map_pointer_y_ = 0.0f;
     int map_fade_ticks_ = 0;

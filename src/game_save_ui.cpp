@@ -813,6 +813,21 @@ void Game::update_map_hover(float x, float y)
     }
 }
 
+void Game::map_clock_done()
+{
+    // if( AVG_ViewClock( 19 ) ){ ...DSP_SetSprite...; AVG_PlayBGM( 10, 30,
+    // ON, 255, 0 ); ... } - the characters start animating and the map's
+    // music comes in with the map, on a 30 fade, not when the clock starts
+    // counting.  AVG_PlayBGM leaves a track that is already playing alone.
+    map_sprite_start_ = map_anim_frames_;
+    const bool fresh = bgm_track_ != 10;
+    play_bgm(10, true, 255, 30);
+    if (fresh) {
+        bgm_.set_gain(0.0f);
+        bgm_.fade_to(bgm_gain(255), audio_fade_duration(30));
+    }
+}
+
 void Game::update_map()
 {
     if (ui_mode_ != UiMode::map) {
@@ -842,13 +857,16 @@ void Game::update_map()
             if (clock_state_->frame >= 32 + clock_state_->travel_frames) {
                 runtime_.set_flag(7, clock_state_->target);
                 clock_state_.reset();
-                // if( AVG_ViewClock( 19 ) ){ ... AVG_PlayBGM( 10, 30, ON,
-                // 255, 0 ); ... } - the map's music comes in with the map,
-                // on a 30 fade, not when the clock starts counting.
-                map_sprite_start_ = map_anim_frames_;
-                play_bgm(10, true, 255, 30);
-                bgm_.set_gain(0.0f);
-                bgm_.fade_to(bgm_gain(255), audio_fade_duration(30));
+                map_clock_done();
+            }
+            break;
+        }
+        // AVG_ViewClock( 19 ) with the clock already there - a map loaded
+        // from a save - answers TRUE on its first call, the frame the clock
+        // would have started on.
+        if (map_clock_instant_ > 0) {
+            if (--map_clock_instant_ == 0) {
+                map_clock_done();
             }
             break;
         }

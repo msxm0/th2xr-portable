@@ -1214,6 +1214,8 @@ void Game::begin_map()
     // Starting the clock at frame 1 here put the whole map - its music, its
     // fade-in and the first hover sound - three frames early.
     begin_clock(19, -2);
+    // Three steps, as the clock's first frame is three steps from -2.
+    map_clock_instant_ = clock_state_ ? 0 : 3;
     map_enter_ticks_ = 16;
     map_finish_pending_ = false;
     calendar_finish_pending_ = false;

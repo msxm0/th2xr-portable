@@ -116,6 +116,7 @@ void Game::reset_play_state()
     screen_flash_.reset();
     shake_.reset();
     clock_state_.reset();
+    map_clock_instant_ = 0;
     calendar_state_.reset();
     skipped_month_ = 0;
     skipped_day_ = 0;
