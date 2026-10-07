@@ -1,5 +1,6 @@
 #pragma once
 #include "archive.hpp"
+#include "gl_readback.hpp"
 #include "text_count.hpp"
 #include "audio.hpp"
 #include "character.hpp"
@@ -581,6 +582,7 @@ private:
     float bgm_gain(int volume) const;
     float se_gain(int volume) const;
     void ensure_upscaler();
+    void warm_renderer_programs();
     std::size_t voice_character_index(int character) const;
     float voice_gain(int volume, int character) const;
     void apply_audio_gains();
@@ -1418,6 +1420,23 @@ private:
     // reading that back moves a fraction of the pixels through what is still
     // a pipeline sync.
     Surface capture_frame_thumbnail(int width, int height);
+    // The art target, reduced to thumbnail size into thumbnail_target_
+    // (made once), or null.
+    SDL_Texture* draw_frame_thumbnail(int width, int height);
+    // save_snapshot_, without the pipeline sync where GLES allows: the
+    // reduced frame is queued for an asynchronous read, and a save made
+    // before it arrives writes its thumbnail when it does
+    // (finish_save_snapshot, every frame).
+    void capture_save_snapshot();
+    bool has_save_snapshot() const;
+    void reset_save_snapshot();
+    void finish_save_snapshot(bool wait);
+    Texture thumbnail_target_;
+    std::unique_ptr<th2::GlAsyncReadback> thumbnail_readback_;
+    // Whether the pending read becomes save_snapshot_ (false once reset),
+    // and the slots whose thumbnail file waits for it.
+    bool snapshot_keep_ = false;
+    std::vector<int> snapshot_slots_;
     static constexpr int save_thumbnail_width = 160;
     static constexpr int save_thumbnail_height = 120;
     Texture texture_from_surface(SDL_Surface* surface);

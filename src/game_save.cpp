@@ -94,6 +94,9 @@ void Game::save_preview(int slot)
         // whatever it loads into its slot anyway.
         SDL_SaveBMP(
             save_snapshot_.get(), thumbnail_path(slot).string().c_str());
+    } else if (thumbnail_readback_ && thumbnail_readback_->pending()) {
+        // Still on its way from the GPU: written when it arrives.
+        snapshot_slots_.push_back(slot);
     }
     std::ofstream metadata(metadata_path(slot));
     if (metadata) {

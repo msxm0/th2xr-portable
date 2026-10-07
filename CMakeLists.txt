@@ -256,6 +256,7 @@ if(BUILD_TESTING AND NOT EMSCRIPTEN)
         src/dsp_test.cpp
         src/dsp.cpp
         src/gl_blend.cpp
+        src/gl_blend_batch.cpp
         src/gl_anime4k.cpp
         src/texture.cpp
         src/image.cpp
@@ -273,6 +274,7 @@ if(BUILD_TESTING AND NOT EMSCRIPTEN)
         src/trace.cpp
         src/dsp.cpp
         src/gl_blend.cpp
+        src/gl_blend_batch.cpp
         src/gl_anime4k.cpp
         src/texture.cpp
         src/image.cpp
@@ -291,6 +293,7 @@ if(BUILD_TESTING AND NOT EMSCRIPTEN)
         src/trace.cpp
         src/dsp.cpp
         src/gl_blend.cpp
+        src/gl_blend_batch.cpp
         src/gl_anime4k.cpp
         src/texture.cpp
         src/image.cpp
@@ -393,8 +396,11 @@ if(ANDROID)
         src/anime4k.cpp
         src/gl_transition.cpp
         src/gl_blend.cpp
+        src/gl_blend_batch.cpp
+        src/gl_readback.cpp
         src/gl_anime4k.cpp
         src/font.cpp
+        src/font_exact.cpp
         src/game.cpp
         src/game_backlog_touch.cpp
         src/game_engine_config.cpp
@@ -439,8 +445,11 @@ else()
         src/anime4k.cpp
         src/gl_transition.cpp
         src/gl_blend.cpp
+        src/gl_blend_batch.cpp
+        src/gl_readback.cpp
         src/gl_anime4k.cpp
         src/font.cpp
+        src/font_exact.cpp
         src/game.cpp
         src/game_backlog_touch.cpp
         src/game_engine_config.cpp

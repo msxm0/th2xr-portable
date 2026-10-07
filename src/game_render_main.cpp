@@ -1240,6 +1240,12 @@ void Game::draw_frame()
         art_cleared_for_ = art_target;
     }
     if (movie_) {
+        // A movie covers only its own rectangle, and the art target is drawn
+        // over rather than cleared (above), so the letterbox showed whatever
+        // was there before - white, after the Leaf logo.  Movies play over
+        // black.
+        SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
+        SDL_RenderClear(renderer_);
         movie_->draw();
         begin_overlay();
 
@@ -1483,6 +1489,8 @@ void Game::draw_frame()
             // antialiased edge where the two cells meet - one column per
             // character, which is where the last of the text difference was.
             for (int pass = 0; pass < 2; ++pass) {
+            // A pass is font draws only, so it can go to the GPU as runs.
+            const th2::GameFont::Batch batch(font_);
             for (std::size_t i = 0; i < limit; ++i) {
                 const auto alpha_256 = msg().glyph_alpha(i);
                 if (alpha_256 <= 0) {
@@ -1731,6 +1739,7 @@ void Game::draw_frame()
                                 static_cast<float>(counted.glyph_y[k]),
                                 text.substr(begin, bytes), alpha});
             }
+            const th2::GameFont::Batch batch(font_);
             for (const auto& g : held) {
                 font_.draw_authentic_shadow(
                     renderer_, g.x, g.y, g.text,

@@ -378,6 +378,23 @@ struct GameFont::Modern {
             && std::abs(scale - requested_scale) < 0.01f) {
             return;
         }
+        // Only the size changed - the menu's size setting, a window moved
+        // to another display: resize the faces already open.  Reopening
+        // reads and validates every file again, the 9.6 MB Japanese
+        // fallback included, inside the frame that applies the change.
+        if (font && family == requested_family) {
+            const float pixel_size = requested_size * requested_scale;
+            bool resized = TTF_SetFontSize(primary.font, pixel_size);
+            for (const auto& fallback : fallbacks) {
+                resized = resized && TTF_SetFontSize(fallback.font, pixel_size);
+            }
+            if (resized) {
+                textures.clear();
+                logical_size = requested_size;
+                scale = requested_scale;
+                return;
+            }
+        }
         // The fallbacks must outlive the font that refers to them, so the
         // whole set is torn down together.
         font = nullptr;
@@ -477,6 +494,16 @@ void GameFont::configure(
     // Every cached measurement was taken with the old face and size.
     boundary_cache_.clear();
     ++generation_;
+    // The face itself too, here rather than at the first text measured: on
+    // the web opening it (and its fallbacks) was most of a 50 ms frame at
+    // the start of the first dialogue.  A face that fails to open fails
+    // again, where it is used.
+    if (!authentic_) {
+        try {
+            modern_->open(family_, font_size_, framebuffer_scale_);
+        } catch (const std::exception&) {
+        }
+    }
 }
 
 namespace {
@@ -762,126 +789,6 @@ void draw_shadow_mask(
 }  // namespace
 
 
-// The glyph masks, as textures, and the blend that composites them.
-//
-// Keyed by the address of the glyph's bitmap plus its size: the bitmaps live
-// inside data_ / shadow_data_, which outlive the cache, so the address
-// identifies the glyph.  Alpha is NOT part of the key - alph2 is a uniform,
-// so one texture per glyph serves every step of the typewriter's reveal.
-struct GameFont::ExactGlyphs {
-    GlExactBlend* blend = nullptr;
-    mutable std::unordered_map<
-        std::string, std::unique_ptr<SDL_Texture, th2app::TextureDeleter>>
-        masks;
-
-    static std::string key(const std::uint8_t* bitmap, int w, int h)
-    {
-        char buffer[48];
-        std::snprintf(buffer, sizeof buffer, "%p/%d/%d",
-                      static_cast<const void*>(bitmap), w, h);
-        return buffer;
-    }
-
-    SDL_Texture* mask(SDL_Renderer* renderer, const std::uint8_t* bitmap,
-                      int width, int height) const
-    {
-        const auto name = key(bitmap, width, height);
-        if (const auto found = masks.find(name); found != masks.end()) {
-            return found->second.get();
-        }
-        SDL_Surface* face =
-            SDL_CreateSurface(width, height, SDL_PIXELFORMAT_RGBA32);
-        if (!face) {
-            return nullptr;
-        }
-        const int stride = (width + 1) / 2;
-        for (int row = 0; row < height; ++row) {
-            auto* out = static_cast<std::uint8_t*>(face->pixels)
-                + static_cast<std::size_t>(row) * face->pitch;
-            for (int column = 0; column < width; ++column) {
-                const auto packed = bitmap[row * stride + column / 2];
-                const int coverage =
-                    column % 2 == 0 ? (packed & 0x0f) : (packed >> 4);
-                // 17*c, so a 0..15 coverage survives an 8 bit channel
-                // exactly and the shader divides it back out.  The colour is
-                // the ink uniform's job; white here keeps any backend
-                // channel order harmless.
-                // In every channel, not just alpha: this backend hands GL
-                // its textures with the colour channels swizzled (see
-                // gl_blend.frag), and a mask that depends on picking the
-                // right one would be a silent solid block wherever the guess
-                // was wrong.  17*c so 0..15 survives 8 bits exactly.
-                const auto value = static_cast<std::uint8_t>(coverage * 17);
-                out[column * 4 + 0] = value;
-                out[column * 4 + 1] = value;
-                out[column * 4 + 2] = value;
-                out[column * 4 + 3] = value;
-            }
-        }
-        std::unique_ptr<SDL_Texture, th2app::TextureDeleter> texture(
-            SDL_CreateTextureFromSurface(renderer, face));
-        SDL_DestroySurface(face);
-        if (!texture) {
-            return nullptr;
-        }
-        SDL_SetTextureScaleMode(texture.get(), SDL_SCALEMODE_NEAREST);
-        SDL_SetTextureBlendMode(texture.get(), SDL_BLENDMODE_NONE);
-        auto* raw = texture.get();
-        masks.emplace(name, std::move(texture));
-        return raw;
-    }
-};
-
-void GameFont::set_exact_blend(GlExactBlend* blend)
-{
-    if (!blend) {
-        exact_.reset();
-        return;
-    }
-    if (!exact_) {
-        exact_ = std::make_unique<ExactGlyphs>();
-    }
-    exact_->blend = blend;
-}
-
-bool GameFont::draw_mask_exact(
-    SDL_Renderer* renderer, float x, float y, int width, int height,
-    const std::uint8_t* bitmap, int red, int green, int blue,
-    int alpha_256, int alpha) const
-{
-    // A caller with no engine alpha - the backlog, the save screens - used
-    // to plot the mask a point at a time instead: 16% of backlog frames
-    // over 8 ms with the bitmap font, every glyph and shadow a few hundred
-    // SDL_RenderPoint calls.  On a layer, which is normal play's text and
-    // is never compared, its 0..255 alpha stands in on the engine's scale.
-    // Into the picture nothing changes: that is what a trace reads.
-    if (alpha_256 < 0 && alpha >= 0
-        && th2::texture_is_premultiplied_layer(SDL_GetRenderTarget(renderer))) {
-        alpha_256 = (std::min(alpha, 255) * 256 + 127) / 255;
-    }
-    if (!exact_ || !exact_->blend || !exact_->blend->available()
-        || alpha_256 < 0 || width <= 0 || height <= 0) {
-        return false;
-    }
-    SDL_Texture* const texture =
-        exact_->mask(renderer, bitmap, width, height);
-    if (!texture) {
-        return false;
-    }
-    const SDL_FRect source{0.0f, 0.0f, static_cast<float>(width),
-                           static_cast<float>(height)};
-    const SDL_FRect destination{x, y, static_cast<float>(width),
-                                static_cast<float>(height)};
-    // draw() copies only the glyph's box of the destination.  An earlier
-    // sub-rect copy composited the text to solid blocks - the fixed point of
-    // dst*(256-eff)/256 + ink*eff/256 is the ink - because it flipped the
-    // rows and so read a band of last frame's scratch that already held the
-    // glyph.  See GlExactBlend::Impl::copy_destination.
-    return exact_->blend->capture_destination(renderer)
-        && exact_->blend->draw(renderer, texture, source, destination,
-                               false, false, 2, alpha_256, red, green, blue);
-}
-
 void GameFont::draw_bitmap(
     SDL_Renderer* renderer, float x, float y, std::string_view text,
     std::uint8_t red, std::uint8_t green, std::uint8_t blue,
@@ -898,6 +805,8 @@ void GameFont::draw_bitmap_face(
     std::uint8_t red, std::uint8_t green, std::uint8_t blue,
     std::uint8_t alpha, int alpha_256) const
 {
+    // One run per call: the glyphs of a line sit side by side.
+    const Batch batch(*this);
     const float start_x = x;
     const auto full_bytes =
         static_cast<std::size_t>(font_size) * font_size / 2;
@@ -1112,6 +1021,7 @@ void GameFont::draw_authentic_shadow(
     if (!authentic_ || shadow_width_ <= 0 || text.empty()) {
         return;
     }
+    const Batch batch(*this);
     SDL_SetRenderDrawBlendMode(
         renderer,
         alpha_256 >= 0 ? SDL_BLENDMODE_BLEND_PREMULTIPLIED

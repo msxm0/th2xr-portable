@@ -485,6 +485,12 @@ private:
     std::vector<Texture> spare_targets_;
     void retire_bitmap(Bitmap& bitmap);
     Texture take_spare_target(int width, int height);
+public:
+    // Fills the pool with targets of one size ahead of need, up to `count`
+    // of them: the first bitmaps a scene makes then come from the pool
+    // rather than from a target created mid-scene.
+    void reserve_targets(int width, int height, std::size_t count);
+private:
 
     int global_x_ = 0;
     int global_y_ = 0;

@@ -480,11 +480,13 @@ int Game::run_loop()
         dbg_w, dbg_h, dbg_pw, dbg_ph, SDL_GetWindowDisplayScale(window_));
     next_frame_ = std::chrono::steady_clock::now();
     while (running_) {
+        finish_save_snapshot(false);
         iterate();
 #ifdef __EMSCRIPTEN__
         wait_for_next_frame(web_frame_pacing);
 #endif
     }
+    finish_save_snapshot(true);
 #ifdef __EMSCRIPTEN__
     frames_ended();
 #endif
@@ -1089,6 +1091,7 @@ void Game::iterate()
     }
     ensure_upscaler();
     if (!gl_transition_) {
+        warm_renderer_programs();
         // Built on the first drawn frame, once the renderer's context is
         // current.  If the shader will not build, available() stays false
         // and every wipe keeps the CPU blend.
@@ -1473,8 +1476,7 @@ bool Game::handle_host_key(const SDL_Event& event)
         return false;
     }
     if (event.key.key == SDLK_F5) {
-        save_snapshot_ = capture_frame_thumbnail(
-            save_thumbnail_width, save_thumbnail_height);
+        capture_save_snapshot();
         save(0);
         return true;
     }

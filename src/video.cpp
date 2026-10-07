@@ -29,6 +29,23 @@ struct TextureDeleter {
     void operator()(SDL_Texture* texture) const { SDL_DestroyTexture(texture); }
 };
 
+class MemorySource final : public VideoSource {
+public:
+    explicit MemorySource(std::span<const std::uint8_t> bytes) : bytes_(bytes) {}
+    std::uint64_t size() const override { return bytes_.size(); }
+    bool read(std::uint64_t offset, std::span<std::uint8_t> out) override
+    {
+        if (offset > bytes_.size() || out.size() > bytes_.size() - offset) {
+            return false;
+        }
+        std::copy_n(bytes_.data() + offset, out.size(), out.data());
+        return true;
+    }
+
+private:
+    std::span<const std::uint8_t> bytes_;
+};
+
 }  // namespace
 
 struct VideoPlayer::Impl {
@@ -39,8 +56,9 @@ struct VideoPlayer::Impl {
 
     SDL_Renderer* renderer;
     SDL_FRect destination;
-    std::span<const std::uint8_t> bytes;
-    std::size_t position = 0;
+    std::unique_ptr<VideoSource> source;
+    std::uint64_t source_size = 0;
+    std::uint64_t position = 0;
     AVFormatContext* format = nullptr;
     AVIOContext* io = nullptr;
     AVCodecContext* video_codec = nullptr;
@@ -67,12 +85,15 @@ struct VideoPlayer::Impl {
     static int read(void* opaque, std::uint8_t* destination, int size)
     {
         auto& self = *static_cast<Impl*>(opaque);
-        const auto available = self.bytes.size() - self.position;
-        const auto copied = std::min<std::size_t>(available, size);
+        const auto available = self.source_size - self.position;
+        const auto copied = static_cast<std::size_t>(
+            std::min<std::uint64_t>(available, static_cast<std::uint64_t>(size)));
         if (copied == 0) {
             return AVERROR_EOF;
         }
-        std::copy_n(self.bytes.data() + self.position, copied, destination);
+        if (!self.source->read(self.position, {destination, copied})) {
+            return AVERROR(EIO);
+        }
         self.position += copied;
         return static_cast<int>(copied);
     }
@@ -80,19 +101,19 @@ struct VideoPlayer::Impl {
     static std::int64_t seek(void* opaque, std::int64_t offset, int whence)
     {
         auto& self = *static_cast<Impl*>(opaque);
+        const auto size = static_cast<std::int64_t>(self.source_size);
         if (whence == AVSEEK_SIZE) {
-            return static_cast<std::int64_t>(self.bytes.size());
+            return size;
         }
         const int origin = whence & ~AVSEEK_FORCE;
         std::int64_t base = origin == SEEK_CUR
             ? static_cast<std::int64_t>(self.position)
-            : origin == SEEK_END ? static_cast<std::int64_t>(self.bytes.size())
-                                 : 0;
+            : origin == SEEK_END ? size : 0;
         const auto next = base + offset;
-        if (next < 0 || next > static_cast<std::int64_t>(self.bytes.size())) {
+        if (next < 0 || next > size) {
             return AVERROR(EINVAL);
         }
-        self.position = static_cast<std::size_t>(next);
+        self.position = static_cast<std::uint64_t>(next);
         return next;
     }
 
@@ -118,9 +139,10 @@ struct VideoPlayer::Impl {
         return context;
     }
 
-    Impl(SDL_Renderer* renderer_, std::span<const std::uint8_t> bytes_,
+    Impl(SDL_Renderer* renderer_, std::unique_ptr<VideoSource> source_,
          SDL_FRect destination_)
-        : renderer(renderer_), destination(destination_), bytes(bytes_)
+        : renderer(renderer_), destination(destination_),
+          source(std::move(source_)), source_size(source->size())
     {
         if (!frame || !packet) {
             throw std::bad_alloc();
@@ -344,9 +366,16 @@ struct VideoPlayer::Impl {
 };
 
 VideoPlayer::VideoPlayer(
+    SDL_Renderer* renderer, std::unique_ptr<VideoSource> source,
+    SDL_FRect destination)
+    : impl_(std::make_unique<Impl>(renderer, std::move(source), destination))
+{
+}
+
+VideoPlayer::VideoPlayer(
     SDL_Renderer* renderer, std::span<const std::uint8_t> bytes,
     SDL_FRect destination)
-    : impl_(std::make_unique<Impl>(renderer, bytes, destination))
+    : VideoPlayer(renderer, std::make_unique<MemorySource>(bytes), destination)
 {
 }
 

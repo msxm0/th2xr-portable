@@ -271,9 +271,8 @@ void Game::handle_touch_actions()
 
 void Game::open_save_load(UiMode mode)
 {
-    if (!save_snapshot_) {
-        save_snapshot_ = capture_frame_thumbnail(
-    save_thumbnail_width, save_thumbnail_height);
+    if (!has_save_snapshot()) {
+        capture_save_snapshot();
     }
     save_return_mode_ =
         ui_mode_ == UiMode::title ? UiMode::title : UiMode::game;

@@ -109,8 +109,7 @@ void Game::engine_go_config(int mode)
     engine_config_open_mode_ = mode;
     // DSP_GetDispBmp( BMP_CAP, ... ): the screen as it was asked from,
     // which is what a save made from here shows as its thumbnail.
-    save_snapshot_ = capture_frame_thumbnail(
-        save_thumbnail_width, save_thumbnail_height);
+    capture_save_snapshot();
     if (mode == 0) {
         play_system_se(9002, 150);
         engine_set_config_window();

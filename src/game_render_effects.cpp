@@ -58,13 +58,18 @@ Surface Game::capture_frame_pixels(bool art_only)
     return Surface(converted);
 }
 
-Surface Game::capture_frame_thumbnail(int width, int height)
+SDL_Texture* Game::draw_frame_thumbnail(int width, int height)
 {
-    Texture small(SDL_CreateTexture(
-        renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET,
-        width, height));
-    if (!small) {
-        throw std::runtime_error(SDL_GetError());
+    // Made once and kept: creating a target is a round trip to the GPU
+    // process in a browser, every autosave.
+    if (!thumbnail_target_ || thumbnail_target_->w != width
+        || thumbnail_target_->h != height) {
+        thumbnail_target_.reset(SDL_CreateTexture(
+            renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET,
+            width, height));
+        if (!thumbnail_target_) {
+            return nullptr;
+        }
     }
     SDL_Texture* art = upscaler_->art_target();
     SDL_ScaleMode art_scale = SDL_SCALEMODE_LINEAR;
@@ -82,15 +87,26 @@ Surface Game::capture_frame_thumbnail(int width, int height)
     float scale_x = 1.0f;
     float scale_y = 1.0f;
     SDL_GetRenderScale(renderer_, &scale_x, &scale_y);
-    SDL_SetRenderTarget(renderer_, small.get());
+    SDL_SetRenderTarget(renderer_, thumbnail_target_.get());
     SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
     const bool drawn = SDL_RenderTexture(renderer_, art, nullptr, nullptr);
-    SDL_Surface* raw = drawn
-        ? SDL_RenderReadPixels(renderer_, nullptr) : nullptr;
     SDL_SetRenderTarget(renderer_, previous_target);
     SDL_SetRenderScale(renderer_, scale_x, scale_y);
     SDL_SetTextureScaleMode(art, art_scale);
     SDL_SetTextureBlendMode(art, art_blend);
+    return drawn ? thumbnail_target_.get() : nullptr;
+}
+
+Surface Game::capture_frame_thumbnail(int width, int height)
+{
+    SDL_Texture* const small = draw_frame_thumbnail(width, height);
+    if (!small) {
+        throw std::runtime_error(SDL_GetError());
+    }
+    SDL_Texture* previous_target = SDL_GetRenderTarget(renderer_);
+    SDL_SetRenderTarget(renderer_, small);
+    SDL_Surface* raw = SDL_RenderReadPixels(renderer_, nullptr);
+    SDL_SetRenderTarget(renderer_, previous_target);
     if (!raw) {
         throw std::runtime_error(SDL_GetError());
     }
@@ -103,6 +119,66 @@ Surface Game::capture_frame_thumbnail(int width, int height)
         throw std::runtime_error(SDL_GetError());
     }
     return converted;
+}
+
+void Game::capture_save_snapshot()
+{
+    // One read in flight at a time: an earlier one finishes first, and the
+    // saves waiting on it get their thumbnails.
+    finish_save_snapshot(true);
+    save_snapshot_.reset();
+    snapshot_keep_ = false;
+    if (!thumbnail_readback_) {
+        thumbnail_readback_ = std::make_unique<th2::GlAsyncReadback>(renderer_);
+    }
+    if (thumbnail_readback_->available()) {
+        SDL_Texture* const small =
+            draw_frame_thumbnail(save_thumbnail_width, save_thumbnail_height);
+        if (small
+            && thumbnail_readback_->start(renderer_, small,
+                                          save_thumbnail_width,
+                                          save_thumbnail_height)) {
+            snapshot_keep_ = true;
+            return;
+        }
+    }
+    save_snapshot_ = capture_frame_thumbnail(
+        save_thumbnail_width, save_thumbnail_height);
+}
+
+bool Game::has_save_snapshot() const
+{
+    return save_snapshot_
+        || (snapshot_keep_ && thumbnail_readback_
+            && thumbnail_readback_->pending());
+}
+
+void Game::reset_save_snapshot()
+{
+    save_snapshot_.reset();
+    // A read still in flight only finishes for the saves waiting on it.
+    snapshot_keep_ = false;
+}
+
+void Game::finish_save_snapshot(bool wait)
+{
+    if (!thumbnail_readback_ || !thumbnail_readback_->pending()) {
+        return;
+    }
+    Surface pixels(thumbnail_readback_->take(wait));
+    if (!pixels && thumbnail_readback_->pending()) {
+        return;     // not there yet
+    }
+    if (pixels) {
+        for (const int slot : snapshot_slots_) {
+            SDL_SaveBMP(pixels.get(), thumbnail_path(slot).string().c_str());
+        }
+        if (snapshot_keep_) {
+            save_snapshot_ = std::move(pixels);
+        }
+    }
+    snapshot_slots_.clear();
+    snapshot_keep_ = false;
 }
 
 Texture Game::capture_frame_texture()

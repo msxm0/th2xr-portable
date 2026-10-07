@@ -571,6 +571,25 @@ void Display::retire_bitmap(Bitmap& bitmap)
     spare_targets_.push_back(std::move(bitmap.owned));
 }
 
+void Display::reserve_targets(int width, int height, std::size_t count)
+{
+    constexpr std::size_t spare_max = 8;    // as retire_bitmap keeps
+    std::size_t have = 0;
+    for (const auto& spare : spare_targets_) {
+        have += spare->w == width && spare->h == height ? 1 : 0;
+    }
+    while (have < count && spare_targets_.size() < spare_max) {
+        Texture texture(SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_RGBA32,
+                                          SDL_TEXTUREACCESS_TARGET, width,
+                                          height));
+        if (!texture) {
+            return;
+        }
+        spare_targets_.push_back(std::move(texture));
+        ++have;
+    }
+}
+
 Texture Display::take_spare_target(int width, int height)
 {
     for (auto at = spare_targets_.begin(); at != spare_targets_.end(); ++at) {
@@ -602,6 +621,10 @@ void Display::set_bmp(int bno, Texture texture, int width, int height)
         return;
     }
     auto& bitmap = bitmaps_[bno];
+    // A target this slot made goes back to the pool rather than away: the
+    // next create_bmp of its size would otherwise make a new one, and making
+    // a target is a round trip to the GPU process in a browser.
+    retire_bitmap(bitmap);
     bitmap.owned = std::move(texture);
     bitmap.view = bitmap.owned.get();
     bitmap.width = width;
@@ -622,6 +645,7 @@ void Display::borrow_bmp(
         return;
     }
     auto& bitmap = bitmaps_[bno];
+    retire_bitmap(bitmap);    // see set_bmp
     bitmap.owned.reset();
     bitmap.view = texture;
     bitmap.width = width;
@@ -655,9 +679,12 @@ bool Display::ensure_renderable(int bno)
     }
     // Promote in place: a bitmap loaded as a plain texture becomes a target
     // the first time something renders into it, keeping whatever it held.
-    Texture promoted{SDL_CreateTexture(
-        renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET,
-        bitmap.width, bitmap.height)};
+    Texture promoted = take_spare_target(bitmap.width, bitmap.height);
+    if (!promoted) {
+        promoted.reset(SDL_CreateTexture(
+            renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET,
+            bitmap.width, bitmap.height));
+    }
     if (!promoted) {
         return false;
     }

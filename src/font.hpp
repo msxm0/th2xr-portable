@@ -86,11 +86,30 @@ public:
     // Null disables it and the point path stands in unchanged.
     void set_exact_blend(GlExactBlend* blend);
 
+    // Between begin_batch() and end_batch() the exact glyphs queue up and go
+    // to the GPU as runs (see font_exact.cpp) instead of one draw each.
+    // Only font draws may happen inside: anything else drawn there would
+    // land under glyphs queued before it.  Nests.
+    void begin_batch() const;
+    void end_batch() const;
+    struct Batch {
+        explicit Batch(const GameFont& font) : font_(font) { font_.begin_batch(); }
+        // May throw: a trace's strict GL check fires when the run is flushed,
+        // and a destructor that is noexcept turns that into a bare abort.
+        ~Batch() noexcept(false) { font_.end_batch(); }
+        Batch(const Batch&) = delete;
+        Batch& operator=(const Batch&) = delete;
+        const GameFont& font_;
+    };
+
 private:
     std::uint64_t generation_ = 0;
     struct Modern;
-    struct ExactGlyphs;
-    std::unique_ptr<ExactGlyphs> exact_;
+    struct ExactGlyphs;     // font_exact.cpp, which also deletes it
+    struct ExactGlyphsDelete {
+        void operator()(ExactGlyphs* glyphs) const;
+    };
+    std::unique_ptr<ExactGlyphs, ExactGlyphsDelete> exact_;
     // Returns false when the mask could not be composited, in which case the
     // caller plots it.  `alpha` (0..255) stands in for a missing alpha_256
     // on a layer target - see the definition.

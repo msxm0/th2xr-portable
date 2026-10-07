@@ -2,6 +2,7 @@
 
 #include <SDL3/SDL.h>
 
+#include <cstddef>
 #include <memory>
 
 namespace th2 {
@@ -67,6 +68,24 @@ public:
               // DRW_DrawPOLY4_TT's per-line spans, 8 ints a row (see
               // Display::poly4_rows).  `dst` must then cover the target.
               const int* poly_rows = nullptr, int poly_row_count = 0);
+
+    // A run of glyph masks (draw()'s mode 2) in one draw, out of one atlas
+    // texture.  Every quad reads the destination as it was before the
+    // batch, so the caller must only batch quads whose inked pixels do not
+    // overlap - the order between them then cannot matter, and a texel with
+    // no coverage writes nothing.  Same coordinates as draw(); requires a
+    // capture_destination() first.  False if it could not draw.
+    struct MaskQuad {
+        SDL_FRect src;      // in the atlas, texels
+        SDL_FRect dst;      // as draw()'s dst
+        int alpha;          // 0..256, as draw()'s alpha
+        int red, green, blue;
+    };
+    bool draw_mask_batch(SDL_Renderer* renderer, SDL_Texture* atlas,
+                         const MaskQuad* quads, std::size_t count);
+    // Whether draw_mask_batch can run; builds its program on first asking,
+    // after flushing the renderer (building touches GL state).
+    bool batch_available(SDL_Renderer* renderer);
 
 private:
     struct Impl;

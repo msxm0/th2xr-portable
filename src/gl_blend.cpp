@@ -1,4 +1,5 @@
 #include "gl_blend.hpp"
+#include "gl_blend_impl.hpp"
 
 #include "image.hpp"
 
@@ -20,12 +21,9 @@
 //     Wrong: every frame is red/blue swapped.
 
 // Same build rule as gl_transition: wherever SDL draws through GLES and the
-// headers exist.  See gl_blend.hpp for why this exists alongside the SDL_GPU
-// version rather than replacing it outright.
-#if defined(__EMSCRIPTEN__) || defined(TH2_HAVE_GLES3)
-#define TH2_GL_BLEND 1
-#include <GLES3/gl3.h>
-#endif
+// headers exist (TH2_GL_BLEND, set in gl_blend_impl.hpp).  See gl_blend.hpp
+// for why this exists alongside the SDL_GPU version rather than replacing it
+// outright.
 
 #include <SDL3/SDL_log.h>
 
@@ -52,7 +50,7 @@ void GlExactBlend::set_strict(bool strict)
 
 #ifdef TH2_GL_BLEND
 
-namespace {
+namespace gl_blend_detail {
 
 // See GlExactBlend::set_strict.
 void strict_check(const char* what)
@@ -68,7 +66,7 @@ void strict_check(const char* what)
     }
 }
 
-constexpr char vertex_source[] = R"(#version 300 es
+extern const char vertex_source[] = R"(#version 300 es
 precision highp float;
 in vec2 a_position;      // clip space
 in vec2 a_uv;            // source texture, normalised
@@ -90,7 +88,7 @@ void main()
 // default to lowp, which a GPU may implement as 8 bit fixed point - close
 // enough to misround a level when every texel is read back as an integer -
 // so they are highp too, as in gl_transition.cpp and gl_anime4k.cpp.
-constexpr char fragment_source[] = R"(#version 300 es
+extern const char fragment_source[] = R"(#version 300 es
 precision highp float;
 precision highp int;
 precision highp sampler2D;
@@ -130,6 +128,25 @@ uniform int u_folded;           // mode 4: bit 0/1 - source 1/2 is stored
                                 // folded already (a toned 32 bit load)
 uniform ivec3 u_ink;            // mode 2: the colour the mask is drawn in
 uniform int u_layer;            // 1: the target is a premultiplied layer
+
+// BATCH (gl_blend_batch.cpp): the same shader for a run of glyphs in one
+// draw, each quad carrying its own rectangles, alpha and ink as flat
+// per-vertex inputs.  Everything below reads them through these names, so
+// the per-pixel arithmetic is the one code either way.
+#ifdef BATCH
+flat in ivec4 v_src_rect;
+flat in ivec4 v_dst_rect;
+flat in ivec4 v_alpha_ink;
+#define SRC_RECT v_src_rect
+#define DST_RECT v_dst_rect
+#define ALPHA v_alpha_ink.x
+#define INK v_alpha_ink.yzw
+#else
+#define SRC_RECT u_src_rect
+#define DST_RECT u_dst_rect
+#define ALPHA u_alpha
+#define INK u_ink
+#endif
 
 in vec2 v_uv;
 out vec4 fragment;
@@ -214,15 +231,15 @@ void main()
             ra.w + (rb.y < 0 ? -1 : 1) * ((k * abs(rb.y)) / rb.z));
         at = texel_at;
     } else {
-        ivec2 d = ivec2(gl_FragCoord.xy) - u_dst_rect.xy;
-        d = clamp(d, ivec2(0), max(u_dst_rect.zw - 1, ivec2(0)));
-        ivec2 step = (d * u_src_rect.zw) / max(u_dst_rect.zw, ivec2(1));
+        ivec2 d = ivec2(gl_FragCoord.xy) - DST_RECT.xy;
+        d = clamp(d, ivec2(0), max(DST_RECT.zw - 1, ivec2(0)));
+        ivec2 step = (d * SRC_RECT.zw) / max(DST_RECT.zw, ivec2(1));
         // A reversed axis walks the source backwards from its far edge,
         // which is where DRW_GetStartPointerSrc1 starts it.
         at = ivec2(
-            u_flip.x != 0 ? u_src_rect.z - 1 - step.x : step.x,
-            u_flip.y != 0 ? u_src_rect.w - 1 - step.y : step.y);
-        texel_at = u_src_rect.xy + at;
+            u_flip.x != 0 ? SRC_RECT.z - 1 - step.x : step.x,
+            u_flip.y != 0 ? SRC_RECT.w - 1 - step.y : step.y);
+        texel_at = SRC_RECT.xy + at;
     }
     vec4 texel = texelFetch(u_source, texel_at, 0);
 
@@ -241,12 +258,12 @@ void main()
         ivec3 gdst = read_dest(gat);
         ivec3 gout;
         int gkeep;
-        if (u_alpha >= 256) {
+        if (ALPHA >= 256) {
             // FNT_DrawTextBuf_Fx2's alph==256 branch: BlendTable16 on both
             // terms, which is a divide by 15 and not by 256.
             //     bld_tbl = BlendTable16[c];  rev_tbl = BlendTable16[15-c];
             //     dest = rev_tbl[dest] + bld_tbl[ink];
-            gout = ((15 - coverage) * gdst) / 15 + (coverage * u_ink) / 15;
+            gout = ((15 - coverage) * gdst) / 15 + (coverage * INK) / 15;
             gkeep = (15 - coverage) * 256 / 15;
         } else {
             // The alpha branch of the same function:
@@ -257,11 +274,11 @@ void main()
             // every antialiased glyph pixel came out a level bright.  The
             // engine can use 255 safely because alph==256 never reaches
             // here, so eff is at most 15*255/15 = 255.
-            int geff = blend_table16(coverage, u_alpha);
+            int geff = blend_table16(coverage, ALPHA);
             gout = ivec3(
-                blend_table(255 - geff, gdst.r) + blend_table(geff, u_ink.r),
-                blend_table(255 - geff, gdst.g) + blend_table(geff, u_ink.g),
-                blend_table(255 - geff, gdst.b) + blend_table(geff, u_ink.b));
+                blend_table(255 - geff, gdst.r) + blend_table(geff, INK.r),
+                blend_table(255 - geff, gdst.g) + blend_table(geff, INK.g),
+                blend_table(255 - geff, gdst.b) + blend_table(geff, INK.b));
             gkeep = 255 - geff;
         }
         fragment = vec4(vec3(clamp(gout, 0, 255)) / 255.0, out_alpha(gkeep));
@@ -284,7 +301,7 @@ void main()
             discard;
         }
         int pair = clamp(u_pair, 0, 256);
-        int own = clamp(u_alpha, 0, 256);
+        int own = clamp(ALPHA, 0, 256);
         int blnd3 = (pair * own) >> 8;
         int brev3 = ((256 - pair) * own) >> 8;
         // The rasteriser's bitmaps carry their own alpha; ours do not, so it
@@ -357,7 +374,7 @@ void main()
         discard;
     }
 
-    int blnd = clamp(u_alpha, 0, 256);
+    int blnd = clamp(ALPHA, 0, 256);
     // Draw32.cpp splits on the source texel being fully opaque, and the two
     // branches do NOT use the same destination factor:
     //     a == 255:  brev_tbl  = BlendTable[ 256 - blnd ];
@@ -512,178 +529,101 @@ bool renderer_uses_gl(SDL_Renderer* renderer)
         || driver == "opengles";
 }
 
-struct TextureDelete {
-    void operator()(SDL_Texture* texture) const { SDL_DestroyTexture(texture); }
-};
+}  // namespace gl_blend_detail
 
-}  // namespace
+using namespace gl_blend_detail;
 
-struct GlExactBlend::Impl {
-    GLuint program = 0;
-    GLuint vertex_buffer = 0;
-    GLuint vertex_array = 0;
-    GLint source_location = -1;
-    GLint source2_location = -1;
-    GLint source2_scale_location = -1;
-    GLint rows_location = -1;
-    GLint row_count_location = -1;
-    GLuint rows_name = 0;
-    GLint src_rect_location = -1;
-    GLint dst_rect_location = -1;
-    GLint src2_origin_location = -1;
-    GLint flip_location = -1;
-    GLint pair_location = -1;
-    GLint folded_location = -1;
-    GLint dest_location = -1;
-    GLint target_location = -1;
-    GLint alpha_location = -1;
-    GLint bright_locations[3] = {-1, -1, -1};
-    GLint mode_location = -1;
-    GLint ink_location = -1;
-    GLint layer_location = -1;
-    bool ready = false;
-
-    // A copy of the render target.  Sampling the texture being drawn into is
-    // a feedback loop and undefined, so the destination is read from here
-    // instead.
-    //
-    // A raw GL texture rather than an SDL one: SDL's GLES backend does not
-    // publish SDL_PROP_TEXTURE_OPENGLES2_TEXTURE_NUMBER for textures created
-    // with SDL_TEXTUREACCESS_TARGET (an ordinary texture gets a name, a
-    // target gets 0), so an SDL scratch could never be bound as a sampler.
-    // glCopyTexSubImage2D reads the bound framebuffer directly, which is
-    // both simpler and one less full render pass than copying through SDL.
-    GLuint scratch_name = 0;
-    // The program's uniforms as last set.  Nothing but this class uses the
-    // program, so a value that has not changed since the last draw does not
-    // need sending again - and in WebGL every call is a command the GPU
-    // process validates and forwards, ~45 of them per glyph before this.
-    bool samplers_set = false;
-    std::unordered_map<GLint, std::array<GLint, 4>> uniform_cache;
-    bool changed(GLint location, std::array<GLint, 4> value)
-    {
-        auto [at, inserted] = uniform_cache.try_emplace(location, value);
-        if (!inserted && at->second == value) {
-            return false;
-        }
-        at->second = value;
-        return true;
-    }
-    void uniform_i(GLint location, GLint a)
-    {
-        if (changed(location, {a, 0, 0, 0})) glUniform1i(location, a);
-    }
-    void uniform_i(GLint location, GLint a, GLint b)
-    {
-        if (changed(location, {a, b, 0, 0})) glUniform2i(location, a, b);
-    }
-    void uniform_i(GLint location, GLint a, GLint b, GLint c)
-    {
-        if (changed(location, {a, b, c, 0})) glUniform3i(location, a, b, c);
-    }
-    void uniform_i(GLint location, GLint a, GLint b, GLint c, GLint d)
-    {
-        if (changed(location, {a, b, c, d})) glUniform4i(location, a, b, c, d);
-    }
-    void uniform_f(GLint location, float a, float b)
-    {
-        if (changed(location, {std::bit_cast<GLint>(a), std::bit_cast<GLint>(b), 0, 0})) {
-            glUniform2f(location, a, b);
-        }
-    }
-    int scratch_width = 0;
-    int scratch_height = 0;
-    bool captured = false;
-
-    // Copies [x0,x1)x[y0,y1) of the bound framebuffer, a width x height
-    // render target, into the scratch.  False if the box is empty.
-    bool copy_destination(int width, int height, int x0, int y0, int x1,
-                          int y1);
-
-    Impl()
-    {
-        const GLuint vertex = compile(GL_VERTEX_SHADER, vertex_source);
-        const GLuint fragment = compile(GL_FRAGMENT_SHADER, fragment_source);
-        if (!vertex || !fragment) {
-            glDeleteShader(vertex);
-            glDeleteShader(fragment);
-            return;
-        }
-        program = glCreateProgram();
-        glAttachShader(program, vertex);
-        glAttachShader(program, fragment);
-        glBindAttribLocation(program, 0, "a_position");
-        glBindAttribLocation(program, 1, "a_uv");
-        glLinkProgram(program);
+GlExactBlend::Impl::Impl()
+{
+    const GLuint vertex = compile(GL_VERTEX_SHADER, vertex_source);
+    const GLuint fragment = compile(GL_FRAGMENT_SHADER, fragment_source);
+    if (!vertex || !fragment) {
         glDeleteShader(vertex);
         glDeleteShader(fragment);
+        return;
+    }
+    program = glCreateProgram();
+    glAttachShader(program, vertex);
+    glAttachShader(program, fragment);
+    glBindAttribLocation(program, 0, "a_position");
+    glBindAttribLocation(program, 1, "a_uv");
+    glLinkProgram(program);
+    glDeleteShader(vertex);
+    glDeleteShader(fragment);
 
-        GLint linked = 0;
-        glGetProgramiv(program, GL_LINK_STATUS, &linked);
-        if (!linked) {
-            char log[512]{};
-            glGetProgramInfoLog(program, sizeof(log) - 1, nullptr, log);
-            SDL_Log("exact blend shader failed to link: %s", log);
-            glDeleteProgram(program);
-            program = 0;
-            return;
-        }
-
-        source_location = glGetUniformLocation(program, "u_source");
-        source2_location = glGetUniformLocation(program, "u_source2");
-        source2_scale_location =
-            glGetUniformLocation(program, "u_source2_scale");
-        pair_location = glGetUniformLocation(program, "u_pair");
-        folded_location = glGetUniformLocation(program, "u_folded");
-        rows_location = glGetUniformLocation(program, "u_rows");
-        row_count_location = glGetUniformLocation(program, "u_row_count");
-        src_rect_location = glGetUniformLocation(program, "u_src_rect");
-        dst_rect_location = glGetUniformLocation(program, "u_dst_rect");
-        src2_origin_location = glGetUniformLocation(program, "u_src2_origin");
-        flip_location = glGetUniformLocation(program, "u_flip");
-        dest_location = glGetUniformLocation(program, "u_dest");
-        target_location = glGetUniformLocation(program, "u_target");
-        alpha_location = glGetUniformLocation(program, "u_alpha");
-        bright_locations[0] = glGetUniformLocation(program, "u_bright_r");
-        bright_locations[1] = glGetUniformLocation(program, "u_bright_g");
-        bright_locations[2] = glGetUniformLocation(program, "u_bright_b");
-        mode_location = glGetUniformLocation(program, "u_mode");
-        ink_location = glGetUniformLocation(program, "u_ink");
-        layer_location = glGetUniformLocation(program, "u_layer");
-
-        // Four vertices, rewritten per draw: position then uv.
-        glGenVertexArrays(1, &vertex_array);
-        glGenBuffers(1, &vertex_buffer);
-        glBindVertexArray(vertex_array);
-        glBindBuffer(GL_ARRAY_BUFFER, vertex_buffer);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(GLfloat) * 16, nullptr,
-                     GL_DYNAMIC_DRAW);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
-                              sizeof(GLfloat) * 4, nullptr);
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(GLfloat) * 4,
-                              reinterpret_cast<const void*>(
-                                  sizeof(GLfloat) * 2));
-        glBindVertexArray(0);
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-
-        ready = glGetError() == GL_NO_ERROR;
+    GLint linked = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        char log[512]{};
+        glGetProgramInfoLog(program, sizeof(log) - 1, nullptr, log);
+        SDL_Log("exact blend shader failed to link: %s", log);
+        glDeleteProgram(program);
+        program = 0;
+        return;
     }
 
-    ~Impl()
-    {
-        if (scratch_name) glDeleteTextures(1, &scratch_name);
-        if (rows_name) glDeleteTextures(1, &rows_name);
-        if (vertex_array) glDeleteVertexArrays(1, &vertex_array);
-        if (vertex_buffer) glDeleteBuffers(1, &vertex_buffer);
-        if (program) glDeleteProgram(program);
-    }
-};
+    source_location = glGetUniformLocation(program, "u_source");
+    source2_location = glGetUniformLocation(program, "u_source2");
+    source2_scale_location =
+        glGetUniformLocation(program, "u_source2_scale");
+    pair_location = glGetUniformLocation(program, "u_pair");
+    folded_location = glGetUniformLocation(program, "u_folded");
+    rows_location = glGetUniformLocation(program, "u_rows");
+    row_count_location = glGetUniformLocation(program, "u_row_count");
+    src_rect_location = glGetUniformLocation(program, "u_src_rect");
+    dst_rect_location = glGetUniformLocation(program, "u_dst_rect");
+    src2_origin_location = glGetUniformLocation(program, "u_src2_origin");
+    flip_location = glGetUniformLocation(program, "u_flip");
+    dest_location = glGetUniformLocation(program, "u_dest");
+    target_location = glGetUniformLocation(program, "u_target");
+    alpha_location = glGetUniformLocation(program, "u_alpha");
+    bright_locations[0] = glGetUniformLocation(program, "u_bright_r");
+    bright_locations[1] = glGetUniformLocation(program, "u_bright_g");
+    bright_locations[2] = glGetUniformLocation(program, "u_bright_b");
+    mode_location = glGetUniformLocation(program, "u_mode");
+    ink_location = glGetUniformLocation(program, "u_ink");
+    layer_location = glGetUniformLocation(program, "u_layer");
+
+    // Four vertices, rewritten per draw: position then uv.
+    glGenVertexArrays(1, &vertex_array);
+    glGenBuffers(1, &vertex_buffer);
+    glBindVertexArray(vertex_array);
+    glBindBuffer(GL_ARRAY_BUFFER, vertex_buffer);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(GLfloat) * 16, nullptr,
+                 GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
+                          sizeof(GLfloat) * 4, nullptr);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(GLfloat) * 4,
+                          reinterpret_cast<const void*>(
+                              sizeof(GLfloat) * 2));
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    ready = glGetError() == GL_NO_ERROR;
+}
+
+GlExactBlend::Impl::~Impl()
+{
+    if (batch_vertex_array) glDeleteVertexArrays(1, &batch_vertex_array);
+    if (batch_vertex_buffer) glDeleteBuffers(1, &batch_vertex_buffer);
+    if (batch_program) glDeleteProgram(batch_program);
+    if (scratch_name) glDeleteTextures(1, &scratch_name);
+    if (rows_name) glDeleteTextures(1, &rows_name);
+    if (vertex_array) glDeleteVertexArrays(1, &vertex_array);
+    if (vertex_buffer) glDeleteBuffers(1, &vertex_buffer);
+    if (program) glDeleteProgram(program);
+}
 
 GlExactBlend::GlExactBlend(SDL_Renderer* renderer)
     : impl_(renderer_uses_gl(renderer) ? std::make_unique<Impl>() : nullptr)
 {
+    // The glyph batch program too, now rather than at the first text: in a
+    // browser its link status is a round trip to the GPU process that waits
+    // for the compile, and it landed in a 15 ms frame early in the first
+    // dialogue.
+    batch_available(renderer);
 }
 
 GlExactBlend::~GlExactBlend() = default;
@@ -916,7 +856,7 @@ bool GlExactBlend::draw(
         x1, y1, u1, v1,
     };
 
-    glUseProgram(impl_->program);
+    impl_->use(impl_->program);
     const auto bind = [](GLenum unit, GLuint name) {
         glActiveTexture(unit);
         glBindTexture(GL_TEXTURE_2D, name);

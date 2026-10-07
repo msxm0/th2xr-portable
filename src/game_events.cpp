@@ -1287,14 +1287,13 @@ void Game::exec_control_lang(bool skipping)
             constexpr auto minimum_interval = std::chrono::minutes(2);
             if (last_save_time_.time_since_epoch().count() == 0
                 || now - last_save_time_ >= minimum_interval) {
-                if (!save_snapshot_) {
-                    save_snapshot_ = capture_frame_thumbnail(
-    save_thumbnail_width, save_thumbnail_height);
+                if (!has_save_snapshot()) {
+                    capture_save_snapshot();
                 }
                 perform_autosave();
                 // Refresh the save snapshot so the next autosave has an
                 // up-to-date thumbnail.
-                save_snapshot_.reset();
+                reset_save_snapshot();
             }
         }
     }

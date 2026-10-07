@@ -1,5 +1,6 @@
 #include "game.hpp"
 
+#include "data_source.hpp"
 #include "icon.hpp"
 #include "image.hpp"
 
@@ -16,6 +17,7 @@
 #include <ctime>
 #include <exception>
 #include <format>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -23,7 +25,9 @@
 #include <numbers>
 #include <ranges>
 #include <stdexcept>
+#include <span>
 #include <unordered_set>
+#include <vector>
 
 #ifdef _WIN32
 #define localtime_r(timep, result) localtime_s(result, timep)
@@ -130,6 +134,66 @@ std::filesystem::path Game::blend_shader_dir() const
     return base / ".." / "Resources" / TH2_BLEND_SHADER_DIR;
 }
 
+// SDL's GLES2 renderer compiles its shaders up front but links each
+// vertex/fragment pair the first time a draw needs it - in a browser a
+// synchronous round trip to the GPU process for the link status, which landed
+// in the middle of a scene the first time the overlay and side bar were drawn.
+// One throwaway draw of each kind the game uses links them all now: solid
+// fills and the two byte orders of 32-bit texture (RGBA32 is SDL's ABGR
+// program, BGRA32 its ARGB one; RGBA8888 textures are converted to one of
+// those).  Into a 1x1 target that nothing else sees, so no picture changes.
+void Game::warm_renderer_programs()
+{
+    SDL_Texture* const held = SDL_GetRenderTarget(renderer_);
+    th2app::Texture scratch(SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_RGBA32,
+                                              SDL_TEXTUREACCESS_TARGET, 1, 1));
+    if (!scratch || !SDL_SetRenderTarget(renderer_, scratch.get())) {
+        return;
+    }
+    const SDL_FRect pixel{0.0f, 0.0f, 1.0f, 1.0f};
+    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 0);
+    SDL_RenderFillRect(renderer_, &pixel);
+    const std::uint32_t texel = 0;
+    for (const auto format : {SDL_PIXELFORMAT_RGBA32, SDL_PIXELFORMAT_BGRA32}) {
+        th2app::Texture source(SDL_CreateTexture(
+            renderer_, format, SDL_TEXTUREACCESS_STATIC, 1, 1));
+        if (source && SDL_UpdateTexture(source.get(), nullptr, &texel, 4)) {
+            SDL_RenderTexture(renderer_, source.get(), nullptr, &pixel);
+            SDL_FlushRenderer(renderer_);
+        }
+    }
+    SDL_SetRenderTarget(renderer_, held);
+    SDL_FlushRenderer(renderer_);
+    // And the targets the first scenes would otherwise make in the middle of
+    // themselves: the thumbnail's, a wipe's two frame copies, and the
+    // screen-sized bitmaps the scripts ask for (the backdrop, its half-toned
+    // copy, a scratch) - 3 was the most ever live at once over ERRATIC2.
+    if (!thumbnail_target_) {
+        thumbnail_target_.reset(SDL_CreateTexture(
+            renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET,
+            save_thumbnail_width, save_thumbnail_height));
+    }
+    float art_width = 0.0f;
+    float art_height = 0.0f;
+    if (upscaler_
+        && SDL_GetTextureSize(upscaler_->art_target(), &art_width, &art_height)) {
+        const int width = static_cast<int>(art_width);
+        const int height = static_cast<int>(art_height);
+        while (spare_frame_targets_.size() < 2) {
+            Texture target(SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_RGBA32,
+                                             SDL_TEXTUREACCESS_TARGET, width,
+                                             height));
+            if (!target) {
+                break;
+            }
+            spare_frame_targets_.push_back(std::move(target));
+        }
+        if (display_) {
+            display_->reserve_targets(width, height, 3);
+        }
+    }
+}
+
 void Game::ensure_upscaler()
 {
     if (last_anime4k_wanted_ == config_.anime4k) {
@@ -227,6 +291,89 @@ void Game::toggle_fullscreen()
 #endif
 }
 
+namespace {
+
+// A movie read out of mov.pak as it plays, a chunk at a time.  The movies
+// are stored uncompressed, so an entry's byte range is the .avi itself.
+// In the browser every chunk is also an HTTP range, so the next few are
+// asked for ahead of the decoder (a no-op natively, where a chunk is a disk
+// read of a millisecond).  Reading the whole entry before the first frame
+// was 18 ms on the frame the opening movie started, and up to 80 MB of
+// wasm heap for an ending.
+class ArchiveMovie final : public th2::VideoSource {
+public:
+    ArchiveMovie(std::filesystem::path path, std::uint64_t offset,
+                 std::uint64_t size)
+        : path_(std::move(path)), base_(offset), size_(size)
+    {
+    }
+
+    std::uint64_t size() const override { return size_; }
+
+    bool read(std::uint64_t offset, std::span<std::uint8_t> out) override
+    {
+        while (!out.empty()) {
+            if (offset >= size_) {
+                return false;
+            }
+            const std::uint64_t index = offset / chunk_size;
+            if (index != chunk_index_ || chunk_.empty()) {
+                if (!load(index)) {
+                    return false;
+                }
+            }
+            const auto within = static_cast<std::size_t>(offset - index * chunk_size);
+            const auto n = std::min(out.size(), chunk_.size() - within);
+            std::copy_n(chunk_.data() + within, n, out.data());
+            out = out.subspan(n);
+            offset += n;
+        }
+        return true;
+    }
+
+private:
+    static constexpr std::uint64_t chunk_size = 1 << 20;
+    static constexpr int read_ahead = 3;
+
+    std::uint64_t chunk_length(std::uint64_t index) const
+    {
+        const auto start = index * chunk_size;
+        return start >= size_ ? 0 : std::min(chunk_size, size_ - start);
+    }
+
+    bool load(std::uint64_t index)
+    {
+        const auto length = chunk_length(index);
+        if (length == 0) {
+            return false;
+        }
+        chunk_.resize(static_cast<std::size_t>(length));
+        if (!th2::data_read(path_, base_ + index * chunk_size, chunk_)) {
+            chunk_.clear();
+            return false;
+        }
+        chunk_index_ = index;
+        // The demuxer reads forward, apart from the index at the very end
+        // that it looks at when it opens the file.
+        for (int ahead = 1; ahead <= read_ahead; ++ahead) {
+            const auto next = index + static_cast<std::uint64_t>(ahead);
+            if (const auto bytes = chunk_length(next)) {
+                th2::data_prefetch_pin(path_, base_ + next * chunk_size,
+                                       static_cast<std::size_t>(bytes), false);
+            }
+        }
+        return true;
+    }
+
+    std::filesystem::path path_;
+    std::uint64_t base_;
+    std::uint64_t size_;
+    std::vector<std::uint8_t> chunk_;
+    std::uint64_t chunk_index_ = 0;
+};
+
+}  // namespace
+
 void Game::start_movie(int mode, int number, bool resume_script)
 {
     std::string name;
@@ -268,9 +415,20 @@ void Game::start_movie(int mode, int number, bool resume_script)
         if (!entry) {
             throw std::runtime_error("movie not found: " + name);
         }
-        movie_bytes_ = movie_archive_.read(*entry);
-        movie_ = std::make_unique<th2::VideoPlayer>(
-            renderer_, movie_bytes_, destination);
+        if (entry->compressed) {
+            // Not in the shipped archive, but a compressed entry's range is
+            // an LZS stream, not the file: that one is read whole.
+            movie_bytes_ = movie_archive_.read(*entry);
+            movie_ = std::make_unique<th2::VideoPlayer>(
+                renderer_, movie_bytes_, destination);
+        } else {
+            const auto range = movie_archive_.range_of(*entry);
+            movie_ = std::make_unique<th2::VideoPlayer>(
+                renderer_,
+                std::make_unique<ArchiveMovie>(range.path, range.offset,
+                                               range.size),
+                destination);
+        }
     }
     movie_resume_script_ = resume_script;
     movie_mode_ = mode;
