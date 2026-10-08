@@ -337,7 +337,15 @@ void Game::setup_background_graphs(
         for (const auto& [gno, saved] :
              {std::pair{th2::grp_back, zoom0},
               std::pair{th2::grp_back + 1, zoom1}}) {
-            if (display().graph(gno).bno != saved.bno) {
+            // Also when the graph was seated just above, on the frame the
+            // wipe starts: AVG_SetBack puts the snapshot on GRP_BACK+1 in the
+            // script pass, before AVG_ControlBackChange zooms it, so the
+            // engine's first frame is already zoomed.  Matching only the old
+            // bitmap dropped that zoom for one tick (494763, BAK_CFZOOM2).
+            const int seated = gno == th2::grp_back ? back_bmp
+                                                    : th2::bmp_back + 1;
+            if (display().graph(gno).bno != saved.bno
+                && display().graph(gno).bno != seated) {
                 continue;
             }
             if (saved.poly == th2::Poly::zoom) {

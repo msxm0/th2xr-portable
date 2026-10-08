@@ -126,4 +126,5 @@ def main():
     sys.exit(status)
 
 
-main()
+if __name__ == "__main__":
+    main()

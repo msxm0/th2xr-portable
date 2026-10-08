@@ -96,7 +96,19 @@ stop_ref || exit 1
 # Whoever parks a reference says which one it is (window.sh); a fresh start
 # from here is nobody's until they do.
 rm -f /tmp/claude-1000/th2ref.running
-setsid wine th2ref.exe > /tmp/claude-1000/ref.log 2>&1 < /dev/null &
+# Through Wine's own Wayland driver, not X11: with DISPLAY set every frame
+# the engine blits goes through Xwayland, which on this machine's display
+# path (vkms scanout, KWin copying in) costs it most of a core and holds the
+# engine to about 52 ticks a second.  Without it the same run does about
+# 330, and its state, frames and hashes are byte-identical - the engine
+# draws into its own buffers and the window is only a copy of them.
+# TH2REF_X11=1 keeps the old path.
+if [ "${TH2REF_X11:-0}" = 1 ]; then
+    setsid wine th2ref.exe > /tmp/claude-1000/ref.log 2>&1 < /dev/null &
+else
+    setsid env -u DISPLAY wine th2ref.exe > /tmp/claude-1000/ref.log 2>&1 \
+        < /dev/null &
+fi
 disown
 
 # Wait on the state trace, not on the last frame.  The state line is written

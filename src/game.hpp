@@ -1067,8 +1067,11 @@ private:
     // indexes it by ESC_ id.  Non-zero means this instruction has already run
     // its set-up and is only re-asking its wait; the four background opcodes
     // count to two, because they clear the old half tone a frame before they
-    // set the new picture.
-    std::array<std::uint8_t, 256> eopr_flag_{};
+    // set the new picture.  Event opcodes run past 255 (VT is 286,
+    // GetSystemTime 297): sized for all of them, and indexed with a check,
+    // because at 256 every waiting opcode above it read and bumped whatever
+    // member came next - VT found 131 there and skipped its set-up.
+    std::array<std::uint8_t, 512> eopr_flag_{};
     // Which of those phases handle() is being called for.
     int opcode_phase_ = 1;
     bool demo_mode_ = false;

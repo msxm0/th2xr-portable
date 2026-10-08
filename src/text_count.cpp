@@ -470,7 +470,14 @@ bool txt_get_text_end_key_wait(std::string_view str)
 bool txt_cursor_after(const TextCount& counted, const TextBox& box,
                       std::size_t shown, int* x, int* y)
 {
-    if (shown == 0 || shown > counted.cursor_x.size()) {
+    if (shown == 0) {
+        // Nothing drawn: TXT_DrawTextEx's px/py never left (sx, sy), and
+        // its kaigyou test needs py != sy, so the cursor is the origin.
+        *x = box.sx;
+        *y = box.sy;
+        return true;
+    }
+    if (shown > counted.cursor_x.size()) {
         return false;
     }
     const auto i = shown - 1;

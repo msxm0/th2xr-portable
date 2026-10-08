@@ -533,7 +533,11 @@ void Game::draw_click_indicator()
     // GRP_KEYWAIT.  AVG_ControlNovelMessage puts it up in MSG_WAIT and
     // MSG_STOP and takes it down everywhere else, so this only has to say
     // where it goes.
-    if (!keywait_visible_ || !message_shown() || message_.empty()) {
+    // Not message_.empty(): a line with nothing to show - a bare \k wait -
+    // still gets the mark, at the origin of the text box, in the engine's
+    // layout (030320000.sdt pc 8085: seventeen ticks of the spinning petal
+    // the port did not draw).
+    if (!keywait_visible_ || !message_shown()) {
         return;
     }
     const bool end_of_block = keywait_page_end_;
@@ -565,6 +569,9 @@ void Game::draw_click_indicator()
         return;
     }
 
+    if (message_.empty()) {
+        return;
+    }
     // DSP_GetTextDispPos( TXT_WINDOW, &px, &py ): where the *next* character
     // would be drawn, which is the end of what has actually been revealed -
     // not the end of the string.  Taking it from the whole string left the

@@ -1185,6 +1185,10 @@ void Game::exec_control_lang(bool skipping)
             const auto kind = opcode_wait_kind(name);
             const auto opcode = step.event.instruction.opcode;
             const int phases = opcode_phases(name);
+            if (opcode >= eopr_flag_.size()) {
+                throw std::runtime_error(std::format(
+                    "opcode {} ({}) past EOprFlag", opcode, name));
+            }
             auto& latch = eopr_flag_[opcode];
 
             if (kind == WaitKind::none || latch < phases) {
