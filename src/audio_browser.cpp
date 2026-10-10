@@ -181,10 +181,24 @@ EM_JS(void, th2_audio_init_js, (), {
             }
             return;
         }
+        // Firefox hands out empty AudioData (a Vorbis stream's first packet
+        // only primes the overlap), and copyTo throws on those.
+        if (frames === 0) {
+            data.close();
+            return;
+        }
         var first = (record.dest >> 2) + at * record.channels;
         // HEAPF32 is looked up here, not kept: a growing heap replaces it.
-        data.copyTo(HEAPF32.subarray(first, first + frames * record.channels),
-                    {planeIndex: 0, format: 'f32'});
+        try {
+            data.copyTo(HEAPF32.subarray(first, first + frames * record.channels),
+                        {planeIndex: 0, format: 'f32'});
+        } catch (e) {
+            // Thrown from the decoder's output callback it would reach the
+            // page as an uncaught error; ffmpeg decodes the file instead.
+            data.close();
+            audio.fail(record);
+            return;
+        }
         data.close();
         record.frames = at + frames;
     };

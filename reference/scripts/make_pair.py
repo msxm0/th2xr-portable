@@ -107,7 +107,7 @@ def main():
                f"# Scenario ticks, shifted by {args.offset}.",
                f"{args.first + args.offset} every {args.period} lclick 3",
                f"{args.first + args.offset} every 1 num1"]
-        ref += [f"{t + args.offset} {rest}" for t, rest in extra]
+        ref += [shift_line(f"{t} {rest}", args.offset) for t, rest in extra]
         (here / f"{args.name}-ref.txt").write_text("\n".join(ref) + "\n")
 
         print(f"wrote {args.name}-ours.txt and {args.name}-ref.txt (repeating)")

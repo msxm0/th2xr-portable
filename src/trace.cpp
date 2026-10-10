@@ -93,6 +93,32 @@ void TraceScript::load(const std::filesystem::path& path)
         }
         what = lower(std::move(what));
 
+        if (what == "at") {
+            std::string where;
+            TraceRule rule;
+            if (!(parts >> where >> rule.key)
+                || where.find('@') == std::string::npos) {
+                throw std::runtime_error(
+                    path.string() + ":" + std::to_string(number)
+                    + ": at needs <script>@<pc> <key>");
+            }
+            rule.key = lower(std::move(rule.key));
+            if (std::ranges::find(known_keys, rule.key) == known_keys.end()) {
+                throw std::runtime_error(
+                    path.string() + ":" + std::to_string(number)
+                    + ": unknown key '" + rule.key + "'");
+            }
+            const auto at = where.find('@');
+            rule.script = lower(where.substr(0, at));
+            if (const auto dot = rule.script.find('.');
+                dot != std::string::npos) {
+                rule.script.erase(dot);
+            }
+            rule.pc = static_cast<std::uint32_t>(
+                std::stoul(where.substr(at + 1)));
+            rules_.push_back(std::move(rule));
+            continue;
+        }
         TraceEvent event;
         event.tick = tick;
         event.until = until;
@@ -115,6 +141,17 @@ void TraceScript::load(const std::filesystem::path& path)
         if (what == "mappick") {
             event.kind = TraceEvent::Kind::mappick;
             event.hold = 1;
+            // "mappick 8,9": MapEvent chr_no values, most wanted first.
+            std::string prefer;
+            if (parts >> prefer) {
+                std::istringstream list(prefer);
+                std::string number_text;
+                while (std::getline(list, number_text, ',')) {
+                    if (!number_text.empty()) {
+                        event.prefer.push_back(std::stoi(number_text));
+                    }
+                }
+            }
             if (event.period == 0) {
                 event.period = 1;
             }
@@ -202,6 +239,7 @@ TraceInputState TraceScript::at(std::uint64_t tick) const
             break;
         case TraceEvent::Kind::mappick:
             state.map_pick = true;
+            state.map_prefer = event.prefer;
             break;
         default:
             break;
@@ -255,7 +293,12 @@ std::string format_trace_event(const TraceEvent& event)
             + " " + std::to_string(event.y);
     case TraceEvent::Kind::lclick: what = "lclick"; break;
     case TraceEvent::Kind::rclick: what = "rclick"; break;
-    case TraceEvent::Kind::mappick: what = "mappick"; break;
+    case TraceEvent::Kind::mappick:
+        what = "mappick";
+        for (std::size_t i = 0; i < event.prefer.size(); ++i) {
+            what += (i == 0 ? " " : ",") + std::to_string(event.prefer[i]);
+        }
+        break;
     case TraceEvent::Kind::key: what = event.key; break;
     }
     std::string line = std::to_string(event.tick);

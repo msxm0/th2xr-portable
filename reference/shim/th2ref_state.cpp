@@ -345,6 +345,17 @@ static void note_click(void)
     fflush(log);
 }
 
+/* For th2ref_input's "at <script>@<pc>" rules: where the script stands
+ * when the input is sampled, which is before EXEC_ControlLang runs. */
+extern "C" const char *th2ref_script_name(void)
+{
+    return NowLangFileName;
+}
+extern "C" unsigned long th2ref_script_pc(void)
+{
+    return EXEC_LangInfo ? EXEC_LangInfo->pc : 0;
+}
+
 extern "C" void th2ref_dump_state(void)
 {
     th2ref_tick_done(MainWindow.draw_flag);

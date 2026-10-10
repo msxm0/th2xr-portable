@@ -1,0 +1,16 @@
+# Route sangoruri: answer every map with character 10 or 5 when one is offered.
+# Their route opens at the 04/09 lunch break (EV_0409LUNCH_BREAK ->
+# 050409000), which needs flag 750, flag 30 at most 18, and none of 206, 320,
+# 964, or 809+860 without 899.
+# - Flag 30 is a running total of character 1's events (010xxxxxx add 2-5
+#   each); taking 1 and 12 whenever nothing else was listed reached 24 by
+#   03/23.  So they come after Konomi and Yuma.
+# - Never (-N): Konomi's 020000900 (every branch sets 206), Yuma's 070000700
+#   (708, which stops 750 on 03/24), Tamaki's 030322000 (309, then 320 on the
+#   04/09 morning) and 110026300 (964).
+30 every 1 mappick 10,5,13,9,11,2,7,14,8,1,12,-20000900,-70000700,-30322000,-110026300
+# On 03/22 every other destination is one of those four, so Yuma has to have
+# an event left short of 070000700.  Taken on 03/12, 03/15, 03/16 and 03/17
+# she has none; so 03/16-03/18 prefer character 1 (010317000, 010318000),
+# leaving her 070000670 for 03/22.  14's chain never opens on this route.
+271000 every 1 mappick 10,5,13,9,11,2,1,7,14,8,12,-20000900,-70000700,-30322000,-110026300 until 300000

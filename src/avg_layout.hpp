@@ -78,5 +78,10 @@ inline constexpr int grp_script = grp_work + 100;           // 523
 // GRP_SCRIPT..GRP_ENDING so the overlays darken with the background.
 inline constexpr int grp_ending = grp_script + max_script_obj;   // 555
 inline constexpr int grp_map = grp_ending + 20;                  // 575
+// GRP_DISP and BMP_DISP: AVG_SetFade's frozen screen, which stands in for
+// everything below it while a fade with disp ON runs.
+inline constexpr int grp_disp = grp_map + 40;                    // 615
+inline constexpr int bmp_ending = bmp_script + max_script_obj;   // 138
+inline constexpr int bmp_disp = bmp_ending + 40 + 4 + 4 + 4 + 3 + 32;  // 225
 
 }  // namespace th2

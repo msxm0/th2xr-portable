@@ -1358,11 +1358,12 @@ void Game::draw_frame()
         present_frame();
         return;
     }
-    // The calendar's page is the engine's art too: it builds up over the
-    // last picture (see below), so outside a trace it is drawn here rather
-    // than on the overlay, which is cleared every frame.  In a trace the
-    // overlay already is the art target.
-    const bool calendar_in_art = calendar_state_ && !clock_state_
+    // The calendar's page and the clock are the engine's art too: they build
+    // up over the last picture where no background covers it (see below), so
+    // outside a trace they are drawn here rather than on the overlay, which
+    // is cleared every frame.  In a trace the overlay already is the art
+    // target.
+    const bool calendar_in_art = (calendar_state_ || clock_state_)
         && !trace_mode_;
     // The art pass, into `target`: the art target on a tick, its copy on a
     // frame between ticks (see below).
@@ -1387,18 +1388,15 @@ void Game::draw_frame()
         // GRP_BACK at LAY_BACK, with the shake's transform on it, and the
         // darkened copy next door at LAY_BACK+2 with the same transform.
         setup_background_graphs(shake, shake_background, shake_characters);
-        // Not under a calendar: AVG_SetCalender's AVG_ResetBack( 0 ) leaves no
-        // background at all, and the engine draws nothing where there is none -
-        // its framebuffer keeps the last frame, which is what the page's
-        // DRW_BLD( count*16 ) fade-in builds up on.  Painted black here instead,
-        // every frame of the fade was the page over black: 3/4 brightness on its
-        // twelfth frame, where the reference's was all but solid.
-        if (!display().bmp_flag(th2::bmp_back2) && bg_scene_ == 0
-            && !calendar_state_) {
-            SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
-            const SDL_FRect game_area{0.0f, 0.0f, 800.0f, 600.0f};
-            SDL_RenderFillRect(renderer_, &game_area);
-        }
+        // Nothing where there is no background.  AVG_SetCalender's
+        // AVG_ResetBack( 0 ) leaves none at all, and the engine draws nothing
+        // in its place - its framebuffer keeps the last frame, which is what
+        // the page's DRW_BLD( count*16 ) fade-in builds up on, and after it
+        // the map's clock, on a day no script put a background up (04/28 on
+        // the Tamaki route): the dial's translucent face brightens frame on
+        // frame, the hands leave trails and the fade-out lingers.  This used
+        // to paint black for a released scene 0, under the page and the
+        // clock alike, and each frame of either was then drawn over black.
         // DSP_DrawGraph: layers 0 to LAYER_MAX, every visible graph on each.
         // Everything in the art pass is a graph now - GRP_WORK at 0, GRP_BACK at
         // LAY_BACK, the script's overlays wherever SetBmpEx put them, GRP_BACK+1
@@ -1441,6 +1439,8 @@ void Game::draw_frame()
         || (present_scene_
             && (character_animation_active() || back().fd_flag
                 || back().br_flag || back().sc_flag
+                || (avgback().fade().flag
+                    && display().graph(th2::grp_disp).flag)
                 || msg().half_tone().tstep == th2::tone_fadeout));
     if (art_moving) {
         if (SDL_Texture* const scratch = ensure_subtick_art()) {
@@ -1543,6 +1543,14 @@ void Game::draw_frame()
             // Interleaved, a glyph's shadow darkens the *previous* glyph's
             // antialiased edge where the two cells meet - one column per
             // character, which is where the last of the text difference was.
+            //
+            // The novel text has no DSP_SetTextClip, so TXT_DrawText clips
+            // to the screen - which a text shake can push it across.
+            font_.set_engine_clip(0, th2::display_width);
+            struct ClearClip {
+                const th2::GameFont& font;
+                ~ClearClip() { font.clear_engine_clip(); }
+            } clear_clip{font_};
             for (int pass = 0; pass < 2; ++pass) {
             // A pass is font draws only, so it can go to the GPU as runs.
             const th2::GameFont::Batch batch(font_);
@@ -1845,9 +1853,12 @@ void Game::draw_frame()
     // turned off.  The bar and the petals are not under it: their control
     // passes (ControlHistorySystem, AVG_ControlWeather) turn their graphs
     // back on every tick, so they stand over the fade at their own alpha -
-    // the bar fading itself in over a load's fade from black.
+    // the bar fading itself in over a load's fade from black.  With GRP_DISP
+    // up the display has drawn all of that already; the tint below is for a
+    // fade that never froze the screen.
     select_overlay();
-    if (screen_flash_ && !(trace_mode_ && draw_exact_fade())) {
+    if (screen_flash_ && !display().graph(th2::grp_disp).flag
+        && !(trace_mode_ && draw_exact_fade())) {
         SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
         SDL_SetRenderDrawColor(
             renderer_,

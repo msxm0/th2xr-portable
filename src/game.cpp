@@ -370,8 +370,11 @@ Game::Game(
     omake_replay_background_ = try_load("t3000.tga");
     if (const auto* entry = graphics_.find("t0001.tga")) {
         Surface loaded(th2::load_image(graphics_.read(*entry), entry->name));
-        title_foreground_pixels_.reset(
-            SDL_ConvertSurface(loaded.get(), SDL_PIXELFORMAT_RGBA32));
+        // The title's pixel pass reads it as a full 800x600 screen.
+        if (loaded && loaded->w >= 800 && loaded->h >= 600) {
+            title_foreground_pixels_.reset(
+                SDL_ConvertSurface(loaded.get(), SDL_PIXELFORMAT_RGBA32));
+        }
     }
     title_mask_ = load_transition_mask(
         0x80 + 52, title_mask_width_, title_mask_height_);
@@ -1273,6 +1276,17 @@ void Game::run_tick()
     control_steps_ = 1;
     ++global_count_;
     load_work_tick_ = false;
+    if (trace_mode_ && !trace_script_.rules().empty()) {
+        trace_rule_script_ = runtime_.script_name();
+        for (auto& c : trace_rule_script_) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (const auto dot = trace_rule_script_.find('.');
+            dot != std::string::npos) {
+            trace_rule_script_.erase(dot);
+        }
+        trace_rule_pc_ = script_ended_ ? 0 : runtime_.vm_pc();
+    }
     // EXEC_ControlLang.  main.cpp runs it, then MAIN_GameControl, and only
     // then MAIN_DrawGraph.  Every resumption of the script goes through here
     // so that order holds; resuming from inside the control pass put a
@@ -1555,6 +1569,7 @@ int main(int argc, char** argv)
         std::uint64_t trace_save_at = 0;
         std::filesystem::path trace_resume_file;
         std::uint64_t trace_resume_trigger = 0;
+        std::string trace_game_flags;
         std::optional<std::filesystem::path> record_path;
         std::uint64_t record_from = 0;
         bool trace_first_set = false;
@@ -1615,6 +1630,12 @@ int main(int argc, char** argv)
                         "--trace-resume-file requires a path");
                 }
                 trace_resume_file = argv[index];
+            } else if (argument == "--trace-game-flags") {
+                if (++index >= argc) {
+                    throw std::runtime_error(
+                        "--trace-game-flags requires N=V[,N=V...]");
+                }
+                trace_game_flags = argv[index];
             } else if (argument == "--trace-resume-trigger") {
                 if (++index >= argc) {
                     throw std::runtime_error(
@@ -1748,6 +1769,9 @@ int main(int argc, char** argv)
             game.set_trace_hold(trace_hold, trace_hold_seconds);
             game.set_trace_checkpoint(trace_save_file, trace_save_at,
                                       trace_resume_file, trace_resume_trigger);
+            if (!trace_game_flags.empty()) {
+                game.set_trace_game_flags(trace_game_flags);
+            }
             if (record_path) {
                 game.enable_recording(*record_path, record_from);
             }

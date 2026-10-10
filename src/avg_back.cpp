@@ -920,11 +920,30 @@ void AvgBack::set_fade(int r, int g, int b, int disp, int fade)
     fade_.flash = 0;
     fade_.fade = fade;
     set_draw_flag_on();   // MainWindow.draw_flag = 1;
-    // The rest of AVG_SetFade freezes the screen: DSP_GetDispBmp captures it
-    // into BMP_DISP, GRP_DISP draws that at LAY_BACK, and every graph
-    // without DSP_GetGraphBrightFlag is hidden for the duration.  Ours tints
-    // the composited frame instead, so there is nothing to hide - but the
-    // two legs and their counters are the same.
+    // The screen frozen: DSP_GetDispBmp takes the frame as last shown - the
+    // text and the bar in it - GRP_DISP draws it at LAY_BACK, and everything
+    // without its own brightness goes off under it:
+    //     for(i=0; i<GRP_DISP ;i++){
+    //         if( !DSP_GetGraphBrightFlag(i) ){
+    //             DSP_SetGraphDisp( i, OFF ); FadeStruct.grp_flag[i] = 1;
+    //         }else{ FadeStruct.grp_flag[i] = 0; } }
+    //     ...the same for the texts.
+    // Tinting the live frame instead looked the same until a flash with the
+    // message up (050427020.sdt pc 7333): the bar stands over the fade, and
+    // over the frozen frame it stands over its own image.
+    if (disp) {
+        display_.get_disp_bmp(bmp_disp);
+        display_.set_graph(grp_disp, bmp_disp, lay_back, true, check_none);
+        for (int i = 0; i < grp_disp; ++i) {
+            fade_.grp_flag[i] = !display_.graph(i).brt_flag;
+            if (fade_.grp_flag[i]) {
+                display_.set_graph_disp(i, false);
+            }
+        }
+        // TXT_WINDOW never has a bright flag.
+        fade_.txt_flag = true;
+        if (hooks_.text_disp) hooks_.text_disp(false);
+    }
 }
 
 void AvgBack::set_bright(int r, int g, int b)
@@ -1092,7 +1111,21 @@ void AvgBack::control_fade()
         fade_.r = fade_.er;
         fade_.g = fade_.eg;
         fade_.b = fade_.eb;
-        if (fade_.disp && fade_.flash) {
+        if (!fade_.disp) {
+            // Everything AVG_SetFade turned off comes back on - including
+            // what was already off before it, such as a character baked into
+            // the plate: for this one frame its graph stands over the plate,
+            // undarkened, until AVG_ControlChar turns it off again.  The
+            // engine does it; so does the reference (050427020.sdt).
+            for (int i = 0; i < grp_disp; ++i) {
+                if (fade_.grp_flag[i]) {
+                    display_.set_graph_disp(i, true);
+                }
+            }
+            if (fade_.txt_flag && hooks_.text_disp) hooks_.text_disp(true);
+            display_.reset_graph(grp_disp);
+            display_.release_bmp(bmp_disp);
+        } else if (fade_.flash) {
             // The return leg, started from inside the control function
             // rather than by anything outside it.
             set_fade(bright_neutral, bright_neutral, bright_neutral,
@@ -1103,6 +1136,15 @@ void AvgBack::control_fade()
         fade_.g = (fade_.sg * (max - fade_.cnt) + fade_.eg * fade_.cnt) / max;
         fade_.b = (fade_.sb * (max - fade_.cnt) + fade_.eb * fade_.cnt) / max;
     }
+    display_.set_graph_bright(grp_disp, fade_.r, fade_.g, fade_.b);
+}
+
+void AvgBack::reset_fade_freeze()
+{
+    fade_.grp_flag.fill(false);
+    fade_.txt_flag = false;
+    display_.reset_graph(grp_disp);
+    display_.release_bmp(bmp_disp);
 }
 
 void AvgBack::open_back()

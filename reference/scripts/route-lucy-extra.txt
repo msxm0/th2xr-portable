@@ -1,0 +1,8 @@
+# Route lucy: answer every map with character 8 when one is offered
+# (mappick falls back to the first destination otherwise).
+30 every 1 mappick 8
+# Ruuko's first three choices each have an answer that closes her route
+# (sets flag 899): take the other one.
+1 at 080306000@755 num2
+1 at 080306001@24618 num2
+1 at 080306002@2712 num2

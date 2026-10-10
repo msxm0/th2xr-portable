@@ -75,7 +75,7 @@ int AvgChar::space_index() const
 int AvgChar::locate_offset(int index) const
 {
     const CharState& character = chars_[index];
-    if (character.cno < 10) {
+    if (character.cno >= 0 && character.cno < 10) {
         if (!((90 <= character.pose && character.pose < 100)
               || (190 <= character.pose && character.pose < 200))) {
             return char_pos_table[static_cast<std::size_t>(character.cno)];

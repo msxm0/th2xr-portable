@@ -114,6 +114,12 @@ void Game::reset_play_state()
     end_transition();
     back().br_flag = 0;
     screen_flash_.reset();
+    // AVG_Init's FadeStruct and graphs: a load's fade-out froze the screen -
+    // the load window - into GRP_DISP, which would otherwise come up again
+    // as the picture the loaded scene fades in from.
+    if (avg_back_) {
+        avgback().reset_fade_freeze();
+    }
     shake_.reset();
     clock_state_.reset();
     map_clock_instant_ = 0;

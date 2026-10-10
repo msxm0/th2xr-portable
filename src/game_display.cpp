@@ -151,8 +151,17 @@ void Game::setup_background_graphs(
         // the blend away and the incoming background composited opaque: a
         // two hundred and forty tick cross fade that was over on its first
         // frame.  The branch below has always been guarded this way.
+        // AVG_SetBack's layout: the outgoing snapshot under GRP_BACK, and
+        // GRP_BACK moved up a layer - except BAK_CFZOOM3, whose snapshot goes
+        // on LAY_BACK+1 over a GRP_BACK left where it was, zooming and fading
+        // away on top of the new picture.
+        const bool snapshot_on_top = back().fd_type == th2::bak_cfzoom3;
+        const int back_layer = snapshot_on_top ? th2::lay_back
+                                               : th2::lay_back + 1;
+        const int snapshot_layer = snapshot_on_top ? th2::lay_back + 1
+                                                   : th2::lay_back;
         if (display().graph(th2::grp_back).bno != back_bmp
-            || display().graph(th2::grp_back).layer != th2::lay_back + 1) {
+            || display().graph(th2::grp_back).layer != back_layer) {
             // On the frame the wipe starts this has to run, and it still
             // clears the parameter - so put it back.  AVG_ControlBackChange
             // has already advanced fd_cnt and written DRW_BLD(rate) for this
@@ -161,8 +170,7 @@ void Game::setup_background_graphs(
             // where the outgoing picture is supposed to be untouched.
             const auto param = display().graph(th2::grp_back).param;
             display().set_graph(
-                th2::grp_back, back_bmp, th2::lay_back + 1, true,
-                th2::check_none);
+                th2::grp_back, back_bmp, back_layer, true, th2::check_none);
             display().set_graph_param(th2::grp_back, param);
         }
         // BAK_CFZOOM1 and BAK_CFZOOM4 take no snapshot - AVG_SetBack's
@@ -189,9 +197,9 @@ void Game::setup_background_graphs(
             // snapshot sat at full brightness and the fade to black lagged
             // the engine's by the whole of its first half.
             if (display().graph(th2::grp_back + 1).bno != th2::bmp_back + 1
-                || display().graph(th2::grp_back + 1).layer != th2::lay_back) {
+                || display().graph(th2::grp_back + 1).layer != snapshot_layer) {
                 display().set_graph(
-                    th2::grp_back + 1, th2::bmp_back + 1, th2::lay_back, true,
+                    th2::grp_back + 1, th2::bmp_back + 1, snapshot_layer, true,
                     th2::check_none);
             }
         }
@@ -212,9 +220,17 @@ void Game::setup_background_graphs(
                 th2::check_none);
         }
         if (washed) {
-            display().set_graph(
-                th2::grp_back + 1, th2::bmp_backhalf, th2::lay_back + 2,
-                true, th2::check_none);
+            // Seated once, like GRP_BACK: AVG_SetFade turns everything off
+            // under its frozen screen and AVG_ControlHalfTone's TONE_DISP is
+            // a hold, so the plate stays off for the fade.  Re-seated every
+            // frame it came back on over GRP_DISP.
+            if (display().graph(th2::grp_back + 1).bno != th2::bmp_backhalf
+                || display().graph(th2::grp_back + 1).layer
+                       != th2::lay_back + 2) {
+                display().set_graph(
+                    th2::grp_back + 1, th2::bmp_backhalf, th2::lay_back + 2,
+                    true, th2::check_none);
+            }
             display().set_graph_pos(
                 th2::grp_back + 1, 0, 0,
                 back().x, back().y,
@@ -557,6 +573,7 @@ th2::AvgBack::Hooks Game::background_hooks()
         msg().set_novel_message_disp(on);
     };
     hooks.reset_half_tone = [this] { reset_half_tone(); };
+    hooks.text_disp = [this](bool on) { msg().set_main_text_disp(on); };
     hooks.global_count = [this] { return global_count_; };
     return hooks;
 }

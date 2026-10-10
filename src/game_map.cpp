@@ -227,9 +227,12 @@ Game::MapCharacter Game::load_map_character(const Game::MapEvent& event)
 
 int Game::weekday(int month, int day) const
 {
-    if (month == 3) return day % 7;
-    if (month == 4) return (day + 3) % 7;
-    if (month == 5) return (day + 5) % 7;
+    // Non-negative whatever the day: it indexes the calendar's weekday table,
+    // and the day can come from a save's flags.
+    const auto wrap = [](int value) { return ((value % 7) + 7) % 7; };
+    if (month == 3) return wrap(day);
+    if (month == 4) return wrap(day + 3);
+    if (month == 5) return wrap(day + 5);
     return 0;
 }
 
@@ -280,7 +283,10 @@ void Game::begin_clock(int requested, int first_frame)
     const int target_minutes = clock_minutes_[target];
     clock_state_ = ClockState{
         target, start_minutes, target_minutes,
-        std::max(0, (target_minutes - start_minutes + 5) / 6),
+        // Step 2 adds its six minutes before it compares, so it runs at
+        // least once - also on a Saturday, where the target is capped at 11
+        // and a clock already there still steps 12:10 -> 12:16 (04/10).
+        std::max(1, (target_minutes - start_minutes + 5) / 6),
         // Frame 1, not 0.  AVG_ViewClock's case 0 sets the clock up and falls
         // through into case 1 without a break, so the call that starts the
         // animation is also its first frame:
@@ -344,7 +350,7 @@ void Game::begin_calendar(int month, int day)
 // destinations share a spot - and only the ones on the displayed page count,
 // so no fixed position answers every map in the game.  With none on this page
 // it stands on the page arrow instead and lets the next click turn it.
-void Game::trace_drive_map(bool pick)
+void Game::trace_drive_map(bool pick, const std::vector<int>& prefer)
 {
     if (ui_mode_ != UiMode::map) {
         return;
@@ -356,7 +362,7 @@ void Game::trace_drive_map(bool pick)
     // that is destination 0 wherever it is, which is why the first frame of
     // step 3 can hover something off the page.
     if (pick) {
-        trace_map_pick_position(trace_mouse_x_, trace_mouse_y_);
+        trace_map_pick_position(trace_mouse_x_, trace_mouse_y_, prefer);
     }
     // MUS_GetMouseNo reads the cursor wherever the harness left it, so the
     // pointer follows it on every frame, answered or not.
@@ -417,6 +423,7 @@ void Game::trace_peek_map_pointer()
     int x = 0;
     int y = 0;
     bool pick = false;
+    std::vector<int> prefer;
     if (live_input()) {
         x = recorder_.x();
         y = recorder_.y();
@@ -425,41 +432,82 @@ void Game::trace_peek_map_pointer()
         x = state.mouse_x;
         y = state.mouse_y;
         pick = state.map_pick;
+        prefer = state.map_prefer;
     }
     if (pick) {
-        trace_map_pick_position(x, y);
+        trace_map_pick_position(x, y, prefer);
     }
     map_pointer_x_ = static_cast<float>(x);
     map_pointer_y_ = static_cast<float>(y);
 }
 
-void Game::trace_map_pick_position(int& out_x, int& out_y) const
+void Game::trace_map_pick_position(int& out_x, int& out_y,
+                                   const std::vector<int>& prefer) const
 {
-    {
-        int x = 748;
-        int y = 300;
-        std::array<int, 10> overlaps{};
+    // th2ref_map_pick: the centre of a flagged destination rect, or the
+    // forward arrow (748, 300) when there is none to take.  With a
+    // preference, the first listed character that has a destination at all:
+    // its rect if it is on this page, otherwise the arrow, until the page
+    // with it comes round.  Without one present, the plain pick.  -N in the
+    // list: never the destination whose script is N, unless nothing else is
+    // on offer - a route's one event that would close it.
+    std::vector<std::pair<int, int>> centres(map_events_.size(), {-1, -1});
+    std::array<int, 10> overlaps{};
+    for (std::size_t i = 0; i < map_events_.size(); ++i) {
+        const auto& event = map_events_[i];
+        if (event.position < 0
+            || event.position >= static_cast<int>(map_positions_.size())) {
+            continue;
+        }
+        const auto& position = map_positions_[event.position];
+        const int overlap = ++overlaps[position.overlap];
+        int cx = position.x;
+        int cy = position.y;
+        if (overlap == 2) cx -= 200;
+        else if (overlap == 3) cx += 200;
+        else if (overlap == 4) { cx -= 100; cy += 160; }
+        centres[i] = {cx + 20 + 65, cy - 118 + 59};
+    }
+    const auto on = [this](std::size_t i) {
+        return i < map_rect_on_.size() && map_rect_on_[i];
+    };
+    const auto denied = [&](std::size_t i) {
+        // atoi( MapEvent[n].script_fname ), as the reference shim reads it.
+        const long script = std::strtol(map_events_[i].script.c_str(), nullptr, 10);
+        return std::ranges::any_of(prefer, [script](int entry) {
+            return entry < 0 && -static_cast<long>(entry) == script;
+        });
+    };
+    for (const int character : prefer) {
+        if (character < 0) {
+            continue;
+        }
         for (std::size_t i = 0; i < map_events_.size(); ++i) {
-            const auto& event = map_events_[i];
-            if (event.position < 0
-                || event.position >= static_cast<int>(map_positions_.size())) {
+            if (map_events_[i].character != character || centres[i].first < 0
+                || denied(i)) {
                 continue;
             }
-            const auto& position = map_positions_[event.position];
-            const int overlap = ++overlaps[position.overlap];
-            int cx = position.x;
-            int cy = position.y;
-            if (overlap == 2) cx -= 200;
-            else if (overlap == 3) cx += 200;
-            else if (overlap == 4) { cx -= 100; cy += 160; }
-            if (i < map_rect_on_.size() && map_rect_on_[i]) {
-                x = cx + 20 + 65;
-                y = cy - 118 + 59;
-                break;
+            if (on(i)) {
+                out_x = centres[i].first;
+                out_y = centres[i].second;
+            } else {
+                out_x = 748;
+                out_y = 300;
+            }
+            return;
+        }
+    }
+    out_x = 748;
+    out_y = 300;
+    for (const bool skip_denied : {true, false}) {
+        for (std::size_t i = 0; i < map_events_.size(); ++i) {
+            if (centres[i].first >= 0 && on(i)
+                && !(skip_denied && denied(i))) {
+                out_x = centres[i].first;
+                out_y = centres[i].second;
+                return;
             }
         }
-        out_x = x;
-        out_y = y;
     }
 }
 

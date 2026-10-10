@@ -182,6 +182,10 @@ void Vm::execute(const Instruction& instruction)
             while (position < end) {
                 const auto type = code[position++];
                 if (type == 0) {
+                    if (position + 4 > end) {
+                        throw std::runtime_error(
+                            "Calc: constant runs past the expression");
+                    }
                     factors.push_back({type, static_cast<std::int32_t>(
                         read_u32(code, position))});
                     position += 4;

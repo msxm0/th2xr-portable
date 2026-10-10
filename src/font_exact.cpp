@@ -218,7 +218,7 @@ void GameFont::end_batch() const
 bool GameFont::draw_mask_exact(
     SDL_Renderer* renderer, float x, float y, int width, int height,
     const std::uint8_t* bitmap, int red, int green, int blue,
-    int alpha_256, int alpha) const
+    int alpha_256, int alpha, Columns columns) const
 {
     // A caller with no engine alpha - the backlog, the save screens - used
     // to plot the mask a point at a time instead: 16% of backlog frames
@@ -261,6 +261,11 @@ bool GameFont::draw_mask_exact(
     if (s->x1 <= s->x0) {
         return true;    // no coverage anywhere: every texel would discard
     }
+    const int first = std::max(0, columns.first);
+    const int last = std::min(width, columns.last);
+    if (last <= first) {
+        return true;    // the engine clip leaves nothing of it
+    }
     // The inked box in target pixels, as draw_mask_batch will place the
     // quad, padded a pixel each way so rounding cannot hide a shared pixel.
     const float tx = (x + static_cast<float>(viewport.x)) * scale_x;
@@ -282,9 +287,10 @@ bool GameFont::draw_mask_exact(
     e.scale_x = scale_x;
     e.scale_y = scale_y;
     e.queue.push_back({
-        SDL_FRect{static_cast<float>(s->x), static_cast<float>(s->y),
-                  static_cast<float>(width), static_cast<float>(height)},
-        SDL_FRect{x, y, static_cast<float>(width), static_cast<float>(height)},
+        SDL_FRect{static_cast<float>(s->x + first), static_cast<float>(s->y),
+                  static_cast<float>(last - first), static_cast<float>(height)},
+        SDL_FRect{x + static_cast<float>(first), y,
+                  static_cast<float>(last - first), static_cast<float>(height)},
         alpha_256, red, green, blue});
     e.inked.push_back(ink);
     if (e.depth == 0) {

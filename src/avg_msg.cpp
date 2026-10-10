@@ -1479,7 +1479,9 @@ bool AvgMsg::read_log(std::istream& in, bool apply)
     nb.a_cut = read_i32(in);
     nb.bmax = std::clamp(read_i32(in), 0, nlog_max);
     nb.bpoint = read_i32(in);
-    if (!in) {
+    // bpoint is written through (SetNovelMessageHistory: buf[bpoint] = ...),
+    // so a damaged save must not get to choose where.
+    if (!in || nb.bpoint < 0 || nb.bpoint >= nlog_max) {
         return false;
     }
     // Loaded at the current line, not paging back through the log.
@@ -1521,9 +1523,12 @@ bool AvgMsg::read_history(std::istream& in)
     nb.vno = read_i32(in);
     nb.cno = read_i32(in);
     nb.a_cut = read_i32(in);
-    nb.bmax = read_i32(in);
+    nb.bmax = std::clamp(read_i32(in), 0, nlog_max);
     nb.bpoint = read_i32(in);
-    nb.bcount = read_i32(in);
+    nb.bcount = std::clamp(read_i32(in), 0, std::max(0, nb.bmax - 1));
+    if (nb.bpoint < 0 || nb.bpoint >= nlog_max) {
+        return false;      // the log is indexed by it; see read_log
+    }
     std::array<std::array<MouseRect, mouse_rest_max>, mouse_layers> rects{};
     for (int lno = 0; lno < mouse_layers_saved; ++lno) {
         for (auto& rect : rects[static_cast<std::size_t>(lno)]) {

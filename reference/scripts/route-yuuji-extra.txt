@@ -1,0 +1,2 @@
+# Route yuuji: answer every map with character 13 when one is offered.
+30 every 1 mappick 13

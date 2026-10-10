@@ -1,0 +1,12 @@
+# Route tamaki: answer every map with character 3 when one is offered, else
+# Yuuji (13).  The plain fallback took Yuma's 070000700 on 03/17, which sets
+# flag 708; then flag 750 is not set on 03/24, Yuma's 070000800 takes the
+# 04/09 morning, 030409000 (flag 320) never runs and the 04/17 map has no
+# Tamaki - the run ended on Yuuji's ending (109901000) instead.
+30 every 1 mappick 3,13
+# Yuuji (100000500) is offered once, on 03/13; from 03/15 neither 3 nor 13 is
+# on the map and the plain pick walks Yuma's chain 070000650..070000700 (the
+# 708 one on 03/18), and on 03/24 her next event comes right before
+# EV_0324NIGHT reads 708.  So from 03/18 to the spring break, anyone but her
+# (03/24 offers only 12, 2 and her).
+263300 every 1 mappick 3,13,1,2,8,14,12 until 395000

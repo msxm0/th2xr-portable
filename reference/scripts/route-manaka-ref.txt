@@ -1,0 +1,8 @@
+# Reference lead-in: the 2002 title screen, which our side does not have.
+# はじめから (start) sits at about y=403 in 800x600 client coordinates.
+150 move 400 403
+200 lclick 3
+# Scenario ticks, shifted by 235.
+265 every 30 lclick 3
+265 every 1 num1
+265 every 1 mappick 2

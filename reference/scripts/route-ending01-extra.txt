@@ -1,0 +1,5 @@
+# Route ending01: the first route-sangoruri attempt, kept for its coverage -
+# 43 scripts no other compared route reaches, ending on 019901000.  Characters
+# 10/5 first, then anyone but 2, 3, 7, 8, 14, 4; the plain pick took Konomi's
+# 020000900 on 03/22 (flag 206), which closes the Sango/Ruri route.
+30 every 1 mappick 10,5,13,1,12,9,11

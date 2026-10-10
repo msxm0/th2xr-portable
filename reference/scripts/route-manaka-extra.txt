@@ -1,0 +1,3 @@
+# Route manaka: answer every map with character 2 when one is offered
+# (mappick falls back to the first destination otherwise).
+30 every 1 mappick 2

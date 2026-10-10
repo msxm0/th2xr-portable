@@ -33,6 +33,11 @@
 
 namespace th2app {
 
+namespace {
+// 'EOPR', ahead of the EOprFlag bytes in a trace checkpoint.
+constexpr int eopr_checkpoint_marker = 0x52504f45;
+}  // namespace
+
 void Game::load_script(std::string name)
 {
     script_ended_ = false;
@@ -120,6 +125,21 @@ bool Game::load_scheduled_script()
     runtime_.set_flag(event_next_flag, -1);
     load_script(std::format(
         "EV_{:02d}{:02d}{}.SDT", month, day, periods[time]));
+    // Temporary: TH2_SCHEDULE_FLAGS=30,206,750 logs those script flags as
+    // each schedule script starts - what its route gates are about to read.
+    if (const char* list = SDL_getenv("TH2_SCHEDULE_FLAGS")) {
+        std::string line = std::format("schedule {} EV_{:02d}{:02d}{}",
+                                       trace_tick_, month, day, periods[time]);
+        for (const char* p = list; *p;) {
+            char* end = nullptr;
+            const long index = std::strtol(p, &end, 10);
+            if (end == p) break;
+            line += std::format(" {}={}", index,
+                                runtime_.flag(static_cast<std::size_t>(index)));
+            p = *end == ',' ? end + 1 : end;
+        }
+        SDL_Log("%s", line.c_str());
+    }
     if (show_calendar) {
         begin_calendar(-1, -1);
         calendar_state_->step = true;
@@ -688,6 +708,29 @@ bool Game::finish_text_reveal()
     return true;
 }
 
+void Game::set_trace_game_flags(const std::string& spec)
+{
+    std::istringstream list(spec);
+    std::string item;
+    while (std::getline(list, item, ',')) {
+        const auto equals = item.find('=');
+        if (item.empty() || equals == std::string::npos) {
+            throw std::runtime_error("--trace-game-flags: expected N=V, got '"
+                                     + item + "'");
+        }
+        const int index = std::stoi(item.substr(0, equals));
+        const int value = std::stoi(item.substr(equals + 1));
+        if (index < 0
+            || static_cast<std::size_t>(index) >= persistent_game_flags_.size()) {
+            throw std::runtime_error("--trace-game-flags: no game flag "
+                                     + std::to_string(index));
+        }
+        persistent_game_flags_[static_cast<std::size_t>(index)] = value;
+        runtime_.set_game_flag(static_cast<std::size_t>(index), value);
+        SDL_Log("trace: game flag %d = %d", index, value);
+    }
+}
+
 void Game::enable_trace(
     const std::filesystem::path& dir,
     const std::optional<std::filesystem::path>& input,
@@ -983,6 +1026,11 @@ void Game::trace_checkpoint_save()
         // message 205 characters into 213 and started the next one - which
         // reads as the two engines disagreeing when it is only ours
         // forgetting where it was.
+        // Marked with its size: it grew from 256 to 512 entries (event
+        // opcodes run to 297), and a checkpoint from before that would
+        // otherwise be read misaligned without a word.
+        write_state_i32(file, eopr_checkpoint_marker);
+        write_state_i32(file, static_cast<int>(eopr_flag_.size()));
         file.write(reinterpret_cast<const char*>(eopr_flag_.data()),
                    static_cast<std::streamsize>(eopr_flag_.size()));
         // The waits.  A checkpoint that lands mid-wait used to resume with
@@ -1167,6 +1215,12 @@ void Game::trace_checkpoint_resume()
         }
         msg().restore_raw(std::move(raw));
         file.read(reinterpret_cast<char*>(&back()), sizeof(th2::BackStruct));
+        if (read_state_i32(file) != eopr_checkpoint_marker
+            || read_state_i32(file) != static_cast<int>(eopr_flag_.size())) {
+            throw std::runtime_error(
+                "checkpoint from an older build (EOprFlag layout): "
+                + trace_resume_file_.string());
+        }
         file.read(reinterpret_cast<char*>(eopr_flag_.data()),
                   static_cast<std::streamsize>(eopr_flag_.size()));
         if (!file) {
@@ -1262,7 +1316,7 @@ void Game::trace_checkpoint_resume()
                 CalendarState c;
                 c.month = read_state_i32(file);
                 c.day = read_state_i32(file);
-                c.weekday = read_state_i32(file);
+                c.weekday = std::clamp(read_state_i32(file), 0, 6);
                 c.holiday = read_state_i32(file);
                 c.dismissing = read_state_i32(file) != 0;
                 c.frame = read_state_i32(file);
@@ -1282,8 +1336,8 @@ void Game::trace_checkpoint_resume()
                     // Textures and the screen, from the saved destinations;
                     // then everything begin_map starts afresh, as it was.
                     begin_map();
-                    map_field_ = m[0];
-                    map_previous_field_ = m[1];
+                    map_field_ = std::clamp(m[0], 0, 4);
+                    map_previous_field_ = std::clamp(m[1], 0, 4);
                     map_hover_ = m[2];
                     map_slide_ticks_ = m[3];
                     map_arrow_pressed_ = m[4];
@@ -1442,6 +1496,14 @@ void Game::trace_apply_input()
                                ? trace_tick_
                                : static_cast<std::uint64_t>(global_count_))
         : trace_script_.at(trace_tick_);
+    if (!live) {
+        for (const auto& rule : trace_script_.rules()) {
+            if (rule.pc == trace_rule_pc_ && rule.script == trace_rule_script_) {
+                state.held.push_back(rule.key);
+                state.pressed.push_back(rule.key);
+            }
+        }
+    }
     if (!live && pointer_warp_) {
         // The reference's SetCursorPos stands until the script moves the
         // pointer somewhere else.
@@ -1524,7 +1586,7 @@ void Game::trace_apply_input()
     th2::get_game_key(game_key_, key_cond_, 0, demo_mode_);
     // The map's step does not run while the menu is up over it.
     if (!engine_config_step_) {
-        trace_drive_map(state.map_pick);
+        trace_drive_map(state.map_pick, state.map_prefer);
     }
     key_cond_.clear_triggers();
 }

@@ -103,6 +103,10 @@ void Game::present_graph(int gno, th2::Graph& graph) const
         if (back_fade_graph && avgback().present_back_fade(phase, r, g, b)) {
             bright(r, g, b);
         }
+        // AVG_ColtrolFade's DSP_SetGraphBright( GRP_DISP, r, g, b ).
+        if (gno == th2::grp_disp && avgback().present_fade(phase, r, g, b)) {
+            bright(r, g, b);
+        }
     }
     if (present_menu_) {
         present_engine_config_graph(gno, phase, graph);

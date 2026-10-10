@@ -482,6 +482,9 @@ bool Game::gwin_set_save_load_check(int select)
 {
     // int GWIN_SetSaveLoadCheck( int select ): an empty slot is saved into
     // straight away; anything else asks first.
+    if (select < 0 || select >= static_cast<int>(visible_saves_.size())) {
+        return true;       // not a slot: nothing to ask about
+    }
     const int slot = select + save_window_.page * 10;
     if (!save_window_.load && !visible_saves_[select].exists) {
         save(slot);                                 // AVG_SetSave
@@ -753,9 +756,14 @@ void Game::change_map_field(int direction)
         return;
     }
     map_previous_field_ = map_field_;
-    do {
-        map_field_ = (map_field_ + direction + 5) % 5;
-    } while (!map_fields_[map_field_]);
+    // Field 1 always exists (begin_map loads it), so this stops; wrapped
+    // non-negative in case map_field_ came from somewhere odd.
+    for (int tries = 0; tries < 5; ++tries) {
+        map_field_ = (((map_field_ + direction) % 5) + 5) % 5;
+        if (map_fields_[static_cast<std::size_t>(map_field_)]) {
+            break;
+        }
+    }
     map_slide_ticks_ = direction > 0 ? 16 : -16;
     map_hover_ = -1;
     play_se(-1, 9015, false, 255);

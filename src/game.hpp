@@ -1188,10 +1188,11 @@ private:
     bool touch_bar_press_ = false;
     bool choice_rects_for_touch_ = false;
     void register_choice_rects(bool touch);
-    void trace_drive_map(bool pick);
+    void trace_drive_map(bool pick, const std::vector<int>& prefer = {});
     void trace_map_follow_pointer();
     void trace_peek_map_pointer();
-    void trace_map_pick_position(int& x, int& y) const;
+    void trace_map_pick_position(int& x, int& y,
+                                 const std::vector<int>& prefer = {}) const;
     std::chrono::steady_clock::time_point map_tick_{};
     std::chrono::steady_clock::time_point map_started_{};
     std::optional<th2::ReadMarker> current_read_marker() const;
@@ -1361,6 +1362,14 @@ public:
     // ticks a second, and the moment that sleep came out, a WaitFrame 90 sat
     // there for fifteen times as many ticks.
     std::chrono::steady_clock::time_point engine_now() const;
+    // Debug: game flags (the Sys.sav ones, which SetFlag/GetFlag reach for
+    // 50..99) as a previous playthrough would have left them, e.g. "84=1,80=1"
+    // for a cleared route - what TH2REF_GAME_FLAGS does on the reference.
+    void set_trace_game_flags(const std::string& spec);
+    // Where the script stood when the tick began - what the reference's input
+    // sampler, which runs before EXEC_ControlLang, sees for an "at" rule.
+    std::string trace_rule_script_;
+    std::uint32_t trace_rule_pc_ = 0;
     void set_trace_hold(std::uint64_t tick, int seconds);
     void enable_recording(const std::filesystem::path& path,
                           std::uint64_t from);

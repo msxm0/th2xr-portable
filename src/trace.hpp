@@ -49,6 +49,9 @@ struct TraceEvent {
     // recording made on top of a scripted lead-in needs: the lead-in's
     // clicking has to end where the player's hands take over.
     std::uint64_t until = 0;
+    // For Kind::mappick: characters to steer to, in order of preference
+    // ("mappick 8,9").  Empty is the plain first-destination pick.
+    std::vector<int> prefer;
 };
 
 // What the script says is true on a given tick.
@@ -68,9 +71,20 @@ struct TraceInputState {
     // click lands, and those rects are per scene, so the script asks for the
     // first selectable one rather than naming a coordinate.
     bool map_pick = false;
+    std::vector<int> map_prefer;   // see TraceEvent::prefer
 
     bool is_pressed(std::string_view name) const;
     bool is_held(std::string_view name) const;
+};
+
+// "at <script>@<pc> <key>": hold a key while the script is parked on that
+// instruction - an answer for one particular choice, on top of whatever the
+// repeats press everywhere.  The engine takes the highest number key held,
+// so "at 080306000@755 num2" overrides the route's "every 1 num1" there.
+struct TraceRule {
+    std::string script;       // lower case, no extension
+    std::uint32_t pc = 0;
+    std::string key;
 };
 
 class TraceScript {
@@ -81,6 +95,7 @@ public:
     TraceInputState at(std::uint64_t tick) const;
     std::size_t size() const { return events_.size(); }
     const std::vector<TraceEvent>& events() const { return events_; }
+    const std::vector<TraceRule>& rules() const { return rules_; }
 
 private:
     // Sorted and split once, so a tick costs a binary search and the events
@@ -89,6 +104,7 @@ private:
     // of a long replay is quadratic in its length.
     void index();
     std::vector<TraceEvent> events_;
+    std::vector<TraceRule> rules_;
     std::vector<TraceEvent> moves_;      // by tick
     std::vector<TraceEvent> one_shots_;  // by tick
     std::vector<TraceEvent> repeats_;

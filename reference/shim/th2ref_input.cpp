@@ -47,8 +47,12 @@ typedef struct { int flag; int wno; unsigned long cnt; TH2REF_WOBJ obj[200];
                  int reset; int reset_cnt; int noreset; float wind; int speed; int amount;
                  int twind; int tspeed; int tamount; } TH2REF_WEATHER;
 extern TH2REF_WEATHER Weather;
+/* Escript.cpp's persistent flags: what SetFlag/GetFlag reach for 50..99. */
+extern int ESC_GameFlagBuf[];
 
 extern "C" unsigned long th2ref_current_tick(void);
+extern "C" const char *th2ref_script_name(void);
+extern "C" unsigned long th2ref_script_pc(void);
 
 /* Scripted pointer.  MUS_RenewMouse reads the real device three ways -
  * GetCursorPos, ScreenToClient and GetAsyncKeyState - and all three are
@@ -69,6 +73,9 @@ struct Event {
     unsigned long hold;
     unsigned long period;   /* 0 one-shot, else repeats every `period` */
     unsigned long until;    /* a repeat stops on this tick (0: never) */
+    int           prefer[24];/* EV_MAPPICK: chr_no, most wanted first;
+                              * -N: never script N, unless nothing else */
+    int           nprefer;
 };
 
 /* Split and sorted once, so a tick costs a binary search and the events in
@@ -79,6 +86,10 @@ struct Event {
 std::vector<Event> g_moves;     /* by tick */
 std::vector<Event> g_shots;     /* one-shots, by tick */
 std::vector<Event> g_repeats;
+/* "at <script>@<pc> <key>": the key is held while the script stands on that
+ * instruction.  Kept in step with TraceRule in src/trace.hpp. */
+struct Rule { char script[32]; unsigned long pc; int offset; };
+std::vector<Rule> g_rules;
 unsigned long g_longest = 1;
 bool   g_loaded = false;
 
@@ -106,9 +117,40 @@ const Named g_keys[] = {
 
 bool by_tick(const Event &a, const Event &b) { return a.tick < b.tick; }
 
+/* TH2REF_GAME_FLAGS="84=1,80=1": game flags as a previous playthrough would
+ * have left them in Sys.sav (which trace.sh deletes), so routes gated on a
+ * cleared one can be compared.  Applied once, before the title - Winmain
+ * has already run AVG_LoadGameFlag by the first input tick.  Kept in step
+ * with Game::set_trace_game_flags (--trace-game-flags). */
+void apply_game_flags(void)
+{
+    const char *spec = getenv("TH2REF_GAME_FLAGS");
+    if (!spec || !*spec) return;
+    const char *p = spec;
+    while (*p) {
+        char *end;
+        long index = strtol(p, &end, 10);
+        if (end == p || *end != '=') {
+            fprintf(stderr, "th2ref: bad TH2REF_GAME_FLAGS near '%s'\n", p);
+            return;
+        }
+        p = end + 1;
+        long value = strtol(p, &end, 10);
+        if (end == p || index < 0 || index >= 1024) {
+            fprintf(stderr, "th2ref: bad TH2REF_GAME_FLAGS near '%s'\n", p);
+            return;
+        }
+        ESC_GameFlagBuf[index] = (int)value;
+        fprintf(stderr, "th2ref: game flag %ld = %ld\n", index, value);
+        p = end;
+        if (*p == ',') ++p;
+    }
+}
+
 void load(void)
 {
     g_loaded = true;
+    apply_game_flags();
     const char *path = getenv("TH2REF_INPUT");
     if (!path || !*path) return;
     FILE *f = fopen(path, "r");
@@ -138,6 +180,33 @@ void load(void)
         int a = 0, b = 0;
         int n = sscanf(line, "%lu %63s %d %d", &tick, name, &a, &b);
         if (n < 2) continue;
+
+        if (!_stricmp(name, "at")) {
+            char where[64] = {0}, key[32] = {0};
+            if (sscanf(line, "%*lu %*63s %63s %31s", where, key) != 2
+                || !strchr(where, '@')) {
+                fprintf(stderr, "th2ref: at needs <script>@<pc> <key>\n");
+                continue;
+            }
+            Rule r;
+            memset(&r, 0, sizeof r);
+            char *at = strchr(where, '@');
+            *at = 0;
+            r.pc = strtoul(at + 1, NULL, 10);
+            char *dot = strchr(where, '.');
+            if (dot) *dot = 0;
+            strncpy(r.script, where, sizeof r.script - 1);
+            r.offset = -1;
+            for (size_t k = 0; k < sizeof g_keys / sizeof g_keys[0]; ++k)
+                if (!_stricmp(key, g_keys[k].name)) r.offset = g_keys[k].offset;
+            if (r.offset < 0) {
+                fprintf(stderr, "th2ref: unknown key '%s'\n", key);
+                continue;
+            }
+            g_rules.push_back(r);
+            ++count;
+            continue;
+        }
 
         /* "<first> every <period> <what> [hold]" */
         if (!_stricmp(name, "every")) {
@@ -181,6 +250,18 @@ void load(void)
         if (!_stricmp(name, "mappick")) {
             e.kind = EV_MAPPICK;
             e.hold = 1;
+            /* "mappick 8,9": the characters to steer to.  Read off the text
+             * after the word, since sscanf's %d stops at the comma. */
+            for (char *p = line; *p; ++p) {
+                if (_strnicmp(p, "mappick", 7) != 0) continue;
+                char *q = p + 7;
+                while (*q && e.nprefer < 24) {
+                    while (*q == ' ' || *q == '\t' || *q == ',') ++q;
+                    if ((*q < '0' || *q > '9') && *q != '-') break;
+                    e.prefer[e.nprefer++] = (int)strtol(q, &q, 10);
+                }
+                break;
+            }
             if (!e.period) e.period = 1;
             g_repeats.push_back(e);
             ++count;
@@ -231,7 +312,7 @@ void load(void)
 
 }  /* namespace */
 
-static void th2ref_map_pick(void);
+static void th2ref_map_pick(const int *prefer, int nprefer);
 
 extern "C" void th2ref_input(void)
 {
@@ -248,6 +329,8 @@ extern "C" void th2ref_input(void)
 
     g_mouse_l = g_mouse_r = false;
     int map_pick = 0;
+    const int *map_prefer = NULL;
+    int map_nprefer = 0;
 
     /* a move is a state change: the latest one at or before now holds */
     {
@@ -263,7 +346,11 @@ extern "C" void th2ref_input(void)
 
     const auto apply = [&](const Event &e, bool first) {
         switch (e.kind) {
-        case EV_MAPPICK: map_pick = 1; break;
+        case EV_MAPPICK:
+            map_pick = 1;
+            map_prefer = e.prefer;
+            map_nprefer = e.nprefer;
+            break;
         case EV_LCLICK: g_mouse_l = true; break;
         case EV_RCLICK: g_mouse_r = true; break;
         case EV_KEY:
@@ -295,7 +382,25 @@ extern "C" void th2ref_input(void)
         const unsigned long phase = (now - e.tick) % e.period;
         if (phase < e.hold) apply(e, phase == 0);
     }
-    if (map_pick) th2ref_map_pick();
+    if (map_pick) th2ref_map_pick(map_prefer, map_nprefer);
+
+    if (!g_rules.empty()) {
+        const char *script = th2ref_script_name();
+        const unsigned long pc = th2ref_script_pc();
+        if (script) {
+            char name[64] = {0};
+            strncpy(name, script, sizeof name - 1);
+            char *dot = strchr(name, '.');
+            if (dot) *dot = 0;
+            for (size_t k = 0; k < g_rules.size(); ++k) {
+                const Rule &r = g_rules[k];
+                if (r.pc != pc || _stricmp(r.script, name)) continue;
+                btn[r.offset] = 1;
+                trg[r.offset] = 1;
+                btrg[r.offset] = 1;
+            }
+        }
+    }
 
     {
         static FILE *wlog = NULL;
@@ -350,17 +455,54 @@ extern "C" void th2ref_input(void)
  * MUS_SetMouseLayer(10) and puts it back when it leaves, so this is inert
  * anywhere else in the game and cannot move the pointer during ordinary
  * scenes.  Rects 0..15 are the destinations, 16 and 17 the page arrows. */
-static void th2ref_map_pick(void)
+/* GM_Avg.cpp's map events, layout copied: the chr_no a preference names. */
+typedef struct { int chr_no; int pos; int type; char script_fname[32]; } TH2REF_MAP_EVENT;
+extern TH2REF_MAP_EVENT MapEvent[16];
+extern int MapMax;
+
+static void th2ref_map_pick(const int *prefer, int nprefer)
 {
     if (MUS_GetMouseLayer() != 10) return;
-    for (int n = 0; n < 16; ++n) {
-        int sx, sy, w, h;
-        if (!MUS_GetMouseRectFlag(10, n)) continue;
-        if (!MUS_GetMouseRect(10, n, &sx, &sy, &w, &h)) continue;
-        if (w <= 0 || h <= 0) continue;
-        g_mouse_x = sx + w / 2;
-        g_mouse_y = sy + h / 2;
-        return;
+    /* A preference: the first listed character with a destination at all -
+     * its rect when it is flagged on this page, else the forward arrow until
+     * that page comes round.  Kept exactly in step with
+     * Game::trace_map_pick_position. */
+    /* -N in the list: never the destination whose script is N, unless
+     * nothing else is on offer - a route's one event that would close it. */
+    const auto denied = [&](int n) {
+        const int script = atoi(MapEvent[n].script_fname);
+        for (int k = 0; k < nprefer; ++k) {
+            if (prefer[k] < 0 && -prefer[k] == script) return true;
+        }
+        return false;
+    };
+    for (int k = 0; k < nprefer; ++k) {
+        if (prefer[k] < 0) continue;
+        for (int n = 0; n < MapMax && n < 16; ++n) {
+            if (MapEvent[n].chr_no != prefer[k] || denied(n)) continue;
+            int sx, sy, w, h;
+            if (MUS_GetMouseRectFlag(10, n)
+                && MUS_GetMouseRect(10, n, &sx, &sy, &w, &h) && w > 0 && h > 0) {
+                g_mouse_x = sx + w / 2;
+                g_mouse_y = sy + h / 2;
+            } else if (MUS_GetMouseRect(10, 17, &sx, &sy, &w, &h) && w > 0 && h > 0) {
+                g_mouse_x = sx + w / 2;
+                g_mouse_y = sy + h / 2;
+            }
+            return;
+        }
+    }
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int n = 0; n < 16; ++n) {
+            int sx, sy, w, h;
+            if (pass == 0 && n < MapMax && denied(n)) continue;
+            if (!MUS_GetMouseRectFlag(10, n)) continue;
+            if (!MUS_GetMouseRect(10, n, &sx, &sy, &w, &h)) continue;
+            if (w <= 0 || h <= 0) continue;
+            g_mouse_x = sx + w / 2;
+            g_mouse_y = sy + h / 2;
+            return;
+        }
     }
     /* Nothing selectable here: stand on the forward arrow and let the next
      * click turn the page. */

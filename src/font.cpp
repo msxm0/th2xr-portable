@@ -454,6 +454,12 @@ GameFont::GameFont(const Archive& archive)
         | shadow_data_[1] << 8
         | shadow_data_[2] << 16
         | shadow_data_[3] << 24);
+    // The glyph strides below are fixed for a 2-pixel shadow (14x28 and 8x28
+    // cells); any other width would read across glyphs and off the end.
+    if (shadow_width_ != 2) {
+        throw std::runtime_error("font24.fk0: unexpected shadow width "
+                                 + std::to_string(shadow_width_));
+    }
     modern_ = std::make_unique<Modern>();
 }
 
@@ -738,10 +744,12 @@ void draw_glyph(
     SDL_Renderer* renderer, float x, float y, int glyph_height,
     int glyph_width,
     const std::uint8_t* bitmap, std::uint8_t red, std::uint8_t green,
-    std::uint8_t blue, std::uint8_t alpha, int alpha_256)
+    std::uint8_t blue, std::uint8_t alpha, int alpha_256,
+    int first_column = 0, int last_column = std::numeric_limits<int>::max())
 {
     for (int row = 0; row < glyph_height; ++row) {
-        for (int column = 0; column < glyph_width; ++column) {
+        for (int column = std::max(0, first_column);
+             column < std::min(glyph_width, last_column); ++column) {
             const auto packed = bitmap[row * (glyph_width / 2) + column / 2];
             const auto coverage =
                 column % 2 == 0 ? packed & 0x0f : packed >> 4;
@@ -763,11 +771,13 @@ void draw_glyph(
 
 void draw_shadow_mask(
     SDL_Renderer* renderer, float x, float y, int width, int height,
-    const std::uint8_t* bitmap, std::uint8_t alpha, int alpha_256)
+    const std::uint8_t* bitmap, std::uint8_t alpha, int alpha_256,
+    int first_column = 0, int last_column = std::numeric_limits<int>::max())
 {
     const int stride = (width + 1) / 2;
     for (int row = 0; row < height; ++row) {
-        for (int column = 0; column < width; ++column) {
+        for (int column = std::max(0, first_column);
+             column < std::min(width, last_column); ++column) {
             const auto packed = bitmap[row * stride + column / 2];
             const auto coverage =
                 column % 2 == 0 ? packed & 0x0f : packed >> 4;
@@ -849,12 +859,14 @@ void GameFont::draw_bitmap_face(
             }
             // The shader form first; draw_glyph is the fallback when it
             // is unavailable, which is every non-GLES build.
+            const auto columns = engine_columns(renderer, x, half_width, false);
             if (!draw_mask_exact(
                     renderer, x, y, half_width, font_size, bitmap,
-                    red, green, blue, alpha_256, alpha)) {
+                    red, green, blue, alpha_256, alpha, columns)) {
                 draw_glyph(
                     renderer, x, y, font_size, half_width, bitmap,
-                    red, green, blue, alpha, alpha_256);
+                    red, green, blue, alpha, alpha_256,
+                    columns.first, columns.last);
             }
             x += half_width;
         }
@@ -882,12 +894,15 @@ void GameFont::draw_bitmap_face(
                     data.data() + static_cast<std::size_t>(index) * full_bytes;
                 // The shader form first; draw_glyph is the fallback when it
                 // is unavailable, which is every non-GLES build.
+                const auto columns =
+                    engine_columns(renderer, x, font_size, false);
                 if (!draw_mask_exact(
                         renderer, x, y, font_size, font_size, bitmap,
-                        red, green, blue, alpha_256, alpha)) {
+                        red, green, blue, alpha_256, alpha, columns)) {
                     draw_glyph(
                         renderer, x, y, font_size, font_size, bitmap,
-                        red, green, blue, alpha, alpha_256);
+                        red, green, blue, alpha, alpha_256,
+                        columns.first, columns.last);
                 }
                 x += font_size;
             } else if (code == 0x8140) {
@@ -907,12 +922,15 @@ void GameFont::draw_bitmap_face(
                     + static_cast<std::size_t>(index) * half_bytes;
                 // The shader form first; draw_glyph is the fallback when it
                 // is unavailable, which is every non-GLES build.
+                const auto columns =
+                    engine_columns(renderer, x, half_width, false);
                 if (!draw_mask_exact(
                         renderer, x, y, half_width, font_size, bitmap,
-                        red, green, blue, alpha_256, alpha)) {
+                        red, green, blue, alpha_256, alpha, columns)) {
                     draw_glyph(
                         renderer, x, y, font_size, half_width, bitmap,
-                        red, green, blue, alpha, alpha_256);
+                        red, green, blue, alpha, alpha_256,
+                        columns.first, columns.last);
                 }
                 x += half_width;
             }
@@ -1014,6 +1032,55 @@ void GameFont::draw_save_menu(
         x, y, text, red, green, blue, alpha);
 }
 
+GameFont::Columns GameFont::engine_columns(
+    SDL_Renderer* renderer, float x, int width, bool shadow) const
+{
+    if (!engine_clip_) {
+        return all_columns;
+    }
+    SDL_Rect viewport{};
+    SDL_GetRenderViewport(renderer, &viewport);
+    float scale_x = 1.0f;
+    float scale_y = 1.0f;
+    SDL_GetRenderScale(renderer, &scale_x, &scale_y);
+    if (scale_x != 1.0f || scale_y != 1.0f) {
+        return all_columns;     // not the engine's pixels
+    }
+    // ClipRect: a box that starts left of the clip starts at it instead,
+    // with the source moved on by as much.  The viewport carries the text
+    // shake (DSP_SetTextMove), which the clip does not move with.
+    int dest = static_cast<int>(std::lround(x)) + viewport.x;
+    const int left = std::max(0, engine_clip_->first);
+    const int right = engine_clip_->second;
+    int first = 0;
+    int w = width;
+    if (dest < left) {
+        w -= left - dest;
+        first += left - dest;
+        dest = left;
+    }
+    if (dest + w > right) {
+        w = right - dest;
+    }
+    if (w <= 0) {
+        return {0, 0};
+    }
+    // Then FNT_DrawTextBuf_F/_Fkage, which read two pixels to a byte: cut
+    // at an odd column, they skip the rest of that byte and the pixel at
+    // the clip with it - a text shaken off the left edge leaves the screen's
+    // first column alone (Q 3 32 20 2, 080308100.sdt).
+    if (first % 2 != 0) {
+        ++first;
+        --w;
+    }
+    // _F walks w/2 whole bytes and drops an odd last pixel; _Fkage walks
+    // (w+1)/2 and so writes one past a clip that cuts it at an odd width.
+    // At the screen's right edge that pixel lands on the next row's first in
+    // the engine; here it falls off the target.
+    const int drawn = shadow ? (w + 1) / 2 * 2 : w / 2 * 2;
+    return {first, first + drawn};
+}
+
 void GameFont::draw_authentic_shadow(
     SDL_Renderer* renderer, float x, float y, std::string_view text,
     std::uint8_t alpha, int alpha_256) const
@@ -1038,18 +1105,21 @@ void GameFont::draw_authentic_shadow(
                 | static_cast<unsigned char>(cp932[i + 1]));
             const auto index = cp932_full_index(code);
             if (index >= 0) {
+                const auto columns = engine_columns(
+                    renderer, x - shadow_width_ + 1.0f,
+                    size + shadow_width_ * 2, true);
                 if (!draw_mask_exact(
                         renderer, x - shadow_width_ + 1.0f, y - shadow_width_ + 1.0f,
                         size + shadow_width_ * 2, size + shadow_width_ * 2,
                         shadow_data_.data() + 4
                         + index * shadow_full_bytes,
-                        0, 0, 0, alpha_256, alpha)) {
+                        0, 0, 0, alpha_256, alpha, columns)) {
                     draw_shadow_mask(
                         renderer, x - shadow_width_ + 1.0f, y - shadow_width_ + 1.0f,
                         size + shadow_width_ * 2, size + shadow_width_ * 2,
                         shadow_data_.data() + 4
                         + index * shadow_full_bytes,
-                        alpha, alpha_256);
+                        alpha, alpha_256, columns.first, columns.last);
                 }
                 x += size;
             } else if (code == 0x8140) {
@@ -1059,18 +1129,21 @@ void GameFont::draw_authentic_shadow(
         } else if (is_cp932_half(byte)) {
             const auto index = cp932_half_index(byte);
             if (index >= 0 && index < 157) {
+                const auto columns = engine_columns(
+                    renderer, x - shadow_width_ + 1.0f,
+                    width + shadow_width_ * 2, true);
                 if (!draw_mask_exact(
                         renderer, x - shadow_width_ + 1.0f, y - shadow_width_ + 1.0f,
                         width + shadow_width_ * 2, size + shadow_width_ * 2,
                         shadow_data_.data() + shadow_ascii_offset
                         + index * shadow_half_bytes,
-                        0, 0, 0, alpha_256, alpha)) {
+                        0, 0, 0, alpha_256, alpha, columns)) {
                     draw_shadow_mask(
                         renderer, x - shadow_width_ + 1.0f, y - shadow_width_ + 1.0f,
                         width + shadow_width_ * 2, size + shadow_width_ * 2,
                         shadow_data_.data() + shadow_ascii_offset
                         + index * shadow_half_bytes,
-                        alpha, alpha_256);
+                        alpha, alpha_256, columns.first, columns.last);
                 }
             }
             x += width;

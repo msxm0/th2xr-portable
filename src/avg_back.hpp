@@ -194,6 +194,10 @@ struct FadeStruct {
     int sr = bright_neutral, sg = bright_neutral, sb = bright_neutral;
     int er = bright_neutral, eg = bright_neutral, eb = bright_neutral;
     int r = bright_neutral, g = bright_neutral, b = bright_neutral;
+    // grp_flag[i] / txt_flag[TXT_WINDOW]: what AVG_SetFade turned off and
+    // the end of the fade turns back on.
+    std::array<bool, grp_disp> grp_flag{};
+    bool txt_flag = false;
 };
 
 class AvgBack {
@@ -218,6 +222,8 @@ public:
         // AVG_SetNovelMessageDisp( OFF ) and AVG_ResetHalfTone().
         std::function<void(bool)> novel_message_disp;
         std::function<void()> reset_half_tone;
+        // DSP_SetTextDisp( TXT_WINDOW, disp ) alone - not NovelMessage.disp.
+        std::function<void(bool)> text_disp;
         // The screen the wipe is blending away from has to exist as a
         // bitmap before GRP_BACK+1 can draw it.  The engine gets it from
         // AVG_SetBack's DSP_CopyBmp; ours captures the framebuffer.
@@ -277,6 +283,9 @@ public:
     void set_bright(int r, int g, int b);                        // AVG_SetBright
     void set_flash(int r, int g, int b, int fade1, int fade2);
     void control_fade();
+    // AVG_Init's share of FadeStruct and the graphs: GRP_DISP and BMP_DISP
+    // gone, and nothing left for the end of the next fade to turn back on.
+    void reset_fade_freeze();
     bool wait_fade() const { return fade_.flag != 0; }
     const FadeStruct& fade() const { return fade_; }
 

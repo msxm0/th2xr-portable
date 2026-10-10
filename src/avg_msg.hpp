@@ -351,6 +351,9 @@ public:
     // What the renderer draws.  TXT_WINDOW's display flag is separate from
     // NovelMessage.disp: the log hides the line without taking the bar down.
     bool main_text_disp() const { return main_text_disp_; }
+    // DSP_SetTextDisp( TXT_WINDOW, disp ) on its own, as AVG_SetFade and
+    // AVG_ColtrolFade call it - NovelMessage.disp stays as it is.
+    void set_main_text_disp(bool disp) { main_text_disp_ = disp; }
     const EngineText& log_text() const { return log_text_; }
     // The log entry on screen: its voiced spans, the one under the pointer
     // (-1 for none), and its rects again - after the presentation's own

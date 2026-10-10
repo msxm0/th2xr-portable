@@ -7,11 +7,14 @@
 #include <SDL3/SDL.h>
 
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace th2 {
@@ -73,6 +76,17 @@ public:
         SDL_Renderer* renderer, float x, float y, std::string_view text,
         std::uint8_t alpha = 255, int alpha_256 = -1) const;
 
+    // TXT_DrawTextEx's clip, left and right in target pixels:
+    // DSP_SetTextClip's box, or the whole screen for a text without one.
+    // While it is set, glyphs and shadows that cross it are cut the way
+    // FNT_DrawTextBuf_F and _Fkage cut them, which is not exactly at the
+    // clip - see engine_columns().  Unset, nothing is cut.
+    void set_engine_clip(int left, int right) const
+    {
+        engine_clip_ = std::pair{left, right};
+    }
+    void clear_engine_clip() const { engine_clip_.reset(); }
+
     // Composite glyphs through the engine's own arithmetic instead of
     // plotting them point by point.
     //
@@ -113,10 +127,21 @@ private:
     // Returns false when the mask could not be composited, in which case the
     // caller plots it.  `alpha` (0..255) stands in for a missing alpha_256
     // on a layer target - see the definition.
+    // The mask columns [first, last) a draw at `x` writes under the engine
+    // clip; every column when none is set.
+    struct Columns {
+        int first;
+        int last;
+    };
+    static constexpr Columns all_columns{0, std::numeric_limits<int>::max()};
+    Columns engine_columns(
+        SDL_Renderer* renderer, float x, int width, bool shadow) const;
+    mutable std::optional<std::pair<int, int>> engine_clip_;
     bool draw_mask_exact(
         SDL_Renderer* renderer, float x, float y, int width, int height,
         const std::uint8_t* bitmap, int red, int green, int blue,
-        int alpha_256, int alpha = -1) const;
+        int alpha_256, int alpha = -1,
+        Columns columns = all_columns) const;
     static constexpr int size = 24;
     static constexpr int width = 12;
     std::vector<std::uint8_t> data_;
