@@ -116,8 +116,8 @@ TextCount txt_count_text(std::string_view str, const TextBox& box)
     // a character count.  With the message window's box it is the layout.
     int px = box.sx;
     int py = box.sy;
-    const int fno = box.font;
-    int fno2 = fno;
+    int fno = box.font;
+    int fno2 = fno;   // the tallest font on the line so far: its height
     int kaig = 0;    // an automatic break just happened; swallow the next \n
     int kflag = 0;   // holding a line open for a character that may not start one
     int px_bak = 0;  // where the last line ended, for the cursor report
@@ -232,12 +232,18 @@ TextCount txt_count_text(std::string_view str, const TextBox& box)
                 break;
             }
             case 'f': case 'F': {
+                //     tag_back[tag_cnt] = fno; ...
+                //     if( GetDigit( str, &cnt, &digit ) ){
+                //         fno = digit; fno2 = max(fno,fno2); }
                 tag_param[tag_cnt] = tag_font;
-                tag_back[tag_cnt] = 0;
+                tag_back[tag_cnt] = fno;
                 ++tag_cnt;
                 ++cnt;
                 int digit = 0;
-                get_digit(str, cnt, digit);
+                if (get_digit(str, cnt, digit)) {
+                    fno = digit;
+                    fno2 = std::max(fno, fno2);
+                }
                 break;
             }
             case 'r': case 'R':
@@ -314,12 +320,23 @@ TextCount txt_count_text(std::string_view str, const TextBox& box)
             // rest of the message: at pc 18629 of 040426300.sdt ours made
             // NovelMessage.max 1268 against the reference's 134.
             //
-            // Speed is the only one of them this counter varies - fno is
-            // box.font throughout and the colour is not tracked - so it is
-            // the only one restored here, and it is the only one whose
-            // previous value the stack actually saves.
+            // The colour is not tracked, so speed and the font are the two
+            // restored here.  The font's height outlives its tag: closed
+            // anywhere but at the start of a line, the line stays as tall
+            // as the tallest font it held, and the next one starts lower.
+            // The English script's only two font tags are empty -
+            // "...<F13>mumble<F26>..." in 070003300.sdt draws nothing at
+            // either size - so this is all they do, and that line's
+            // <F26> puts the next one two pixels down:
+            //
+            //     case TAG_FONT:
+            //         fno = tag_back[tag_cnt];
+            //         if(px==sx){ fno2 = fno; }else{ fno2 = max(fno,fno2); }
             if (tag_param[tag_cnt] == tag_speed) {
                 speed = tag_back[tag_cnt];
+            } else if (tag_param[tag_cnt] == tag_font) {
+                fno = tag_back[tag_cnt];
+                fno2 = px == box.sx ? fno : std::max(fno, fno2);
             }
             break;
         default:
@@ -390,7 +407,7 @@ TextCount txt_count_text(std::string_view str, const TextBox& box)
         // There is no word wrap in it at all - the break lands wherever the
         // cell runs out, mid-word if that is where it falls.
         const auto rest = str.substr(std::min(cnt, str.size()));
-        if (px - box.sx >= box.w * fno - fno + 1) {
+        if (px - box.sx >= box.w * box.font - fno + 1) {
             if (kflag == 1) {
                 if (!rest.starts_with("\u3000")) {
                     kflag = 0;
@@ -424,8 +441,8 @@ TextCount txt_count_text(std::string_view str, const TextBox& box)
             out.cursor_bak.push_back(px_bak);
         }
 
-        if (py - box.sy >= box.h * (fno + box.pich_h) - (fno + box.pich_h) + 1) {
-            if (!(py - box.sy == box.h * (fno + box.pich_h) && px == box.sx)) {
+        if (py - box.sy >= box.h * (box.font + box.pich_h) - (fno + box.pich_h) + 1) {
+            if (!(py - box.sy == box.h * (box.font + box.pich_h) && px == box.sx)) {
                 break;
             }
         }

@@ -878,8 +878,12 @@ int Game::seasonal_background_scene(int scene) const
 {
     const int variant = scene % 10;
     int base = scene / 10;
+    // AVG_SakuraSakuTH2: ret = scene % 10000, and a scene of 10000 or more
+    // is that and nothing else - "this picture, whatever the season".  As
+    // it was, 10081 (080411001.sdt pc 12981) asked for B10081000.bmp, which
+    // does not exist, and the game stopped.
     if (base >= 10000) {
-        return scene;
+        return base % 10000 * 10 + variant;
     }
     if ((base >= 1 && base <= 4) || base == 78) {
         base = 1;

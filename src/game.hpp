@@ -201,6 +201,13 @@ private:
     // for the full fifty ticks where the reference held for fourteen.
     std::unordered_map<std::size_t, std::uint64_t> trace_sound_started_;
     void note_sound_started(std::size_t channel);
+    // Voices go in the same map, under their own keys, so a checkpoint
+    // carries them with the effects.  AVG_WaitVoice asks the PCM status and
+    // the reference's stub answers "playing" for trace_sound_ticks after the
+    // start - the real channel would answer from the wall clock instead.
+    static constexpr std::size_t trace_voice_key = 1000;
+    bool trace_voice_playing(std::size_t channel) const;
+    bool voice_channel_playing(std::size_t channel) const;
     // Audio as events.  The reference decodes nothing, so there is no
     // waveform to compare against - what is comparable is which sound it
     // asked for, on which channel, on which tick.  Argument order matches
@@ -1370,6 +1377,10 @@ public:
     // sampler, which runs before EXEC_ControlLang, sees for an "at" rule.
     std::string trace_rule_script_;
     std::uint32_t trace_rule_pc_ = 0;
+    // For key-list rules: the location last tick, and each rule's arrivals.
+    std::string trace_rule_prev_script_;
+    std::uint32_t trace_rule_prev_pc_ = UINT32_MAX;
+    std::vector<int> trace_rule_visits_;
     void set_trace_hold(std::uint64_t tick, int seconds);
     void enable_recording(const std::filesystem::path& path,
                           std::uint64_t from);

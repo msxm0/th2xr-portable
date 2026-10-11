@@ -592,6 +592,7 @@ void Game::play_voice(const th2::Event& event)
     auto name = standard_name;
     auto& voice_channel = voice_channels_[channel];
     voice_channel.stop();
+    trace_sound_started_.erase(trace_voice_key + channel);
     //     if( skip_voice || Avg.voice==0
     //         || (AVG_GetMesCut() && Avg.demo==0 && test==0) ) return;
     // A line being skipped is not voiced at all - AVG_StopVoice above has
@@ -620,6 +621,7 @@ void Game::play_voice(const th2::Event& event)
         return;
     }
     trace_note_audio("voicefile", 0, loop ? 1 : 0, volume, 0, name.c_str());
+    note_sound_started(trace_voice_key + channel);
     voice_channel.play_streaming(
         ready_audio_decoder(voice_archive_, voice_entry->name), loop,
         voice_gain(volume, character));
@@ -637,6 +639,7 @@ void Game::play_log_voice(int character, int scenario, int voice, bool a_cut)
     trace_note_audio("voice", 0, character, scenario, voice);
     auto& voice_channel = voice_channels_[0];
     voice_channel.stop();
+    trace_sound_started_.erase(trace_voice_key);
     const auto standard_name = std::format(
         "K{:09d}_{:03d}{:03d}.OGG", scenario, voice, character);
     auto name = standard_name;
@@ -658,6 +661,7 @@ void Game::play_log_voice(int character, int scenario, int voice, bool a_cut)
         return;
     }
     trace_note_audio("voicefile", 0, 0, 255, 0, name.c_str());
+    note_sound_started(trace_voice_key);
     voice_channel.play_streaming(
         ready_audio_decoder(voice_archive_, voice_entry->name), false,
         voice_gain(255, character));
@@ -713,8 +717,12 @@ void Game::refresh_audio_wait(bool before_script)
     //
     // Treating both the same way is wrong whichever way you pick: one costs
     // a tick at pc 4041 of 010301000.sdt, the other gains one at pc 547.
-    if (audio_wait_
-        && (audio_wait_->kind == AudioWaitKind::bgm) != before_script) {
+    //   VW   -> AVG_WaitVoice (GM_Avg.cpp:1586), asked by ESC_EOprVW
+    //           itself (Escript.cpp:3026) - the same frame, like MW.
+    const bool asked_by_opcode = audio_wait_
+        && (audio_wait_->kind == AudioWaitKind::bgm
+            || audio_wait_->kind == AudioWaitKind::voice);
+    if (audio_wait_ && asked_by_opcode != before_script) {
         return;
     }
     if (audio_wait_) {
@@ -722,7 +730,10 @@ void Game::refresh_audio_wait(bool before_script)
             // From the tick the sound started, which is what
             // th2ref_pcm_play records on the other side - not from the tick
             // something began waiting for it.
-            const auto found = trace_sound_started_.find(audio_wait_->channel);
+            const auto key = audio_wait_->kind == AudioWaitKind::voice
+                ? trace_voice_key + audio_wait_->channel
+                : audio_wait_->channel;
+            const auto found = trace_sound_started_.find(key);
             // Nothing recorded means nothing ever started on that channel, and
             // the reference agrees loudly: th2ref_pcm_status answers PCM_STOP
             // for a handle it has never seen, so the wait clears at once.
@@ -753,6 +764,31 @@ void Game::refresh_audio_wait(bool before_script)
             }
         }
     }
+}
+
+bool Game::trace_voice_playing(std::size_t channel) const
+{
+    // th2ref_pcm_status: a looping sound plays until it is stopped, anything
+    // else for g_tick - start < TH2REF_PCM_TICKS.  `<`, where the SE answer
+    // below has `<=`: AVG_WaitVoice asks the PCM itself, in the same frame,
+    // and has none of AVG_WaitSe's lag to make up for.
+    const auto found = trace_sound_started_.find(trace_voice_key + channel);
+    if (found == trace_sound_started_.end()) {
+        return false;
+    }
+    if (channel < voice_loop_.size() && voice_loop_[channel]) {
+        return true;
+    }
+    return trace_tick_ - found->second < trace_sound_ticks;
+}
+
+bool Game::voice_channel_playing(std::size_t channel) const
+{
+    if (trace_mode_) {
+        return trace_voice_playing(channel);
+    }
+    return channel < voice_channels_.size()
+        && voice_channels_[channel].playing();
 }
 
 bool Game::trace_se_playing(std::size_t channel) const

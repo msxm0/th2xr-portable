@@ -81,10 +81,20 @@ struct TraceInputState {
 // instruction - an answer for one particular choice, on top of whatever the
 // repeats press everywhere.  The engine takes the highest number key held,
 // so "at 080306000@755 num2" overrides the route's "every 1 num1" there.
+// With a list - "at 999999005@419 num3,num4,num1" - the n-th key is held on
+// the n-th arrival there and nothing after: a menu the script comes back to,
+// answered differently each time.
 struct TraceRule {
     std::string script;       // lower case, no extension
     std::uint32_t pc = 0;
-    std::string key;
+    std::vector<std::string> keys;
+};
+
+// "<tick> setflag <index> <value>": a script flag written once, at that tick.
+struct TraceFlagSet {
+    std::uint64_t tick = 0;
+    std::size_t index = 0;
+    std::int32_t value = 0;
 };
 
 class TraceScript {
@@ -96,6 +106,7 @@ public:
     std::size_t size() const { return events_.size(); }
     const std::vector<TraceEvent>& events() const { return events_; }
     const std::vector<TraceRule>& rules() const { return rules_; }
+    const std::vector<TraceFlagSet>& flag_sets() const { return flag_sets_; }
 
 private:
     // Sorted and split once, so a tick costs a binary search and the events
@@ -105,6 +116,7 @@ private:
     void index();
     std::vector<TraceEvent> events_;
     std::vector<TraceRule> rules_;
+    std::vector<TraceFlagSet> flag_sets_;
     std::vector<TraceEvent> moves_;      // by tick
     std::vector<TraceEvent> one_shots_;  // by tick
     std::vector<TraceEvent> repeats_;

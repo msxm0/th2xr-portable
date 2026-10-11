@@ -1287,6 +1287,13 @@ void Game::run_tick()
         }
         trace_rule_pc_ = script_ended_ ? 0 : runtime_.vm_pc();
     }
+    if (trace_mode_) {
+        for (const auto& set : trace_script_.flag_sets()) {
+            if (set.tick == trace_tick_) {
+                runtime_.set_flag(set.index, set.value);
+            }
+        }
+    }
     // EXEC_ControlLang.  main.cpp runs it, then MAIN_GameControl, and only
     // then MAIN_DrawGraph.  Every resumption of the script goes through here
     // so that order holds; resuming from inside the control pass put a

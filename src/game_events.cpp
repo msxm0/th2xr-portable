@@ -641,9 +641,12 @@ bool Game::handle(const th2::Event& event)
             number(event, 2) < 0 ? 0 : number(event, 2));
     } else if (name == "SES") {
         const auto channel = number(event, 0);
+        // Noted on entry, as the reference notes AVG_StopSE2 - which is also
+        // called for channels past the table (080331000.sdt: SES 90) and
+        // reads a SeStruct that is not there; ours does nothing with those.
+        trace_note_audio("sestop", channel, -1, number(event, 1), 0);
         if (channel >= 0 && static_cast<std::size_t>(channel) < se_channels_.size()) {
             const int fade = number(event, 1) < 0 ? 0 : number(event, 1);
-            trace_note_audio("sestop", channel, -1, number(event, 1), 0);
             se_channels_[channel].fade_to(
                 0.0f, audio_fade_duration(fade), true);
             se_sound_[channel] = -1;
@@ -690,6 +693,12 @@ bool Game::handle(const th2::Event& event)
         if (channel >= 0 && static_cast<std::size_t>(channel) < voice_channels_.size()) {
             const int fade = number(event, 0) < 0 ? 0 : number(event, 0);
             trace_note_audio("voicestop", channel, -1, -1, -1);
+            if (fade == 0) {
+                // AVG_StopVoice: the PCM is stopped, so AVG_WaitVoice finds
+                // nothing playing from here on.
+                trace_sound_started_.erase(
+                    trace_voice_key + static_cast<std::size_t>(channel));
+            }
             voice_channels_[channel].fade_to(
                 0.0f, audio_fade_duration(fade), true);
             voice_sound_[channel] = -1;
@@ -697,7 +706,7 @@ bool Game::handle(const th2::Event& event)
     } else if (name == "VW") {
         const auto channel = number(event, 0) < 0 ? 0 : number(event, 0);
         if (channel >= 0 && static_cast<std::size_t>(channel) < voice_channels_.size()
-            && voice_channels_[channel].playing()) {
+            && voice_channel_playing(static_cast<std::size_t>(channel))) {
             audio_wait_ = AudioWait{
                 AudioWaitKind::voice, static_cast<std::size_t>(channel)};
         }

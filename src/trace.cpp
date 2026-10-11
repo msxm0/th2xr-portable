@@ -17,7 +17,7 @@ namespace {
 // The key names th2ref_input.cpp accepts.  Kept in step deliberately: a
 // script that runs on one side has to run on the other, and a name only one
 // of them knows would diverge silently.
-constexpr std::array<std::string_view, 25> known_keys{
+constexpr std::array<std::string_view, 26> known_keys{
     "enter", "space", "esc", "bs", "ctrl", "shift", "alt",
     "up", "down", "left", "right", "pup", "pdown", "home", "end",
     // The number row.  GameKey.num[] in the original, and not a convenience:
@@ -25,6 +25,10 @@ constexpr std::array<std::string_view, 25> known_keys{
     // way to answer one without knowing where its text landed on screen.
     "num0", "num1", "num2", "num3", "num4",
     "num5", "num6", "num7", "num8", "num9",
+    // Not a key: in an "at" rule it ends the trace after this tick, which
+    // is how a debug-menu walk stops when it is back where it began.  The
+    // reference ignores it and is run to the tick ours stopped on.
+    "quit",
 };
 
 std::string lower(std::string value)
@@ -93,20 +97,41 @@ void TraceScript::load(const std::filesystem::path& path)
         }
         what = lower(std::move(what));
 
+        if (what == "setflag") {
+            TraceFlagSet set;
+            set.tick = tick;
+            if (!(parts >> set.index >> set.value)) {
+                throw std::runtime_error(
+                    path.string() + ":" + std::to_string(number)
+                    + ": setflag needs <index> <value>");
+            }
+            flag_sets_.push_back(set);
+            continue;
+        }
         if (what == "at") {
             std::string where;
+            std::string keys;
             TraceRule rule;
-            if (!(parts >> where >> rule.key)
+            if (!(parts >> where >> keys)
                 || where.find('@') == std::string::npos) {
                 throw std::runtime_error(
                     path.string() + ":" + std::to_string(number)
-                    + ": at needs <script>@<pc> <key>");
+                    + ": at needs <script>@<pc> <key>[,<key>...]");
             }
-            rule.key = lower(std::move(rule.key));
-            if (std::ranges::find(known_keys, rule.key) == known_keys.end()) {
+            std::istringstream list(lower(std::move(keys)));
+            std::string key;
+            while (std::getline(list, key, ',')) {
+                if (std::ranges::find(known_keys, key) == known_keys.end()) {
+                    throw std::runtime_error(
+                        path.string() + ":" + std::to_string(number)
+                        + ": unknown key '" + key + "'");
+                }
+                rule.keys.push_back(key);
+            }
+            if (rule.keys.empty() || rule.keys.size() > 16) {
                 throw std::runtime_error(
                     path.string() + ":" + std::to_string(number)
-                    + ": unknown key '" + rule.key + "'");
+                    + ": at takes 1 to 16 keys");
             }
             const auto at = where.find('@');
             rule.script = lower(where.substr(0, at));

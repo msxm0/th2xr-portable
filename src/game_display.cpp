@@ -573,7 +573,15 @@ th2::AvgBack::Hooks Game::background_hooks()
         msg().set_novel_message_disp(on);
     };
     hooks.reset_half_tone = [this] { reset_half_tone(); };
-    hooks.text_disp = [this](bool on) { msg().set_main_text_disp(on); };
+    // DSP_SetTextDisp( TXT_WINDOW, on ): the only thing between the window's
+    // text and the screen in the engine, so both of ours follow it.  The end
+    // of a fade turns it on even when NovelMessage.disp is off, and the last
+    // line shows again until the message machine next writes the text
+    // (040417000.sdt pc 18923, two ticks).
+    hooks.text_disp = [this](bool on) {
+        msg().set_main_text_disp(on);
+        message_visible_ = on;
+    };
     hooks.global_count = [this] { return global_count_; };
     return hooks;
 }

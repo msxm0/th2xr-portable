@@ -53,6 +53,8 @@ extern int ESC_GameFlagBuf[];
 extern "C" unsigned long th2ref_current_tick(void);
 extern "C" const char *th2ref_script_name(void);
 extern "C" unsigned long th2ref_script_pc(void);
+/* Escript.cpp's flag array, written by "setflag" lines. */
+extern int ESC_FlagBuf[];
 
 /* Scripted pointer.  MUS_RenewMouse reads the real device three ways -
  * GetCursorPos, ScreenToClient and GetAsyncKeyState - and all three are
@@ -88,8 +90,14 @@ std::vector<Event> g_shots;     /* one-shots, by tick */
 std::vector<Event> g_repeats;
 /* "at <script>@<pc> <key>": the key is held while the script stands on that
  * instruction.  Kept in step with TraceRule in src/trace.hpp. */
-struct Rule { char script[32]; unsigned long pc; int offset; };
+/* "at SCRIPT@PC k1,k2,...": one key held on every tick at that pc, or with a
+ * list the n-th key on the n-th arrival there and nothing after - a menu the
+ * script comes back to, answered differently each time. */
+struct Rule { char script[32]; unsigned long pc; int offsets[16]; int nkeys; int visits; };
 std::vector<Rule> g_rules;
+/* "<tick> setflag <index> <value>": ESC_FlagBuf written once, at that tick. */
+struct FlagSet { unsigned long tick; int index; int value; };
+std::vector<FlagSet> g_flagsets;
 unsigned long g_longest = 1;
 bool   g_loaded = false;
 
@@ -181,9 +189,15 @@ void load(void)
         int n = sscanf(line, "%lu %63s %d %d", &tick, name, &a, &b);
         if (n < 2) continue;
 
+        if (!_stricmp(name, "setflag") && n >= 4) {
+            FlagSet fs = { tick, a, b };
+            g_flagsets.push_back(fs);
+            ++count;
+            continue;
+        }
         if (!_stricmp(name, "at")) {
-            char where[64] = {0}, key[32] = {0};
-            if (sscanf(line, "%*lu %*63s %63s %31s", where, key) != 2
+            char where[64] = {0}, key[256] = {0};
+            if (sscanf(line, "%*lu %*63s %63s %255s", where, key) != 2
                 || !strchr(where, '@')) {
                 fprintf(stderr, "th2ref: at needs <script>@<pc> <key>\n");
                 continue;
@@ -196,13 +210,21 @@ void load(void)
             char *dot = strchr(where, '.');
             if (dot) *dot = 0;
             strncpy(r.script, where, sizeof r.script - 1);
-            r.offset = -1;
-            for (size_t k = 0; k < sizeof g_keys / sizeof g_keys[0]; ++k)
-                if (!_stricmp(key, g_keys[k].name)) r.offset = g_keys[k].offset;
-            if (r.offset < 0) {
-                fprintf(stderr, "th2ref: unknown key '%s'\n", key);
-                continue;
+            bool bad = false;
+            for (char *k = strtok(key, ","); k && r.nkeys < 16; k = strtok(NULL, ",")) {
+                int offset = -1;
+                for (size_t j = 0; j < sizeof g_keys / sizeof g_keys[0]; ++j)
+                    if (!_stricmp(k, g_keys[j].name)) offset = g_keys[j].offset;
+                /* "quit" ends our side's trace; this side is simply run to
+                 * the tick that stopped on, so it presses nothing. */
+                if (!_stricmp(k, "quit")) offset = -2;
+                if (offset == -1) {
+                    fprintf(stderr, "th2ref: unknown key '%s'\n", k);
+                    bad = true;
+                }
+                r.offsets[r.nkeys++] = offset;
             }
+            if (bad || !r.nkeys) continue;
             g_rules.push_back(r);
             ++count;
             continue;
@@ -384,20 +406,39 @@ extern "C" void th2ref_input(void)
     }
     if (map_pick) th2ref_map_pick(map_prefer, map_nprefer);
 
+    for (size_t k = 0; k < g_flagsets.size(); ++k) {
+        if (g_flagsets[k].tick == now) {
+            ESC_FlagBuf[g_flagsets[k].index] = g_flagsets[k].value;
+        }
+    }
+
     if (!g_rules.empty()) {
         const char *script = th2ref_script_name();
         const unsigned long pc = th2ref_script_pc();
+        static char prev_name[64] = {0};
+        static unsigned long prev_pc = (unsigned long)-1;
+        if (!script) {
+            prev_name[0] = 0;
+            prev_pc = (unsigned long)-1;
+        }
         if (script) {
             char name[64] = {0};
             strncpy(name, script, sizeof name - 1);
             char *dot = strchr(name, '.');
             if (dot) *dot = 0;
+            const bool arrived = pc != prev_pc || _stricmp(prev_name, name);
+            strcpy(prev_name, name);
+            prev_pc = pc;
             for (size_t k = 0; k < g_rules.size(); ++k) {
-                const Rule &r = g_rules[k];
+                Rule &r = g_rules[k];
                 if (r.pc != pc || _stricmp(r.script, name)) continue;
-                btn[r.offset] = 1;
-                trg[r.offset] = 1;
-                btrg[r.offset] = 1;
+                if (arrived) ++r.visits;
+                int key = r.nkeys == 1 ? 0 : r.visits - 1;
+                if (key < 0 || key >= r.nkeys || r.offsets[key] < 0) continue;
+                const int offset = r.offsets[key];
+                btn[offset] = 1;
+                trg[offset] = 1;
+                btrg[offset] = 1;
             }
         }
     }

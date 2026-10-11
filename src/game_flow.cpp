@@ -56,6 +56,16 @@ bool Game::load_scheduled_script()
     constexpr std::size_t calendar_skip_flag = 6;
     constexpr std::size_t clock_time_flag = 7;
 
+    // _DEBUG_CALL: the developers' script menu instead of the day, every
+    // time a script ends - which is what lets a trace play any script.
+    //     if( ESC_GetFlag(_DEBUG_CALL) ){
+    //         AVG_LoadScript( "999999999.sdt" ); return 0; }
+    constexpr std::size_t debug_call_flag = 9;
+    if (runtime_.flag(debug_call_flag) != 0) {
+        load_script("999999999.sdt");
+        return true;
+    }
+
     int month = runtime_.flag(month_flag);
     int day = runtime_.flag(day_flag);
     int time = runtime_.flag(time_flag);
@@ -149,11 +159,12 @@ bool Game::load_scheduled_script()
 
 bool Game::voice_playing() const
 {
-    return std::any_of(
-        voice_channels_.begin(), voice_channels_.end(),
-        [](const th2::AudioChannel& channel) {
-            return channel.playing();
-        });
+    for (std::size_t channel = 0; channel < voice_channels_.size(); ++channel) {
+        if (voice_channel_playing(channel)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void Game::update_playback_modes()
@@ -1497,10 +1508,29 @@ void Game::trace_apply_input()
                                : static_cast<std::uint64_t>(global_count_))
         : trace_script_.at(trace_tick_);
     if (!live) {
-        for (const auto& rule : trace_script_.rules()) {
-            if (rule.pc == trace_rule_pc_ && rule.script == trace_rule_script_) {
-                state.held.push_back(rule.key);
-                state.pressed.push_back(rule.key);
+        // An arrival is a tick whose location differs from the last one's;
+        // a rule with a key list answers its n-th arrival with the n-th key.
+        const auto& rules = trace_script_.rules();
+        trace_rule_visits_.resize(rules.size());
+        const bool arrived = trace_rule_pc_ != trace_rule_prev_pc_
+            || trace_rule_script_ != trace_rule_prev_script_;
+        trace_rule_prev_pc_ = trace_rule_pc_;
+        trace_rule_prev_script_ = trace_rule_script_;
+        for (std::size_t i = 0; i < rules.size(); ++i) {
+            const auto& rule = rules[i];
+            if (rule.pc != trace_rule_pc_ || rule.script != trace_rule_script_) {
+                continue;
+            }
+            if (arrived) {
+                ++trace_rule_visits_[i];
+            }
+            const std::size_t key = rule.keys.size() == 1
+                ? 0 : static_cast<std::size_t>(trace_rule_visits_[i] - 1);
+            if (key < rule.keys.size() && rule.keys[key] == "quit") {
+                trace_last_tick_ = trace_tick_;
+            } else if (key < rule.keys.size()) {
+                state.held.push_back(rule.keys[key]);
+                state.pressed.push_back(rule.keys[key]);
             }
         }
     }
