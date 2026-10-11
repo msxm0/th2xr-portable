@@ -1763,10 +1763,11 @@ void Display::draw_graph_bmp(
         }
         if (debug_draws) {
             SDL_Log("draw_graph bno=%d mode=%u dst=%.0f,%.0f %.0fx%.0f "
-                    "alpha=%d gl_exact=%d drawn=%d",
+                    "alpha=%d gl_exact=%d drawn=%d bright=%d,%d,%d",
                     graph.bno, mode, destination.x, destination.y,
                     destination.w, destination.h, alpha, (int)gl_exact,
-                    (int)drawn);
+                    (int)drawn, geometry.bright_r, geometry.bright_g,
+                    geometry.bright_b);
         }
         if (!drawn) {
             if (exact) {

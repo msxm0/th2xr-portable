@@ -260,16 +260,24 @@ private:
     // per wipe showed up as a fifth of the frames that overran.
     struct TransitionMask {
         std::vector<std::uint8_t> pixels;
+        // The pattern's raw palette indices, flipped like the pixels but
+        // with no palette and no curve: what DRW_DrawBMP_FFB_Ptn reads
+        // when the back is drawn at a brightness other than 128.  Read from
+        // the file on first use (transition_mask_indices).
+        std::vector<std::uint8_t> indices;
         int width = 0;
         int height = 0;
         Texture texture;  // Only built when the shader path can use it.
+        Texture index_texture;
     };
     std::unordered_map<int, TransitionMask> transition_masks_;
     std::set<int> pending_transition_masks_;
     // Best-effort: null or unavailable means every wipe takes the CPU blend.
     std::unique_ptr<th2::GlPatternTransition> gl_transition_;
     bool gl_transition_usable() const;
-    SDL_Texture* transition_mask_texture(int type);
+    SDL_Texture* transition_mask_texture(int type, bool indices = false);
+    bool pattern_wipe_reads_indices() const;
+    const std::vector<std::uint8_t>& transition_mask_indices(int type);
     bool transition_needs_pixels(int type) const;
     const TransitionMask& transition_mask(int type);
     void prepare_pending_transition_mask();
@@ -284,6 +292,7 @@ private:
         Surface next_pixels;
         Texture composite;
         std::vector<std::uint8_t> mask;
+        std::vector<std::uint8_t> mask_indices;
         int mask_width = 0;
         int mask_height = 0;
         int vague = 128;

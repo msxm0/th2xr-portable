@@ -168,10 +168,18 @@ void Game::setup_background_graphs(
             // frame by the time the display pass gets here; dropping it cost
             // the fade its first frame, which for a cross fade is the one
             // where the outgoing picture is supposed to be untouched.
-            const auto param = display().graph(th2::grp_back).param;
+            //
+            // The brightness too: AVG_SetBack's last word is
+            //     DSP_SetGraphBright( GRP_BACK, BackStruct.r, .g, .b );
+            // after its own DSP_SetGraph.  Without it a cross fade under
+            // FB's tint drew the incoming picture untinted - B 1 54 after
+            // FB 64 70 90 in 080330000.sdt brightened by up to 126 and
+            // dropped back on the frame the fade ended.
+            const auto held = display().graph(th2::grp_back);
             display().set_graph(
                 th2::grp_back, back_bmp, back_layer, true, th2::check_none);
-            display().set_graph_param(th2::grp_back, param);
+            display().set_graph_param(th2::grp_back, held.param);
+            display().set_graph_bright(th2::grp_back, held.r, held.g, held.b);
         }
         // BAK_CFZOOM1 and BAK_CFZOOM4 take no snapshot - AVG_SetBack's
         // switch has nothing for them - and draw GRP_BACK alone at a partial

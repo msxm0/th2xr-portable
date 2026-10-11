@@ -378,11 +378,84 @@ bool Game::gl_transition_usable() const
 
 // The mask only becomes a texture if the shader path is going to sample it;
 // on the CPU path the bytes are all that is needed.
-SDL_Texture* Game::transition_mask_texture(int type)
+// DRW_DrawBMP_FFB_Ptn has two loops, and they do not read the pattern the
+// same way.  At neutral brightness:
+//     blnd_tbl = BlendTable[ PtnTable[ pal[*src2_p].b + blnd2 ] ];
+// and with the graph's brightness anywhere else:
+//     blnd_tbl = BlendTable[ PtnTable[ *src2_p + blnd2 ] ];
+// - the palette index itself, with neither the palette nor the .AMP curve
+// that BMP_SetTonecurve_BT wrote into it.  The patterns' palettes are not
+// the identity, so a wipe under FB's tint runs a couple of steps behind the
+// same wipe untinted.  Measured on B 188 54 after FB 64 70 90 in
+// 080330000.sdt: every partly covered pixel two levels dark.
+// The pattern's palette indices, read from the file itself: load_image
+// resolves an 8 bit BMP's palette as it decodes, so the surface no longer
+// has them.  Only a wipe under a tint asks, which is rare enough that the
+// archive read is not worth doing for every mask up front.  Flipped the
+// same way as the pixels (DSP_LoadBmp2's rparam); no curve - .AMP is
+// BMP_SetTonecurve_BT, which rewrites the palette and leaves the indices.
+const std::vector<std::uint8_t>& Game::transition_mask_indices(int type)
 {
     auto& mask = const_cast<TransitionMask&>(transition_mask(type));
-    if (mask.texture) {
-        return mask.texture.get();
+    if (!mask.indices.empty() || mask.width <= 0 || mask.height <= 0) {
+        return mask.indices;
+    }
+    const auto name = std::format("f0{:03d}.bmp", type & 0x7f);
+    const auto* entry = graphics_.find(name);
+    if (!entry) {
+        return mask.indices;
+    }
+    const auto bytes = graphics_.read(*entry);
+    const auto u16 = [&](std::size_t at) {
+        return static_cast<std::uint32_t>(bytes[at] | (bytes[at + 1] << 8));
+    };
+    const auto u32 = [&](std::size_t at) { return u16(at) | (u16(at + 2) << 16); };
+    if (bytes.size() < 54 || bytes[0] != 'B' || bytes[1] != 'M'
+        || u16(28) != 8) {
+        return mask.indices;
+    }
+    const std::uint32_t offset = u32(10);
+    const int width = static_cast<std::int32_t>(u32(18));
+    int height = static_cast<std::int32_t>(u32(22));
+    const bool bottom_up = height > 0;
+    height = std::abs(height);
+    const int stride = (width + 3) / 4 * 4;
+    if (width != mask.width || height != mask.height
+        || offset + static_cast<std::size_t>(stride) * height > bytes.size()) {
+        return mask.indices;
+    }
+    const bool flip_x = type & 0x800;
+    const bool flip_y = type & 0x1000;
+    std::vector<std::uint8_t> indices(static_cast<std::size_t>(width) * height);
+    for (int y = 0; y < height; ++y) {
+        const int stored_y = flip_y ? height - y - 1 : y;
+        const int file_row = bottom_up ? height - 1 - stored_y : stored_y;
+        const auto* row = bytes.data() + offset
+            + static_cast<std::size_t>(file_row) * stride;
+        for (int x = 0; x < width; ++x) {
+            indices[static_cast<std::size_t>(y) * width + x] =
+                row[flip_x ? width - x - 1 : x];
+        }
+    }
+    mask.indices = std::move(indices);
+    return mask.indices;
+}
+
+bool Game::pattern_wipe_reads_indices() const
+{
+    const auto& graph = display().graph(th2::grp_back);
+    return !(graph.r == th2::bright_neutral && graph.g == th2::bright_neutral
+             && graph.b == th2::bright_neutral);
+}
+
+SDL_Texture* Game::transition_mask_texture(int type, bool indices)
+{
+    auto& mask = const_cast<TransitionMask&>(transition_mask(type));
+    auto& held = indices ? mask.index_texture : mask.texture;
+    const auto& values = indices && !transition_mask_indices(type).empty()
+        ? mask.indices : mask.pixels;
+    if (held) {
+        return held.get();
     }
     if (mask.width <= 0 || mask.height <= 0) {
         return nullptr;
@@ -396,8 +469,8 @@ SDL_Texture* Game::transition_mask_texture(int type)
     // The shader reads the red channel; the mask is a single value per pixel.
     std::vector<std::uint8_t> rgba(
         static_cast<std::size_t>(mask.width) * mask.height * 4);
-    for (std::size_t i = 0; i < mask.pixels.size(); ++i) {
-        const auto value = mask.pixels[i];
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        const auto value = values[i];
         rgba[i * 4 + 0] = value;
         rgba[i * 4 + 1] = value;
         rgba[i * 4 + 2] = value;
@@ -410,8 +483,8 @@ SDL_Texture* Game::transition_mask_texture(int type)
     // The CPU blend indexes the mask with integer division, so nearest keeps
     // the two paths producing the same edge.
     SDL_SetTextureScaleMode(texture.get(), SDL_SCALEMODE_NEAREST);
-    mask.texture = std::move(texture);
-    return mask.texture.get();
+    held = std::move(texture);
+    return held.get();
 }
 
 const Game::TransitionMask& Game::transition_mask(int type)
@@ -594,6 +667,7 @@ void Game::begin_transition(
         {},
         {},
         {},
+        {},
         0,
         0,
         vague >= 0 ? vague : 128,
@@ -675,7 +749,8 @@ bool Game::draw_pattern_transition_gpu(int rate)
         // same way the old one was taken.
         transition.composite = capture_frame_texture();
     }
-    SDL_Texture* mask = transition_mask_texture(transition.type);
+    SDL_Texture* mask = transition_mask_texture(
+        transition.type, pattern_wipe_reads_indices());
     if (!mask) {
         return false;
     }
@@ -736,12 +811,18 @@ void Game::draw_pattern_transition_rate(int rate)
     // with dnum2 the rate and dnum3 the vagueness, both integers.
     const int vague = std::clamp(transition.vague, 1, 256);
     const int blend_offset = rate * (256 + vague) / 256;
+    if (pattern_wipe_reads_indices() && transition.mask_indices.empty()) {
+        transition.mask_indices = transition_mask_indices(transition.type);
+    }
+    const auto& pattern =
+        pattern_wipe_reads_indices() && !transition.mask_indices.empty()
+            ? transition.mask_indices : transition.mask;
 
     for (int y = 0; y < height; ++y) {
         const int mask_y = y * transition.mask_height / height;
         for (int x = 0; x < width; ++x) {
             const int mask_x = x * transition.mask_width / width;
-            const int mask = transition.mask[
+            const int mask = pattern[
                 static_cast<std::size_t>(mask_y) * transition.mask_width
                 + mask_x];
             const int alpha = std::clamp(
