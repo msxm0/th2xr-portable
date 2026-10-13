@@ -96,7 +96,7 @@ constexpr std::array<WaitOpcode, 35> wait_opcodes{{
     {"ViewClock",   WaitKind::clock,         1},
     {"W",           WaitKind::frame,         1},
     {"WaitFrame",   WaitKind::wait_frame,    1},
-    {"WaitTime",    WaitKind::frame,         1},
+    {"WaitTime",    WaitKind::time,          1},
     {"Z",           WaitKind::back_scroll,   1},
 }};
 

@@ -90,6 +90,18 @@ PATCHES = [
      "void MAIN_Loop( void )\r\n{\r\n\tstatic int\t\tFrameLimit  = 1000;",
      "void MAIN_Loop( void )\r\n{\r\n#ifdef TH2REF_TRACE\r\n\tth2ref_advance_tick();\r\n#endif\r\n\tstatic int\t\tFrameLimit  = 1000;",
      "virtual clock: advance one tick per MAIN_Loop"),
+    # A bonus scenario as a run's start: the title's END_INITSTART turned into
+    # TTL_System's END_OMAKESTART case, which is these three calls in place
+    # of MAIN_StartScenario.  The title in front of it is the same either
+    # way, so the lead-in stays REFERENCE_LEAD_IN.
+    ("ScriptEngine/src/main.cpp",
+     "void MAIN_StartScenario( void )\r\n{\r\n",
+     "void MAIN_StartScenario( void )\r\n{\r\n#ifdef TH2REF_TRACE\r\n"
+     "\t{\r\n\t\tint omake = th2ref_omake_start();\r\n"
+     "\t\tif( omake >= 0 ){\r\n\t\t\tAvg.omake=ON;\r\n"
+     "\t\t\tMAIN_StartOmakeScenario(omake);\r\n"
+     "\t\t\tMUS_SetMouseLayer(0);\r\n\t\t\treturn;\r\n\t\t}\r\n\t}\r\n#endif\r\n",
+     "trace: start a bonus scenario (TH2REF_OMAKE)"),
     # --- audio as events.  Nothing is decoded on this side, so what can
     # be compared is which sound was asked for, on which channel, when.
     ("ScriptEngine/src/GM_Avg.cpp",

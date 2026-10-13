@@ -1,0 +1,11 @@
+# Route sasara110d: route sasara110 until 04/23's after-school map, then
+# Yuuji (13) first and any heroine but Sasara (14) after him.  Variant b's
+# 13,14 still took 110045000 there - Yuuji is not on that page, and the
+# fallback pick is the first destination on the page, which was hers.
+# Without 110045000 there is no 976, so no forced 110046000 and no 977:
+# EV_0426SCHOOL_HOURS runs 110047010 (972 is set).  With no 110048000 (978)
+# and Yuuji on 04/28 (no 110051000, 980), EV_0430LUNCH_BREAK ends on
+# 110060000.
+30 every 1 mappick 14
+916361 every 1 mappick 13,1,2,3,4,5,6,7,8,9,10,11,12,15,16,17,18,19,20
+1 at 110010001@8393 num2

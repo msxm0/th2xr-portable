@@ -1,0 +1,9 @@
+# Route sasara110b: route sasara110, but from 04/23's after-school map on
+# Yuuji (13) before Sasara: 04/23's 110045000 (flag 976, so no 110046000/977)
+# and 04/28's 110051000 (980) are passed over.  EV_0426SCHOOL_HOURS then runs
+# 110047010, and EV_0430LUNCH_BREAK ends on 110060000 (978 unset).
+# (A -N deny does not do it: with no other destination on the page the
+# fallback takes the denied one.)
+30 every 1 mappick 14
+916361 every 1 mappick 13,14
+1 at 110010001@8393 num2

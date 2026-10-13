@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -52,6 +53,9 @@ public:
                     std::size_t pc);
     std::span<const std::int32_t> all_flags() const { return flags_; }
     std::span<const std::int32_t> all_game_flags() const { return game_flags_; }
+    // STD_timeGetTime(), in milliseconds, for GetTime.  The game's engine
+    // clock, which WaitTime compares it against.
+    void set_clock(std::function<std::uint32_t()> clock) { clock_ = std::move(clock); }
 
 private:
     const Archive* archive_;
@@ -61,6 +65,7 @@ private:
     std::array<std::int32_t, 1024> game_flags_{};
     std::string script_name_;
     std::filesystem::path loose_script_directory_;
+    std::function<std::uint32_t()> clock_;
 
     bool handle(const Event& event);
     void load_bytes(std::vector<std::uint8_t> bytes, std::string name);

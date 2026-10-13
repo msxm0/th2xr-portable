@@ -57,6 +57,16 @@ struct GameConfig {
     int font_size = 24;
     bool show_script_position = false;
     bool dump_transition_frames = false;
+    // The player's name and DefaultCharName, which the original keeps in the
+    // registry (GM_AvgMsg.cpp: NameL..NameNN and "DefaultName") and opens
+    // the next new game's name dialog on.  Empty until a game has been
+    // started or loaded.
+    std::string name_family;
+    std::string name_given;
+    std::string name_family_reading;
+    std::string name_given_reading;
+    std::string name_nickname;
+    int default_char_name = 1;
 };
 
 GameConfig load_config(const std::filesystem::path& path);

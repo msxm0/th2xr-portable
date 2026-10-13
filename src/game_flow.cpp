@@ -813,14 +813,11 @@ void Game::enable_trace(
     // full-width characters in one and four half-width ones in the other,
     // which is two counts of difference in the typewriter and a different
     // line break wherever the name appears.
-    player_name_ = th2::PlayerName{
-        "\u6cb3\u91ce",                    // DEF_NAME_L    河野
-        "\u8cb4\u660e",                    // DEF_NAME_F    貴明
-        "\u3053\u3046\u306e",             // DEF_NAME_LK   こうの
-        "\u305f\u304b\u3042\u304d",      // DEF_NAME_FK   たかあき
-        "\u305f\u304b",                    // DEF_NAME_NN   たか
-        "\u30bf\u30ab",                    // DEF_NAME_NNK  タカ
-    };
+    player_name_ = th2::original_default_player_name();
+    // And they are the defaults the name dialog compares against, with
+    // DefaultCharName at its initial 1 rather than the player's registry.
+    default_player_name_ = player_name_;
+    default_char_name_ = 1;
     // The same difference one token further out: *h2 is a character's name,
     // not the player's, and AVG_SetName substitutes the original two-
     // character one.  Ours ships the romanised English name, which is six
@@ -862,9 +859,32 @@ void Game::enable_trace(
                      "bk_br_flag bk_br_cnt "
                      "avg_msg_cut avg_auto avg_frame avg_wait avg_level "
                      "avg_msg_wait avg_msg_page avg_half_tone "
-                     "txt_cnt txt_step global_count text\n");
+                     "txt_cnt txt_step global_count flags gflags text\n");
     }
+    // Every change to the 1024 script flags and the 1024 game flags, one
+    // line each - "tick f|g index value" - as the reference's
+    // TH2REF_FLAGLOG.  The state columns say a flag differs; this says which.
+    trace_flag_log_ = std::fopen((trace_dir_ / "flags.log").string().c_str(), "w");
 }
+
+namespace {
+
+// FNV-1a over the flags as little-endian int32s - the bytes the engine's
+// int ESC_FlagBuf[1024] holds, so th2ref_state.cpp hashes the same thing.
+std::uint32_t trace_flag_hash(std::span<const std::int32_t> flags)
+{
+    std::uint32_t hash = 2166136261u;
+    for (const auto value : flags) {
+        auto bits = static_cast<std::uint32_t>(value);
+        for (int i = 0; i < 4; ++i) {
+            hash = (hash ^ (bits & 0xffu)) * 16777619u;
+            bits >>= 8;
+        }
+    }
+    return hash;
+}
+
+}  // namespace
 
 std::string Game::trace_glyph_alpha() const
 {
@@ -880,8 +900,12 @@ std::string Game::trace_glyph_alpha() const
     // Nothing when the window is not on screen, which is what the
     // reference records: with DSP_SetTextDisp off, DrawGraphText is never
     // reached and no glyph goes by.  Ours has to agree about *when* there is
-    // text as well as about what it looks like.
-    if (!avg_msg_ || !message_visible_ || msg().state().disp == 0
+    // text as well as about what it looks like.  The gate is the text
+    // layer's, the one the frame is drawn with - not NovelMessage.disp: the
+    // end of a flash turns TXT_WINDOW back on with the message still off
+    // (AVG_ColtrolFade's txt_flag loop), and the reference draws its glyphs
+    // until the next back change (110040000.sdt pc 32894 to 33205).
+    if (!avg_msg_ || !message_visible_
         || ui_mode_ != UiMode::game || message_.empty()
         // The engine's log hides TXT_WINDOW while an older entry is up.
         || !msg().main_text_disp()) {
@@ -1446,6 +1470,27 @@ void Game::trace_dump_state()
         }
         trace_choice_answered_ = false;
     }
+    const auto flags = runtime_.all_flags();
+    const auto game_flags = runtime_.all_game_flags();
+    if (trace_flag_log_) {
+        for (std::size_t i = 0; i < flags.size(); ++i) {
+            if (flags[i] != trace_flags_prev_[i]) {
+                std::fprintf(trace_flag_log_, "%llu f %zu %d\n",
+                             static_cast<unsigned long long>(trace_tick_),
+                             i, flags[i]);
+                trace_flags_prev_[i] = flags[i];
+            }
+        }
+        for (std::size_t i = 0; i < game_flags.size(); ++i) {
+            if (game_flags[i] != trace_game_flags_prev_[i]) {
+                std::fprintf(trace_flag_log_, "%llu g %zu %d\n",
+                             static_cast<unsigned long long>(trace_tick_),
+                             i, game_flags[i]);
+                trace_game_flags_prev_[i] = game_flags[i];
+            }
+        }
+        std::fflush(trace_flag_log_);
+    }
     std::fprintf(trace_state_,
                  "%llu %s %lu "
                  "%d %d %d %d %d %d %d "
@@ -1454,7 +1499,7 @@ void Game::trace_dump_state()
                  "%d %d %d "
                  "%d %d "
                  "%d %d "
-                 "%d %d %d %d %d %d %d %d %d %d %d %s\n",
+                 "%d %d %d %d %d %d %d %d %d %d %d %08x %08x %s\n",
                  static_cast<unsigned long long>(trace_tick_),
                  name.empty() ? "-" : name.c_str(),
                  static_cast<unsigned long>(
@@ -1475,6 +1520,7 @@ void Game::trace_dump_state()
                  avg_msg_ ? msg().text_cnt() : 0,
                  avg_msg_ ? msg().text_step() : 0,
                  global_count_,
+                 trace_flag_hash(flags), trace_flag_hash(game_flags),
                  glyphs.c_str());
     std::fflush(trace_state_);
 
@@ -1547,7 +1593,7 @@ void Game::trace_apply_input()
     }
     script_mouse_x_ = state.mouse_x;
     script_mouse_y_ = state.mouse_y;
-    const bool open = !live || engine_input_open();
+    const bool open = live ? engine_input_open() : !trace_port_input_;
     if (!open) {
         // One of the port's own screens is up over the scene.  Its presses
         // never reached the sampler; what is left is the pointer, which the

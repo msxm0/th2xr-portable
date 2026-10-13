@@ -509,7 +509,7 @@ void Game::complete_movie()
     } else if (completed_mode == 3 && runtime_.game_flag(98) != 0) {
         start_movie(0, 0, false);
     } else {
-        title_started_ = std::chrono::steady_clock::now();
+        title_started_ = menu_now();
     }
 }
 

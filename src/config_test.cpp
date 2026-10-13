@@ -24,6 +24,9 @@ int main()
     source.message_half_tone = 96;
     source.character_voice_volume[3] = 17;
     source.character_voice_muted[3] = true;
+    source.name_family = "\u5411\u5742";
+    source.name_nickname = "Taka";
+    source.default_char_name = 0;
     th2::save_config(path, source);
 
     const auto loaded = th2::load_config(path);
@@ -43,7 +46,11 @@ int main()
         || loaded.effect_speed != 2
         || loaded.message_half_tone != 96
         || loaded.character_voice_volume[3] != 17
-        || !loaded.character_voice_muted[3]) {
+        || !loaded.character_voice_muted[3]
+        || loaded.name_family != "\u5411\u5742"
+        || loaded.name_given != ""
+        || loaded.name_nickname != "Taka"
+        || loaded.default_char_name != 0) {
         return 1;
     }
     if (th2::auto_delay_ms(loaded, false, true, true)

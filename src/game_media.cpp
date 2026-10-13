@@ -614,13 +614,16 @@ void Game::play_voice(const th2::Event& event)
             return;
         }
     }
+    // The reference's probe is the first thing in ClSoundDS::playVoice, so
+    // it logs the attempt before the file turns out to be missing - as
+    // K110040000_106028 is (110040000.sdt, character 28).
+    trace_note_audio("voicefile", 0, loop ? 1 : 0, volume, 0, name.c_str());
     const auto* voice_entry = voice_archive_.find(name);
     if (!voice_entry) {
         voice_sound_[channel] = -1;
         voice_loop_[channel] = false;
         return;
     }
-    trace_note_audio("voicefile", 0, loop ? 1 : 0, volume, 0, name.c_str());
     note_sound_started(trace_voice_key + channel);
     voice_channel.play_streaming(
         ready_audio_decoder(voice_archive_, voice_entry->name), loop,
@@ -654,13 +657,13 @@ void Game::play_log_voice(int character, int scenario, int voice, bool a_cut)
             return;
         }
     }
+    trace_note_audio("voicefile", 0, 0, 255, 0, name.c_str());
     const auto* voice_entry = voice_archive_.find(name);
     if (!voice_entry) {
         voice_sound_[0] = -1;
         voice_loop_[0] = false;
         return;
     }
-    trace_note_audio("voicefile", 0, 0, 255, 0, name.c_str());
     note_sound_started(trace_voice_key);
     voice_channel.play_streaming(
         ready_audio_decoder(voice_archive_, voice_entry->name), false,

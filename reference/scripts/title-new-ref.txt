@@ -1,0 +1,6 @@
+# Reference lead-in: its own title menu, clicks found by titlecal.py.
+1 move 400 401
+20 every 4 lclick 3 until 133
+# Scenario ticks, shifted by 167.
+197 every 30 lclick 3
+197 every 1 num1

@@ -74,6 +74,7 @@ enum class WaitKind {
     wait_frame,     // AVG_WaitFrame()
     clock,          // AVG_ViewClock() / AVG_SetCalender()
     title,          // AVG_SetGotoTitle's fade, then the release frame
+    time,           // STD_timeGetTime() < EscParam[0].num
 };
 
 // WAIT_STRUCT, the counter behind AVG_SetWaitFrame / AVG_WaitFrame.  A frame
@@ -664,6 +665,9 @@ private:
     Texture omake_music_artist_;
     Texture omake_music_playing_;
     Texture omake_replay_background_;
+    // The bonus screens' Back button (sys0111.tga, all three frames) already
+    // drawn over each screen's background - cg, music, replay.
+    std::array<Texture, 3> omake_cancel_baked_;
     Texture map_frame_;
     Texture map_arrows_;
     Texture map_markers_;
@@ -976,6 +980,13 @@ private:
         map,
     };
     UiMode ui_mode_ = UiMode::title;
+    // initialize_scenario_flags ran this tick: AVG_INIT's frame, which ends
+    // with _DEFAULT_NAME cleared (see run_tick).
+    bool avg_init_tick_ = false;
+    // The global_count_ return_to_title ran on - GOTILE_END's AVG_Init.  The
+    // next tick is AVG_END's, whose AVG_System writes _DEFAULT_NAME once
+    // more before the title takes over (see run_tick).
+    std::optional<int> title_return_count_;
     UiMode save_return_mode_ = UiMode::game;
     // Starts on the first item so the menu can be driven from the keyboard
     // alone; a mouse moving off the items clears it, as the original does.
@@ -1008,6 +1019,17 @@ private:
     OmakeCgPhase omake_cg_phase_ = OmakeCgPhase::viewing;
     std::chrono::steady_clock::time_point omake_cg_phase_started_{};
     std::array<Texture, 9> omake_replay_thumbnails_;
+    // The same at DSP_SetGraphFade( CGGP_SAM+i, 96 ): what LoadReplayWindow
+    // and REPLAY_MAIN show for every item but the one under the pointer.
+    std::array<Texture, 9> omake_replay_thumbnails_dim_;
+    // A replay clicked and not yet started (start_replay), and when.
+    int replay_start_slot_ = -1;
+    std::chrono::steady_clock::time_point replay_start_clicked_;
+    // The pointer as the port's screens last saw it, in game coordinates:
+    // the bonus screens' selection is whatever is under it, every frame
+    // (MUS_GetMouseNo), not the last item it moved over.
+    float port_pointer_x_ = -1.0f;
+    float port_pointer_y_ = -1.0f;
     std::chrono::steady_clock::time_point title_started_{};
     std::optional<std::chrono::steady_clock::time_point> title_exit_started_;
     bool title_exit_game_ = false;
@@ -1100,6 +1122,12 @@ private:
     // Release is its own frame here as it is for the map and the calendar.
     bool goto_title_released_ = false;
     bool replay_mode_ = false;
+    int trace_omake_ = -1;
+    bool trace_title_ = false;
+    // This tick's scripted input went to one of the port's screens.
+    bool trace_port_input_ = false;
+    int trace_title_mouse_x_ = -1;
+    int trace_title_mouse_y_ = -1;
     int demo_delay_frames_ = 0;
     std::vector<MapEvent> map_events_;
     int map_field_ = 1;
@@ -1382,6 +1410,15 @@ public:
     // 50..99) as a previous playthrough would have left them, e.g. "84=1,80=1"
     // for a cleared route - what TH2REF_GAME_FLAGS does on the reference.
     void set_trace_game_flags(const std::string& spec);
+    // --trace-omake N: the run starts in bonus scenario 8000%05d, as the
+    // replay gallery would start it, instead of the new game.  The
+    // reference's TH2REF_OMAKE.
+    void set_trace_omake(int number) { trace_omake_ = number; }
+    // --trace-title: the run starts at the port's own title instead of in
+    // the scenario, and the script clicks through it (trace_title_input).
+    void set_trace_title(bool on) { trace_title_ = on; }
+    // --trace-replay-flags 1,2,...: the replay menu's unlocks.
+    void set_trace_replay_flags(const std::string& spec);
     // Where the script stood when the tick began - what the reference's input
     // sampler, which runs before EXEC_ControlLang, sees for an "at" rule.
     std::string trace_rule_script_;
@@ -1401,6 +1438,10 @@ public:
                               std::uint64_t resume_trigger);
 private:
     std::FILE* trace_state_ = nullptr;
+    // flags.log, and the values its last lines left each flag at.
+    std::FILE* trace_flag_log_ = nullptr;
+    std::array<std::int32_t, 1024> trace_flags_prev_{};
+    std::array<std::int32_t, 1024> trace_game_flags_prev_{};
 public:
     // Called before run() when --trace is given.  Throws if the script
     // cannot be read or names a key the reference does not know.
@@ -1687,8 +1728,16 @@ private:
     // --- UI Methods ---
     void reset_play_state();
     void initialize_scenario_flags();
+    void reset_back_struct();
     void start_new_game();
+    // The name dialog: it opens on the current names, as NameDialogBoxProc
+    // does with NameL..NameNN; "Reset Defaults" is its IDC_RESET_NAME.
     void open_name_input();
+    void fill_name_input(const th2::PlayerName& name);
+    // The registry half of NameL..NameNN and DefaultCharName: kept in the
+    // config so the next session's dialog opens on them.  Never in a trace,
+    // whose names are pinned.
+    void remember_player_name();
     void begin_title_exit(bool start_game);
     void begin_title_menu_transition(bool extras);
     void update_title();
@@ -1869,9 +1918,24 @@ private:
         128020, 128021, 128022, 128023, 0, 0, 0, 0, 0,
     };
     void draw_omake_cancel(int highlight);
+    void start_pending_replay();
+    Texture bake_omake_cancel(const char* background, int passes);
     void open_cg_gallery();
     void open_music_room();
-    void open_replay_gallery();
+    // fade_in false: the way back from a bonus scenario, where Avg.omake is
+    // still on and OMK_ControlReplayMode skips REPLAY_FADEIN.
+    void open_replay_gallery(bool fade_in = true);
+    void cancel_omake_screen();
+    // OMK_SetReplayModeMouse's rects: slot 0..8, 14 for the back button, or
+    // -1.
+    static int replay_gallery_item_at(float x, float y);
+    // The clock the port's title and bonus screens animate by: the wall
+    // clock, or the engine's in a trace.
+    std::chrono::steady_clock::time_point menu_now() const;
+    void dispatch_port_screen_event(const SDL_Event& event);
+    void trace_title_input();
+    // The name dialog's Start Game: false while a field is empty.
+    bool accept_name_input();
     void close_omake_screen();
     void draw_cg_gallery_page();
     void draw_cg_full(
@@ -1914,6 +1978,7 @@ private:
     void activate_music_room_item();
     void handle_music_room_input(const SDL_Event& event);
     void start_replay(int slot);
+    void start_replay_scenario(int number);
     void activate_replay_gallery_item();
     void handle_replay_gallery_input(const SDL_Event& event);
     void draw_save_load();

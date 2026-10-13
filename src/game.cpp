@@ -192,9 +192,25 @@ Game::Game(
     default_player_name_ =
         th2::load_default_player_name(data / "TOHEART2.EXE");
     player_name_ = default_player_name_;
+    if (!config_.name_family.empty()) {
+        player_name_ = {
+            config_.name_family,
+            config_.name_given,
+            config_.name_family_reading,
+            config_.name_given_reading,
+            config_.name_nickname,
+            config_.name_nickname,
+        };
+    }
+    default_char_name_ = config_.default_char_name;
     for (std::size_t i = 0; i < persistent_game_flags_.size(); ++i) {
         runtime_.set_game_flag(i, persistent_game_flags_[i]);
     }
+    runtime_.set_clock([this] {
+        return static_cast<std::uint32_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                engine_now().time_since_epoch()).count());
+    });
     SDL_WindowFlags window_flags =
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
 #ifdef __EMSCRIPTEN__
@@ -368,6 +384,9 @@ Game::Game(
     omake_music_artist_ = try_load("t2021.tga");
     omake_music_playing_ = try_load("t2100.tga");
     omake_replay_background_ = try_load("t3000.tga");
+    omake_cancel_baked_ = {bake_omake_cancel("t1000.tga", 1),
+                           bake_omake_cancel("t2000.tga", 1),
+                           bake_omake_cancel("t3000.tga", 2)};
     if (const auto* entry = graphics_.find("t0001.tga")) {
         Surface loaded(th2::load_image(graphics_.read(*entry), entry->name));
         // The title's pixel pass reads it as a full 800x600 screen.
@@ -384,7 +403,7 @@ Game::Game(
     if (title_masked_) {
         SDL_SetTextureBlendMode(title_masked_.get(), SDL_BLENDMODE_BLEND);
     }
-    title_started_ = std::chrono::steady_clock::now();
+    title_started_ = menu_now();
     // The player's input sampled once a tick, in every run - not only in a
     // trace.  A recording compares exactly this against the reference;
     // normal play is the same machine with nobody keeping the file.
@@ -726,9 +745,18 @@ void Game::iterate()
         // A trace run starts in the scenario rather than at the title: the
         // two title screens are not the same program and never will be, so
         // aligning them would be aligning the wrong thing.
-        if (trace_tick_ == 0 && ui_mode_ != UiMode::game) {
+        if (trace_tick_ == 0 && trace_title_) {
+            // The boot movies are not in it: the comparison is aligned by
+            // hand at the scenario's first tick, and a movie is a stub here.
             movie_.reset();
-            start_new_game();
+            title_started_ = menu_now();
+        } else if (trace_tick_ == 0 && ui_mode_ != UiMode::game) {
+            movie_.reset();
+            if (trace_omake_ >= 0) {
+                start_replay_scenario(trace_omake_);
+            } else {
+                start_new_game();
+            }
         }
         {
             // TH2_RAND_LOG: engine_rand() calls made during each tick, the
@@ -991,7 +1019,7 @@ void Game::iterate()
                            && runtime_.game_flag(98) != 0) {
                     start_movie(0, 0, false);
                 } else {
-                    title_started_ = std::chrono::steady_clock::now();
+                    title_started_ = menu_now();
                 }
             }
             continue;
@@ -1020,16 +1048,12 @@ void Game::iterate()
         }
 
         // The port's own screens, which have no engine under them.
-        if (ui_mode_ == UiMode::title) {
-            handle_title_input(event);
-        } else if (ui_mode_ == UiMode::cg_gallery) {
-            handle_cg_gallery_input(event);
-        } else if (ui_mode_ == UiMode::music_room) {
-            handle_music_room_input(event);
-        } else if (ui_mode_ == UiMode::replay_gallery) {
-            handle_replay_gallery_input(event);
-        }
+        dispatch_port_screen_event(event);
     }
+    if (trace_mode_) {
+        trace_title_input();
+    }
+    start_pending_replay();
     handle_touch_actions();
     process_save_bundle_dialog();
 
@@ -1323,6 +1347,24 @@ void Game::run_tick()
     // player's hands (or the script's) per tick, so every edge it folds is
     // seen by exactly one control pass.
     get_game_key();
+    // AVG_System, straight after AVG_GetGameKey and before its step switch:
+    //     ESC_SetFlag( _DEFAULT_NAME, DefaultCharName );
+    // After this tick's script pass - EXEC_ControlLang ran first.  Not on
+    // the AVG_INIT frame: there ESC_InitFlag clears it again after the
+    // write, and the frame ends with 0 (our new game starts from
+    // update_title, before this point, so the order is the other way round).
+    if (avg_init_tick_) {
+        avg_init_tick_ = false;
+    } else if (ui_mode_ == UiMode::game || ui_mode_ == UiMode::map
+        || ui_mode_ == UiMode::save || ui_mode_ == UiMode::load) {
+        runtime_.set_flag(5, default_char_name_);
+    } else if (title_return_count_ && *title_return_count_ < global_count_) {
+        // AVG_END's frame: AVG_System's write, then AVG_Term and the title,
+        // which never writes it.  So the title holds DefaultCharName, not
+        // the 0 AVG_Init left (dwalk-009, tick 64097).
+        title_return_count_.reset();
+        runtime_.set_flag(5, default_char_name_);
+    }
     // AVG_Main's AVG_CALENDER arm: AVG_SetCalender reads it.
     control_calendar_key();
     // AVG_System's chain, in its order:
@@ -1577,6 +1619,9 @@ int main(int argc, char** argv)
         std::filesystem::path trace_resume_file;
         std::uint64_t trace_resume_trigger = 0;
         std::string trace_game_flags;
+        int trace_omake = -1;
+        bool trace_title = false;
+        std::string trace_replay_flags;
         std::optional<std::filesystem::path> record_path;
         std::uint64_t record_from = 0;
         bool trace_first_set = false;
@@ -1643,6 +1688,20 @@ int main(int argc, char** argv)
                         "--trace-game-flags requires N=V[,N=V...]");
                 }
                 trace_game_flags = argv[index];
+            } else if (argument == "--trace-omake") {
+                if (++index >= argc) {
+                    throw std::runtime_error(
+                        "--trace-omake requires a bonus scenario number");
+                }
+                trace_omake = std::stoi(argv[index]);
+            } else if (argument == "--trace-title") {
+                trace_title = true;
+            } else if (argument == "--trace-replay-flags") {
+                if (++index >= argc) {
+                    throw std::runtime_error(
+                        "--trace-replay-flags requires N[,N...]");
+                }
+                trace_replay_flags = argv[index];
             } else if (argument == "--trace-resume-trigger") {
                 if (++index >= argc) {
                     throw std::runtime_error(
@@ -1778,6 +1837,11 @@ int main(int argc, char** argv)
                                       trace_resume_file, trace_resume_trigger);
             if (!trace_game_flags.empty()) {
                 game.set_trace_game_flags(trace_game_flags);
+            }
+            game.set_trace_omake(trace_omake);
+            game.set_trace_title(trace_title);
+            if (!trace_replay_flags.empty()) {
+                game.set_trace_replay_flags(trace_replay_flags);
             }
             if (record_path) {
                 game.enable_recording(*record_path, record_from);

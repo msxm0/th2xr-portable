@@ -133,6 +133,17 @@ void Game::reset_play_state()
     demo_delay_frames_ = 0;
 }
 
+void Game::reset_back_struct()
+{
+    // AVG_INIT's AVG_Init: ZeroMemory( &BackStruct ).  The menu's own fade
+    // used the same counters (begin_transition), and the reference's first
+    // scenario frame reads them zero, not as the replay gallery left them
+    // (title-omake-0: fd_type 1, fd_cnt 60, fd_max 30 for two ticks).
+    if (avg_back_) {
+        avgback().init();
+    }
+}
+
 void Game::initialize_scenario_flags()
 {
     runtime_.reset_flags();
@@ -141,7 +152,11 @@ void Game::initialize_scenario_flags()
     runtime_.set_flag(2, 0);
     runtime_.set_flag(3, -1);
     runtime_.set_flag(4, 0);
-    runtime_.set_flag(5, default_char_name_);
+    // AVG_System writes _DEFAULT_NAME at its top, every frame, and on the
+    // AVG_INIT frame AVG_Init's ESC_InitFlag clears it again straight after:
+    // the first tick ends with 0, and the next one's run_tick mirrors it.
+    runtime_.set_flag(5, 0);
+    avg_init_tick_ = true;
     runtime_.set_flag(6, 0);
     runtime_.set_flag(7, 0);
 }
@@ -149,6 +164,7 @@ void Game::initialize_scenario_flags()
 void Game::start_new_game()
 {
     reset_play_state();
+    reset_back_struct();
     initialize_scenario_flags();
     direct_scenario_ = false;
     load_script(new_game_script);
@@ -160,15 +176,34 @@ void Game::open_name_input()
 {
     name_input_open_ = true;
     name_error_.clear();
+    fill_name_input(player_name_);
+}
+
+void Game::fill_name_input(const th2::PlayerName& name)
+{
     const auto copy = [](auto& destination, const std::string& source) {
         std::snprintf(
             destination.data(), destination.size(), "%s", source.c_str());
     };
-    copy(name_family_, default_player_name_.family);
-    copy(name_given_, default_player_name_.given);
-    copy(name_family_reading_, default_player_name_.family_reading);
-    copy(name_given_reading_, default_player_name_.given_reading);
-    copy(name_nickname_, default_player_name_.nickname);
+    copy(name_family_, name.family);
+    copy(name_given_, name.given);
+    copy(name_family_reading_, name.family_reading);
+    copy(name_given_reading_, name.given_reading);
+    copy(name_nickname_, name.nickname);
+}
+
+void Game::remember_player_name()
+{
+    if (trace_mode_) {
+        return;
+    }
+    config_.name_family = player_name_.family;
+    config_.name_given = player_name_.given;
+    config_.name_family_reading = player_name_.family_reading;
+    config_.name_given_reading = player_name_.given_reading;
+    config_.name_nickname = player_name_.nickname;
+    config_.default_char_name = default_char_name_;
+    th2::save_config(config_path_, config_);
 }
 
 void Game::begin_title_exit(bool start_game)
@@ -177,7 +212,7 @@ void Game::begin_title_exit(bool start_game)
         return;
     }
     title_exit_game_ = start_game;
-    title_exit_started_ = std::chrono::steady_clock::now();
+    title_exit_started_ = menu_now();
 }
 
 void Game::begin_title_menu_transition(bool extras)
@@ -187,14 +222,14 @@ void Game::begin_title_menu_transition(bool extras)
     }
     title_extras_transition_from_ = title_extras_;
     title_extras_ = extras;
-    title_menu_transition_started_ = std::chrono::steady_clock::now();
+    title_menu_transition_started_ = menu_now();
 }
 
 void Game::update_title()
 {
     if (title_menu_transition_started_) {
         const auto elapsed = std::chrono::duration<double>(
-            std::chrono::steady_clock::now()
+            menu_now()
             - *title_menu_transition_started_).count();
         if (elapsed * 60.0 >= 24.0) {
             title_menu_transition_started_.reset();
@@ -203,9 +238,13 @@ void Game::update_title()
     if (!title_exit_started_) {
         return;
     }
+    // GM_Title.cpp, counted from the click's tick C: TTL_SYS_FADEOUT runs
+    // from C+1 with TitleCounter 0 and leaves at 32 (C+33), TTL_SYS_END hands
+    // over on C+34 and TTL_TERM opens the name dialog on C+35.  The scenario
+    // starts on the tick after it is accepted, AVG_INIT on C+36 at the soonest.
     const auto elapsed =
-        std::chrono::steady_clock::now() - *title_exit_started_;
-    if (elapsed < std::chrono::milliseconds(32 * 1000 / 60)) {
+        menu_now() - *title_exit_started_;
+    if (elapsed < std::chrono::milliseconds(35 * engine_tick_ms)) {
         return;
     }
     const bool start_game = title_exit_game_;

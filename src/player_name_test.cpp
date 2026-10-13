@@ -49,6 +49,23 @@ int main(int argc, char** argv)
     if (th2::uses_default_voice_name(changed, defaults)) {
         return 4;
     }
+    // The default in either script, and Latin names whatever their case.
+    if (!th2::uses_default_voice_name(
+            th2::original_default_player_name(), defaults)) {
+        return 9;
+    }
+    const th2::PlayerName romaji{
+        "Kouno", "Takaaki", "Kouno", "Takaaki", "Taka", "Taka"};
+    auto typed = romaji;
+    typed.family = " kouno ";
+    typed.given = "TAKAAKI";
+    if (!th2::uses_default_voice_name(typed, romaji)) {
+        return 10;
+    }
+    typed.given = "Takashi";
+    if (th2::uses_default_voice_name(typed, romaji)) {
+        return 11;
+    }
     if (argc > 1) {
         const auto patched = th2::load_default_player_name(argv[1]);
         if (patched.family != "Kouno" || patched.given != "Takaaki"

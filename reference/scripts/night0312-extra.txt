@@ -1,0 +1,5 @@
+# 010312100: EV_0312NIGHT loads it when flag 184 (010311001) is set and
+# 109 (010312000) is not.  Route manaka's run, with 184 set during 03/12's
+# after-school map (EV_0312NIGHT at 230555 on that route).
+30 every 1 mappick 2
+225000 setflag 184 1

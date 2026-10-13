@@ -46,14 +46,71 @@ bool Game::title_item_disabled(int item) const
 
 void Game::draw_omake_cancel(int highlight)
 {
-    if (!ui_sys_cancel_) {
+    const int screen = ui_mode_ == UiMode::cg_gallery ? 0
+        : ui_mode_ == UiMode::music_room             ? 1
+                                                      : 2;
+    const auto& baked = omake_cancel_baked_[screen];
+    if (!baked) {
         return;
     }
     const SDL_FRect source{
         highlight ? 188.0f : 0.0f, 0.0f, 188.0f, 32.0f};
     const SDL_FRect destination{306.0f, 496.0f, 188.0f, 32.0f};
-    SDL_RenderTexture(
-        renderer_, ui_sys_cancel_.get(), &source, &destination);
+    SDL_RenderTexture(renderer_, baked.get(), &source, &destination);
+}
+
+Texture Game::bake_omake_cancel(const char* background, int passes)
+{
+    // DSP_LoadBmp( CGBM_SYS, BMP_TRUE, "sys0111.tga" ) and a CHK_ANTI graph
+    // at 306,496 over the screen's opaque background, with nothing else under
+    // it.  BMP_TRUE folds the alpha into the colour on load, (a*c)>>8, and the
+    // 32 bit blit adds that to ((255-a)*dst)>>8 - an opaque texel is (255*c)>>8,
+    // a level short of c.  The background never changes under it, so the
+    // blend is done here, once per screen, and the screen shows the engine's
+    // pixels and not SDL's straight-alpha ones.
+    // The replay menu's is blended twice: measured on the reference's frames
+    // of that screen, every partly covered texel of the button and its shadow
+    // is exactly two passes of the blend over t3000.tga.  REPLAY_INIT sets the
+    // one graph; where the second comes from is not known.
+    if (!graphics_.find("sys0111.tga") || !graphics_.find(background)) {
+        return {};
+    }
+    Surface button(SDL_ConvertSurface(
+        decode_image(graphics_, "sys0111.tga").get(),
+        SDL_PIXELFORMAT_RGBA32));
+    Surface ground(SDL_ConvertSurface(
+        decode_image(graphics_, background).get(), SDL_PIXELFORMAT_RGBA32));
+    if (!button || !ground || ground->w < 494 || ground->h < 528
+        || !SDL_LockSurface(button.get())) {
+        return {};
+    }
+    if (!SDL_LockSurface(ground.get())) {
+        SDL_UnlockSurface(button.get());
+        return {};
+    }
+    for (int y = 0; y < button->h; ++y) {
+        auto* row = static_cast<std::uint8_t*>(button->pixels)
+            + static_cast<std::ptrdiff_t>(y) * button->pitch;
+        const auto* under = static_cast<const std::uint8_t*>(ground->pixels)
+            + static_cast<std::ptrdiff_t>(496 + y) * ground->pitch;
+        for (int x = 0; x < button->w; ++x) {
+            auto* texel = row + x * 4;
+            const auto* dst = under + (306 + x % 188) * 4;
+            const int a = texel[3];
+            for (int c = 0; c < 3; ++c) {
+                int out = dst[c];
+                for (int pass = 0; pass < passes && a != 0; ++pass) {
+                    out = (((a == 255 ? 0 : 255 - a) * out) >> 8)
+                        + ((a * texel[c]) >> 8);
+                }
+                texel[c] = static_cast<std::uint8_t>(out);
+            }
+            texel[3] = 255;
+        }
+    }
+    SDL_UnlockSurface(ground.get());
+    SDL_UnlockSurface(button.get());
+    return texture_from_surface(button.get());
 }
 
 void Game::open_cg_gallery()
@@ -113,11 +170,14 @@ void Game::open_music_room()
     ui_mode_ = UiMode::music_room;
 }
 
-void Game::open_replay_gallery()
+void Game::open_replay_gallery(bool fade_in)
 {
-    begin_transition(1, 30, 128, false, EffectTiming::menu);
+    if (fade_in) {
+        begin_transition(1, 30, 128, false, EffectTiming::menu);
+    }
     for (int slot = 0; slot < 9; ++slot) {
         omake_replay_thumbnails_[slot].reset();
+        omake_replay_thumbnails_dim_[slot].reset();
         if (!unlocked_replays_.contains(replay_flags[slot])) {
             continue;
         }
@@ -126,9 +186,29 @@ void Game::open_replay_gallery()
         if (graphics_.find(name)) {
             omake_replay_thumbnails_[slot] =
                 load_texture(renderer_, graphics_, name);
+            // DSP_SetGraphFade( 96 ) on an opaque graph: every channel
+            // (v * 96) >> 7, as the display layer's bright table has it.
+            Surface dim(SDL_ConvertSurface(
+                decode_image(graphics_, name).get(), SDL_PIXELFORMAT_RGBA32));
+            if (dim && SDL_LockSurface(dim.get())) {
+                for (int y = 0; y < dim->h; ++y) {
+                    auto* row = static_cast<std::uint8_t*>(dim->pixels)
+                        + static_cast<std::ptrdiff_t>(y) * dim->pitch;
+                    for (int x = 0; x < dim->w; ++x) {
+                        for (int c = 0; c < 3; ++c) {
+                            row[x * 4 + c] = static_cast<std::uint8_t>(
+                                (row[x * 4 + c] * 96) >> 7);
+                        }
+                    }
+                }
+                SDL_UnlockSurface(dim.get());
+                omake_replay_thumbnails_dim_[slot] =
+                    texture_from_surface(dim.get());
+            }
         }
     }
-    omake_highlight_ = 14;
+    omake_highlight_ =
+        replay_gallery_item_at(port_pointer_x_, port_pointer_y_);
     ui_mode_ = UiMode::replay_gallery;
 }
 
@@ -221,7 +301,7 @@ float Game::omake_cg_phase_progress(int frames) const
     return std::clamp(
         static_cast<float>(
             std::chrono::duration<double>(
-                std::chrono::steady_clock::now()
+                menu_now()
                 - omake_cg_phase_started_).count()
             * 60.0 / frames),
         0.0f, 1.0f);
@@ -408,12 +488,13 @@ void Game::draw_replay_gallery()
         const bool unlocked =
             unlocked_replays_.contains(replay_flags[slot]);
         if (unlocked && omake_replay_thumbnails_[slot]) {
-            SDL_SetTextureAlphaMod(
-                omake_replay_thumbnails_[slot].get(),
-                omake_highlight_ == slot ? 255 : 192);
+            // REPLAY_MAIN: fade 96 for all, 128 for the one selected.
+            const auto& thumbnail = omake_highlight_ == slot
+                    || !omake_replay_thumbnails_dim_[slot]
+                ? omake_replay_thumbnails_[slot]
+                : omake_replay_thumbnails_dim_[slot];
             SDL_RenderTexture(
-                renderer_, omake_replay_thumbnails_[slot].get(),
-                nullptr, &destination);
+                renderer_, thumbnail.get(), nullptr, &destination);
         } else if (omake_cg_locked_) {
             SDL_RenderTexture(
                 renderer_, omake_cg_locked_.get(), nullptr, &destination);
@@ -424,17 +505,19 @@ void Game::draw_replay_gallery()
 
 void Game::draw_title()
 {
-    const auto now = std::chrono::steady_clock::now();
+    const auto now = menu_now();
     const int frame = static_cast<int>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             now - title_started_).count() * 60 / 1000);
     float brightness = 1.0f;
     if (title_exit_started_) {
-        const int exit_frame = static_cast<int>(
+        // TTL_SYS_FADEOUT: DSP_SetGraphGlobalBright( 128 - TitleCounter*256/32 ),
+        // the counter 0 on the tick after the click.
+        const int exit_tick = static_cast<int>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - *title_exit_started_).count() * 60 / 1000);
-        brightness = std::clamp(
-            1.0f - static_cast<float>(exit_frame) / 16.0f, 0.0f, 1.0f);
+                now - *title_exit_started_).count() / engine_tick_ms);
+        brightness = static_cast<float>(std::clamp(
+            128 - std::max(0, exit_tick - 1) * 256 / 32, 0, 128)) / 128.0f;
     }
     SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
     SDL_RenderClear(renderer_);

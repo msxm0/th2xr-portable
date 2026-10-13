@@ -66,6 +66,34 @@ bool Game::compact_ui() const
 #endif
 }
 
+bool Game::accept_name_input()
+{
+    if (name_family_[0] == '\0' || name_given_[0] == '\0'
+        || name_family_reading_[0] == '\0'
+        || name_given_reading_[0] == '\0'
+        || name_nickname_[0] == '\0') {
+        name_error_ = "Every field must contain a name.";
+        return false;
+    }
+    player_name_ = {
+        name_family_.data(),
+        name_given_.data(),
+        name_family_reading_.data(),
+        name_given_reading_.data(),
+        name_nickname_.data(),
+        name_nickname_.data(),
+    };
+    // ESC_SetFlag( _DEFAULT_NAME, DefaultCharName ) in the dialog's OK
+    // handler, which compares each field it offered against its default.
+    // start_new_game seeds flag 5 from this.
+    default_char_name_ = th2::uses_default_voice_name(
+        player_name_, default_player_name_) ? 1 : 0;
+    remember_player_name();
+    name_input_open_ = false;
+    start_new_game();
+    return true;
+}
+
 void Game::return_to_title()
 {
     if (soak_) {
@@ -75,6 +103,7 @@ void Game::return_to_title()
     confirm_return_title_ = false;
     auto_mode_ = false;
     skip_mode_ = false;
+    const bool from_replay = replay_mode_;
     replay_mode_ = false;
     wake_time_.reset();
     audio_wait_.reset();
@@ -95,12 +124,22 @@ void Game::return_to_title()
     if (avg_back_) {
         avgback().init();
     }
+    // AVG_Init's ESC_InitFlag too: the scenario flags are all 0 at the
+    // title, the game flags kept (dwalk-009, tick 64096).
+    runtime_.reset_flags();
+    title_return_count_ = global_count_;
     ui_mode_ = UiMode::title;
     title_highlight_ = 0;
     title_extras_ = false;
     title_menu_transition_started_.reset();
     title_exit_started_.reset();
-    title_started_ = std::chrono::steady_clock::now();
+    title_started_ = menu_now();
+    if (from_replay) {
+        // TTL_LEAF_INIT with Avg.omake still on goes straight to
+        // TTL_SYS_INIT's replay arm: the replay menu, over the bonus menu.
+        title_extras_ = true;
+        open_replay_gallery(false);
+    }
     th2::save_config(config_path_, config_);
 }
 
@@ -475,35 +514,14 @@ void Game::draw_name_input()
     }
     if (ImGui::Button(
             "Start Game", ImVec2(compact ? -FLT_MIN : 120.0f, 0.0f))) {
-        if (name_family_[0] == '\0' || name_given_[0] == '\0'
-            || name_family_reading_[0] == '\0'
-            || name_given_reading_[0] == '\0'
-            || name_nickname_[0] == '\0') {
-            name_error_ = "Every field must contain a name.";
-        } else {
-            player_name_ = {
-                name_family_.data(),
-                name_given_.data(),
-                name_family_reading_.data(),
-                name_given_reading_.data(),
-                name_nickname_.data(),
-                name_nickname_.data(),
-            };
-            // ESC_SetFlag( _DEFAULT_NAME, DefaultCharName ) in the dialog's
-            // OK handler, which compares each field it offered against its
-            // default.  start_new_game seeds flag 5 from this.
-            default_char_name_ = th2::uses_default_voice_name(
-                player_name_, default_player_name_) ? 1 : 0;
-            name_input_open_ = false;
-            start_new_game();
-        }
+        accept_name_input();
     }
     if (!compact) {
         ImGui::SameLine();
     }
     if (ImGui::Button(
             "Reset Defaults", ImVec2(compact ? -FLT_MIN : 130.0f, 0.0f))) {
-        open_name_input();
+        fill_name_input(default_player_name_);
     }
     if (!compact) {
         ImGui::SameLine();
@@ -511,7 +529,7 @@ void Game::draw_name_input()
     if (ImGui::Button(
             "Cancel", ImVec2(compact ? -FLT_MIN : 90.0f, 0.0f))) {
         name_input_open_ = false;
-        title_started_ = std::chrono::steady_clock::now()
+        title_started_ = menu_now()
             - std::chrono::milliseconds(120 * 1000 / 60);
     }
     if (compact) {

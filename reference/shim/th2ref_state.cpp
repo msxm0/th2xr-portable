@@ -356,6 +356,51 @@ extern "C" unsigned long th2ref_script_pc(void)
     return EXEC_LangInfo ? EXEC_LangInfo->pc : 0;
 }
 
+/* FNV-1a over a flag array as the int32s it holds - src/game_flow.cpp's
+ * trace_flag_hash, byte for byte. */
+static unsigned long flag_hash(const int *flags)
+{
+    unsigned long hash = 2166136261UL;
+    for (int i = 0; i < ESC_FLAG_MAX; ++i) {
+        unsigned long bits = (unsigned long)(unsigned int)flags[i];
+        for (int b = 0; b < 4; ++b) {
+            hash = ((hash ^ (bits & 0xffUL)) * 16777619UL) & 0xffffffffUL;
+            bits >>= 8;
+        }
+    }
+    return hash;
+}
+
+/* TH2REF_FLAGLOG: "tick f|g index value" for every flag that changed since
+ * the last state line, as our side's flags.log. */
+static FILE *g_flaglog = 0;
+static int   g_flag_prev[ESC_FLAG_MAX];
+static int   g_gflag_prev[ESC_FLAG_MAX];
+
+static void log_flags(void)
+{
+    static int tried = 0;
+    if (!tried) {
+        tried = 1;
+        const char *path = getenv("TH2REF_FLAGLOG");
+        if (path && *path) g_flaglog = fopen(path, "w");
+    }
+    if (!g_flaglog) return;
+    for (int i = 0; i < ESC_FLAG_MAX; ++i) {
+        if (ESC_FlagBuf[i] != g_flag_prev[i]) {
+            fprintf(g_flaglog, "%lu f %d %d\n", th2ref_current_tick(), i, ESC_FlagBuf[i]);
+            g_flag_prev[i] = ESC_FlagBuf[i];
+        }
+    }
+    for (int i = 0; i < ESC_FLAG_MAX; ++i) {
+        if (ESC_GameFlagBuf[i] != g_gflag_prev[i]) {
+            fprintf(g_flaglog, "%lu g %d %d\n", th2ref_current_tick(), i, ESC_GameFlagBuf[i]);
+            g_gflag_prev[i] = ESC_GameFlagBuf[i];
+        }
+    }
+    fflush(g_flaglog);
+}
+
 extern "C" void th2ref_dump_state(void)
 {
     th2ref_tick_done(MainWindow.draw_flag);
@@ -381,7 +426,7 @@ extern "C" void th2ref_dump_state(void)
                         "bk_br_flag bk_br_cnt "
                         "avg_msg_cut avg_auto avg_frame avg_wait avg_level "
                         "avg_msg_wait avg_msg_page avg_half_tone "
-                        "txt_cnt txt_step global_count text\n");
+                        "txt_cnt txt_step global_count flags gflags text\n");
             }
         }
     }
@@ -392,6 +437,7 @@ extern "C" void th2ref_dump_state(void)
     if (th2ref_dump_held()) return;
 
     const DWORD pc = EXEC_LangInfo ? EXEC_LangInfo->pc : 0;
+    log_flags();
 
     fprintf(g_state,
             "%lu %s %lu "
@@ -401,7 +447,7 @@ extern "C" void th2ref_dump_state(void)
             "%d %d %d "
             "%d %d "
             "%d %d "
-            "%ld %d %ld %ld %ld %ld %ld %ld %d %d %d %s\n",
+            "%ld %d %ld %ld %ld %ld %ld %ld %d %d %d %08lx %08lx %s\n",
             th2ref_current_tick(),
             NowLangFileName[0] ? NowLangFileName : "-",
             (unsigned long)pc,
@@ -419,6 +465,7 @@ extern "C" void th2ref_dump_state(void)
             Avg.msg_cut, Avg.auto_flag, Avg.frame,
             Avg.wait, Avg.level, Avg.msg_wait, Avg.msg_page, Avg.half_tone,
             g_txt_cnt, g_txt_step, GlobalCount,
+            flag_hash(ESC_FlagBuf), flag_hash(ESC_GameFlagBuf),
             (g_text[g_text_len] = 0, g_text_len ? g_text : "-"));
     /* Reset for the next tick: a frame that draws no message must report
      * none, not last frame's. */

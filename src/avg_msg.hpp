@@ -286,6 +286,9 @@ public:
     void add_novel_message(const std::string& raw, int cr);
     // AVG_WaitNovelMessage: the one state that lets the opcode retire.
     bool wait_novel_message() const { return message_.step1 == msg_next; }
+    // AVG_GetHitKey(): GameKey.click && (MUS_GetMouseNo(-1)==-1).  Also
+    // AVG_WaitKey's, for K.
+    bool hit_key() const;
     void set_novel_message_disp(bool disp);      // AVG_SetNovelMessageDisp
     // AVG_OpenWindow( tdisp, flag ) / AVG_CloseWindow( flag ).  Closing the
     // window parks the message machine at MSG_NODISP and remembers where it
@@ -547,8 +550,6 @@ private:
     int text_count(int step) const { return txt_get_text_count(counted_, step); }
     // The MSG_WAIT / MSG_STOP body.
     void control_wait(const GameKey& key);
-    // AVG_GetHitKey(): GameKey.click && (MUS_GetMouseNo(-1)==-1).
-    bool hit_key() const;
     // MUS_GetMouseNoEx( MOUSE_LBTRIGGER / MOUSE_LBUTTON / -1, 0 ).
     int mouse_no_btrg() const;
     int mouse_no_trg() const;

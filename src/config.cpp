@@ -103,6 +103,19 @@ GameConfig load_config(const std::filesystem::path& path)
             config.show_script_position = parse_bool(value);
         } else if (key == "dump_transition_frames") {
             config.dump_transition_frames = parse_bool(value);
+        } else if (key == "name_family") {
+            config.name_family = value;
+        } else if (key == "name_given") {
+            config.name_given = value;
+        } else if (key == "name_family_reading") {
+            config.name_family_reading = value;
+        } else if (key == "name_given_reading") {
+            config.name_given_reading = value;
+        } else if (key == "name_nickname") {
+            config.name_nickname = value;
+        } else if (key == "default_char_name") {
+            config.default_char_name =
+                parse_int(value, config.default_char_name, 0, 1);
         } else if (key.starts_with("character_voice_volume_")) {
             const auto index = parse_int(
                 key.substr(std::string_view("character_voice_volume_").size()),
@@ -157,7 +170,13 @@ void save_config(const std::filesystem::path& path, const GameConfig& config)
            << "font_family=" << config.font_family << '\n'
            << "font_size=" << config.font_size << '\n'
            << "show_script_position=" << config.show_script_position << '\n'
-           << "dump_transition_frames=" << config.dump_transition_frames << '\n';
+           << "dump_transition_frames=" << config.dump_transition_frames << '\n'
+           << "name_family=" << config.name_family << '\n'
+           << "name_given=" << config.name_given << '\n'
+           << "name_family_reading=" << config.name_family_reading << '\n'
+           << "name_given_reading=" << config.name_given_reading << '\n'
+           << "name_nickname=" << config.name_nickname << '\n'
+           << "default_char_name=" << config.default_char_name << '\n';
     for (std::size_t i = 0; i < config.character_voice_volume.size(); ++i) {
         output << "character_voice_volume_" << i << '='
                << config.character_voice_volume[i] << '\n'

@@ -264,13 +264,21 @@ bool ScriptRuntime::handle(const Event& event)
         return true;
     }
     if (event.instruction.name == "GetTime") {
-        const auto milliseconds = std::chrono::duration_cast<
-            std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-        vm_->set_reg(
-            target(event, 0).index,
-            static_cast<std::int32_t>(
-                static_cast<std::uint32_t>(milliseconds)));
+        // EscParam[0].reg = STD_timeGetTime(), the clock WaitTime then waits
+        // on.  It has to be the same clock: this read the host's while
+        // WaitTime read the engine's, so the song lyrics of 090423001.sdt
+        // (GetTime, then WaitTime r0 = start + 1000 ...) waited for good.
+        std::uint32_t milliseconds = 0;
+        if (clock_) {
+            milliseconds = clock_();
+        } else {
+            milliseconds = static_cast<std::uint32_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
+        }
+        vm_->set_reg(target(event, 0).index,
+                     static_cast<std::int32_t>(milliseconds));
         return true;
     }
     if (event.instruction.name == "GetSystemTime") {

@@ -252,15 +252,7 @@ bool Game::handle(const th2::Event& event)
         wait_frame_.count = 0;
         wait_frame_.max = number(event, 0);
     } else if (name == "WaitTime") {
-        const auto now = static_cast<std::uint32_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                engine_now().time_since_epoch()).count());
-        const auto deadline = static_cast<std::uint32_t>(number(event, 0));
-        const auto remaining = static_cast<std::int32_t>(deadline - now);
-        if (remaining > 0) {
-            wake_time_ = engine_now()
-                + std::chrono::milliseconds(remaining);
-        }
+        // Nothing to start: WaitKind::time asks the clock every frame.
     } else if (name == "SetMovie") {
         start_movie(number(event, 0), 0, true);
     } else if (name == "SetEnding") {
@@ -299,6 +291,11 @@ bool Game::handle(const th2::Event& event)
         begin_clock(number(event, 0));
     } else if (name == "ViewCalender") {
         begin_calendar(number(event, 0), number(event, 1));
+        // ESC_EOprViewCalender calls AVG_SetCalender from the script pass,
+        // and its case 0 falls through into case 1: the tick that reaches the
+        // opcode already draws count 1.  The day-change calendar starts from
+        // AVG_Main's step on the tick after, so it keeps frame 0.
+        calendar_state_->frame = 1;
     } else if (name == "SkipDate") {
         skipped_month_ = number(event, 0);
         skipped_day_ = number(event, 1);
@@ -954,6 +951,21 @@ bool Game::opcode_waiting(WaitKind kind, const th2::Event& event)
     case WaitKind::frame:
         // No predicate: one frame of ESC_WAIT and the machine moves on.
         return false;
+    case WaitKind::time: {
+        // static void ESC_EOprWaitTime( void ), verbatim:
+        //     if( STD_timeGetTime() >= EscParam[0].num ){
+        //         EXEC_AddPC( EscCnt );
+        //     }
+        // Re-asked every frame on its own pc, and ESC_WAIT, so the frame it
+        // lets go on still ends the script pass.  It used to be a wake-up
+        // time set past the instruction: the trace showed the next pc for
+        // the whole wait, and the following SetMessage2 ran on the frame the
+        // time came instead of the one after - pc 3112 of 090423001.sdt.
+        const auto now = static_cast<std::int32_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                engine_now().time_since_epoch()).count());
+        return now < number(event, 0);
+    }
     case WaitKind::clock:
         // A pure query.  update_clock_calendar does the stepping, before the
         // script pass so that this sees the frame the animation is actually
@@ -1003,8 +1015,16 @@ bool Game::opcode_waiting(WaitKind kind, const th2::Event& event)
         // !AVG_WaitBackScroll(): BackStruct.sc_flag.
         return avgback().wait_back_scroll();
     case WaitKind::key:
-        // AVG_WaitKey(): AVG_GetHitKey() || AVG_GetMesCut() || Avg.demo.
-        return waiting_for_input_ && !message_cut() && !demo_mode_;
+        // BOOL AVG_WaitKey( void ), verbatim:
+        //     return AVG_GetHitKey() || AVG_GetMesCut() || Avg.demo;
+        // A question asked afresh each frame, so a click lets it go: the one
+        // K in all the scripts, after the demo text at pc 10389 of
+        // 089901000.sdt, which ours held for good on clicks alone.
+        if (msg().hit_key() || message_cut() || demo_mode_) {
+            waiting_for_input_ = false;
+            return false;
+        }
+        return true;
     case WaitKind::bgm:
         // AVG_WaitBGM(): the track is stopped or playing - that is, not
         // still fading - so MW holds only for the length of a fade.

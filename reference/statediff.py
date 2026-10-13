@@ -12,6 +12,7 @@ game is a black screen where everything and nothing matches.
 """
 import argparse
 import sys
+from pathlib import Path
 
 
 def read_header(path):
@@ -73,8 +74,14 @@ def main():
     args = p.parse_args()
 
     header = read_header(args.ours)
+    # The columns both files have: a reference run from before a column was
+    # added (flags, gflags) still diffs on everything else.
+    ref_header = set(read_header(args.ref))
     fields = args.fields.split(",") if args.fields else [
-        f for f in header if f != "tick"]
+        f for f in header if f != "tick" and f in ref_header]
+    skipped = [f for f in header if f != "tick" and f not in ref_header]
+    if skipped and not args.fields:
+        print(f"not in the reference's trace: {' '.join(skipped)}")
 
     first_bad = {}
     counts = {}
@@ -92,7 +99,11 @@ def main():
     for tick, a, b in walk(args.ours, args.ref, args.offset,
                            args.first, args.last):
         shared_count += 1
-        here = (a.get("script"), a.get("pc"))
+        # Both sides' place: one engine stuck while the other walks on is a
+        # divergence, not idleness, and must reach the table below - single-d
+        # and single-g were reported as "both parked" while only ours was.
+        here = ((a.get("script") or "").lower(), a.get("pc"),
+                (b.get("script") or "").lower(), b.get("pc"))
         if here != idle_at:
             idle_at, idle_from = here, tick
         elif tick - idle_from > worst_idle:
@@ -129,12 +140,16 @@ def main():
                  f"requested {args.last} - one side ended early, so this "
                  f"run proves nothing about the rest")
 
+    idle = None
     if args.max_idle and worst_idle >= args.max_idle:
         where = f"{worst_idle_at[0]}@{worst_idle_at[1]}" if worst_idle_at else "?"
-        sys.exit(
-            f"the script sat on {where} for {worst_idle} ticks - both sides "
-            f"were parked, so whatever they agreed about here they agreed "
-            f"about while doing nothing")
+        if worst_idle_at and worst_idle_at[:2] != worst_idle_at[2:]:
+            where += f" (ref {worst_idle_at[2]}@{worst_idle_at[3]})"
+        idle = (f"the script sat on {where} for {worst_idle} ticks - both "
+                f"sides were parked, so whatever they agreed about here they "
+                f"agreed about while doing nothing")
+        if not first_bad:
+            sys.exit(idle)
 
     if not first_bad:
         print(f"all {len(fields)} fields agree on all {shared_count} ticks")
@@ -162,7 +177,44 @@ def main():
                                ("ref ", b, tick + args.offset)):
             values = [str(key)] + [row.get(f, "?") for f in show]
             print(f"  {side} " + "  ".join(f"{v:>10}" for v in values))
+    flag_detail(args, first_bad)
+    if idle:
+        print(idle)
     return 1
+
+
+def flag_values(path, upto):
+    """Both flag arrays as flags.log leaves them after tick `upto`."""
+    values = {"f": {}, "g": {}}
+    with open(path) as f:
+        for line in f:
+            tick, kind, index, value = line.split()
+            if int(tick) > upto:
+                break
+            values[kind][int(index)] = int(value)
+    return values
+
+
+def flag_detail(args, first_bad):
+    # The hash columns say the flags differ; flags.log, next to each
+    # state.txt, says which - replayed to the first tick they disagree on.
+    ticks = [first_bad[c][0] for c in ("flags", "gflags") if c in first_bad]
+    if not ticks:
+        return
+    ours_log = Path(args.ours).with_name("flags.log")
+    ref_log = Path(args.ref).with_name("flags.log")
+    if not ours_log.exists() or not ref_log.exists():
+        print("flags differ; no flags.log on both sides to say which")
+        return
+    tick = min(ticks)
+    mine = flag_values(ours_log, tick)
+    theirs = flag_values(ref_log, tick + args.offset)
+    print(f"\nflags at our tick {tick}:")
+    for kind, name in (("f", "flag"), ("g", "game flag")):
+        for index in sorted(set(mine[kind]) | set(theirs[kind])):
+            a, b = mine[kind].get(index, 0), theirs[kind].get(index, 0)
+            if a != b:
+                print(f"  {name} {index}: ours {a}, ref {b}")
 
 
 if __name__ == "__main__":

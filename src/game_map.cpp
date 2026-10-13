@@ -271,8 +271,14 @@ void Game::begin_clock(int requested, int first_frame)
     if (current == target) {
         return;
     }
+    // The Saturday cap is a local in steps 0 and 2 only.  Step 3 stores the
+    // clock it was called with, so after a Saturday afternoon _CLOCK_TIME is
+    // 19 while the hands stopped at 11 (03/06):
+    //     case 3: ...; ESC_SetFlag( _CLOCK_TIME, clock );
+    // ClockState::target is that flag value; the travel uses the capped one.
+    int travel_target = target;
     if (weekday(runtime_.flag(0), runtime_.flag(1)) == 6) {
-        target = std::min(target, 11);
+        travel_target = std::min(target, 11);
     }
     if (!clock_background_) {
         clock_background_ =
@@ -280,7 +286,7 @@ void Game::begin_clock(int requested, int first_frame)
         clock_animation_ = load_sprite_animation("clock99");
     }
     const int start_minutes = clock_minutes_[current];
-    const int target_minutes = clock_minutes_[target];
+    const int target_minutes = clock_minutes_[travel_target];
     clock_state_ = ClockState{
         target, start_minutes, target_minutes,
         // Step 2 adds its six minutes before it compares, so it runs at
@@ -528,7 +534,29 @@ void Game::update_clock_calendar()
             }
         }
     }
-    if (calendar_state_) {
+    if (calendar_state_ && !calendar_state_->step) {
+        // ViewCalender, the opcode: AVG_SetCalender is asked by
+        // ESC_EOprViewCalender in the script pass, which is before this
+        // tick's AVG_GetGameKey.  So step 2 sees last tick's key - the one
+        // msg().hit_key() still holds here, as the K wait does - and step 4
+        // returns TRUE to the opcode itself, on the frame after count 16:
+        //     case 2: if( AVG_GetMesCut() || AVG_GetHitKey() ){ step=3; count=0; }
+        //     case 4: ...; ret = TRUE;
+        // Run like the day-change one (key after the input pass, release the
+        // tick after), the fade-out came one tick early (single-c, 04/15 ->
+        // 04/20 at 080415100@8455).
+        calendar_state_->frame += control_steps_;
+        if (!calendar_state_->dismissing) {
+            if (calendar_state_->frame > 16
+                && (msg().hit_key() || message_cut())) {
+                calendar_state_->dismissing = true;
+                calendar_state_->frame = 0;
+            }
+        } else if (calendar_state_->frame >= 17) {
+            calendar_state_.reset();
+            advance();
+        }
+    } else if (calendar_state_) {
         calendar_state_->frame += control_steps_;
         // AVG_SetCalender's step 3 ends on count 16 (the page at fade 0) and
         // step 4 - the frame after - resets the graphs and returns TRUE, from
@@ -572,8 +600,8 @@ void Game::control_calendar_key()
     // The skip key is not an edge: in AVG_CALENDER, Avg.msg_cut is the latch
     // AVG_ControlSystem2 left before the page went up, the same on every
     // frame of it.
-    if (!calendar_state_ || calendar_state_->dismissing
-        || calendar_state_->frame <= 16) {
+    if (!calendar_state_ || !calendar_state_->step
+        || calendar_state_->dismissing || calendar_state_->frame <= 16) {
         return;
     }
     if (game_key_.click || message_cut()) {

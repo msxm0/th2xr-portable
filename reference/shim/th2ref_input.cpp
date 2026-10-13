@@ -49,6 +49,8 @@ typedef struct { int flag; int wno; unsigned long cnt; TH2REF_WOBJ obj[200];
 extern TH2REF_WEATHER Weather;
 /* Escript.cpp's persistent flags: what SetFlag/GetFlag reach for 50..99. */
 extern int ESC_GameFlagBuf[];
+/* GM_Avg.cpp: the replay menu's unlocks, kept in Sys.sav beside them. */
+void AVG_SetReplayFlag(int rp_no);
 
 extern "C" unsigned long th2ref_current_tick(void);
 extern "C" const char *th2ref_script_name(void);
@@ -155,10 +157,34 @@ void apply_game_flags(void)
     }
 }
 
+/* TH2REF_REPLAY_FLAGS="1,2,3": the bonus scenarios a previous playthrough
+ * unlocked, so a run can start one from the title's own replay menu rather
+ * than through TH2REF_OMAKE.  Applied with the game flags, before the title
+ * builds the menu. */
+void apply_replay_flags(void)
+{
+    const char *spec = getenv("TH2REF_REPLAY_FLAGS");
+    if (!spec || !*spec) return;
+    const char *p = spec;
+    while (*p) {
+        char *end;
+        long index = strtol(p, &end, 10);
+        if (end == p || index < 0 || index >= 32) {
+            fprintf(stderr, "th2ref: bad TH2REF_REPLAY_FLAGS near '%s'\n", p);
+            return;
+        }
+        AVG_SetReplayFlag((int)index);
+        fprintf(stderr, "th2ref: replay flag %ld\n", index);
+        p = end;
+        if (*p == ',') ++p;
+    }
+}
+
 void load(void)
 {
     g_loaded = true;
     apply_game_flags();
+    apply_replay_flags();
     const char *path = getenv("TH2REF_INPUT");
     if (!path || !*path) return;
     FILE *f = fopen(path, "r");
@@ -552,6 +578,16 @@ static void th2ref_map_pick(const int *prefer, int nprefer)
         g_mouse_x = sx + w / 2;
         g_mouse_y = sy + h / 2;
     }
+}
+
+extern "C" int th2ref_omake_start(void)
+{
+    static bool used = false;
+    const char *spec = getenv("TH2REF_OMAKE");
+    if (used || !spec || !*spec) return -1;
+    used = true;
+    fprintf(stderr, "th2ref: bonus scenario %s\n", spec);
+    return atoi(spec);
 }
 
 extern "C" int th2ref_mouse_level(void) { return g_mouse_l ? 1 : 0; }

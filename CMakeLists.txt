@@ -411,6 +411,7 @@ if(ANDROID)
         src/game_map.cpp
         src/game_media.cpp
         src/game_omake_input.cpp
+        src/game_trace_title.cpp
         src/game_prefetch.cpp
         src/gamepad_input.cpp
         src/game_render_effects.cpp
@@ -460,6 +461,7 @@ else()
         src/game_map.cpp
         src/game_media.cpp
         src/game_omake_input.cpp
+        src/game_trace_title.cpp
         src/game_prefetch.cpp
         src/gamepad_input.cpp
         src/game_render_effects.cpp

@@ -94,6 +94,12 @@ void th2ref_text_glyph(int alph2);
  * keyed by tick, and leaves the real devices unread. */
 void th2ref_input(void);
 
+/* TH2REF_OMAKE=N: the title's start goes into bonus scenario 8000%05d
+ * (MAIN_StartOmakeScenario) instead of the new game, as the replay menu's
+ * END_OMAKESTART would - once; -1 when unset or already used.  Kept in step
+ * with --trace-omake. */
+int th2ref_omake_start(void);
+
 /* MUS_RenewMouse reads the real pointer three ways.  Redirecting these lets
  * the function itself run untouched, so all of its rect and trigger
  * bookkeeping still happens - on scripted coordinates. */

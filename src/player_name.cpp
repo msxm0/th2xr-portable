@@ -56,11 +56,14 @@ void set_h2_character_name(std::string family, std::string given)
     h2_given() = std::move(given);
 }
 
+PlayerName original_default_player_name()
+{
+    return {"河野", "貴明", "こうの", "たかあき", "たか", "タカ"};
+}
+
 PlayerName load_default_player_name(const std::filesystem::path& executable)
 {
-    PlayerName result{
-        "河野", "貴明", "こうの", "たかあき", "たか", "タカ",
-    };
+    PlayerName result = original_default_player_name();
     const auto contents = read_data_file(executable);
     const std::string bytes(contents.begin(), contents.end());
     const auto read_slot = [&](std::size_t offset) {
@@ -101,11 +104,33 @@ PlayerName load_default_player_name(const std::filesystem::path& executable)
 bool uses_default_voice_name(
     const PlayerName& name, const PlayerName& default_name)
 {
-    return name.family == default_name.family
-        && name.given == default_name.given
-        && name.family_reading == default_name.family_reading
-        && name.given_reading == default_name.given_reading
-        && name.nickname == default_name.nickname;
+    const auto same = [](std::string_view a, std::string_view b) {
+        const auto trim = [](std::string_view value) {
+            const auto space = [](unsigned char byte) {
+                return std::isspace(byte) != 0;
+            };
+            while (!value.empty() && space(value.front())) {
+                value.remove_prefix(1);
+            }
+            while (!value.empty() && space(value.back())) {
+                value.remove_suffix(1);
+            }
+            return value;
+        };
+        a = trim(a);
+        b = trim(b);
+        return std::ranges::equal(a, b, [](unsigned char x, unsigned char y) {
+            return std::tolower(x) == std::tolower(y);
+        });
+    };
+    const auto matches = [&](const PlayerName& defaults) {
+        return same(name.family, defaults.family)
+            && same(name.given, defaults.given)
+            && same(name.family_reading, defaults.family_reading)
+            && same(name.given_reading, defaults.given_reading)
+            && same(name.nickname, defaults.nickname);
+    };
+    return matches(default_name) || matches(original_default_player_name());
 }
 
 std::string substitute_player_name(

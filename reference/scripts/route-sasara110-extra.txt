@@ -1,0 +1,7 @@
+# Route sasara110: Sasara's student-council route (the 110xxxxxx scripts).
+# Every 110 map event is character 14's; each one sets the flag that opens
+# the next (952, 963/964, 966 ... 987).
+30 every 1 mappick 14
+# The route's only choice: option 1 loads 110010100, the dead end the
+# plain route-sasara took; option 2 goes on and sets flag 952.
+1 at 110010001@8393 num2

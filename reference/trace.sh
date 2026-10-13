@@ -68,6 +68,7 @@ export TH2REF_NOTEXT="${TH2REF_NOTEXT:-0}"
 # is one short line per tick, and having it cover the lead-in is what lets
 # the offset be read off rather than guessed.
 export TH2REF_STATE="$(dos "$OUT/state.txt")"
+export TH2REF_FLAGLOG="$(dos "$OUT/flags.log")"
 # Checkpoints.  TH2REF_SAVE_FILE/_AT write one at the end of a given tick;
 # TH2REF_RESUME_FILE loads one once the lead-in has the engine in the opening
 # script, and then tells the virtual clock it is at the tick the save was

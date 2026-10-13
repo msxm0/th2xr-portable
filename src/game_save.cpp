@@ -993,6 +993,9 @@ bool Game::load_body(std::istream& in)
     // flag 5 already, so the load restores it from there rather than
     // recomputing it from the names.
     default_char_name_ = runtime_.flag(5);
+    // And NameL..NameNN with it, which AVG_WriteConfigParam puts back in the
+    // registry: the next new game's dialog opens on the loaded names.
+    remember_player_name();
     return true;
 }
 

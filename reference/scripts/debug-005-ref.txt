@@ -1,0 +1,28 @@
+# Reference lead-in: the 2002 title screen, which our side does not have.
+# はじめから (start) sits at about y=403 in 800x600 client coordinates.
+150 move 400 403
+200 lclick 3
+# Scenario ticks, shifted by 235.
+265 every 30 lclick 3
+265 every 1 num1
+1235 setflag 9 1
+1235 at 999999999@363 num6
+1235 at 999999005@419 num3,num4,num5,num6,num7,num1
+1235 at 999999005@759 num3,num4,num5,num6,num7,num1
+1235 at 999999005@1099 num3,num4,num5,num6,num7,num1
+1235 at 999999005@1439 num3,num4,num5,num6,num7,num1
+1235 at 999999005@1779 num3,num4,num5,num6,num7,num1
+1235 at 999999005@2119 num3,num4,num5,num6,num7,num1
+1235 at 999999005@2459 num3,num4,num5,num6,num7,num1
+1235 at 999999005@2799 num3,num4,num5,num6,num7,num1
+1235 at 999999005@3139 num3,num4,num5,num6,num7,num1
+1235 at 999999005@3479 num3,num4,num5,num6,num7,num1
+1235 at 999999005@3819 num3,num4,num5,num6,num7,num1
+1235 at 999999005@4159 num3,num4,num5,num6,num7,num1
+1235 at 999999005@4499 num3,num4,num5,num6,num7,num1
+1235 at 999999005@4839 num3,num4,num5,num6,num7,num1
+1235 at 999999005@5179 num3,num4,num5,num6,num7,num1
+1235 at 999999005@5519 num3,num4,num5,num6,num7,num1
+1235 at 999999005@5859 num3,num4,num5,num6,num7,num1
+1235 at 999999005@6199 num3,num5,num6,num7,num1
+1235 at 999999005@6479 num3,num4
