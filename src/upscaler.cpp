@@ -1,6 +1,7 @@
 #include "upscaler.hpp"
 
 #include "gl_anime4k.hpp"
+#include "gl_cunny.hpp"
 #include "image.hpp"
 
 #include <string_view>
@@ -10,6 +11,8 @@
 #include "anime4k.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <optional>
 #include <stdexcept>
 
 namespace th2 {
@@ -35,8 +38,8 @@ SDL_FRect letterbox_rect(int output_width, int output_height)
 
 class LinearUpscaler : public Upscaler {
 public:
-    LinearUpscaler(SDL_Renderer* renderer, bool want_anime4k)
-        : renderer_(renderer), want_anime4k_(want_anime4k)
+    LinearUpscaler(SDL_Renderer* renderer, ArtUpscaling mode)
+        : renderer_(renderer), mode_(mode)
     {
         create_targets();
     }
@@ -46,13 +49,18 @@ public:
     // GL context is not current before the first drawn frame.
     bool anime4k_active() const
     {
-        return want_anime4k_ && anime4k_ && anime4k_->available();
+        return mode_ == ArtUpscaling::anime4k && anime4k_
+            && anime4k_->available();
     }
 
     void reset() override
     {
         overlay_.reset();
         sidebar_.reset();
+        // A device reset takes the GL context, and the network's textures
+        // and programs with it.
+        cunny_.reset();
+        art_changed_ = true;
         overlay_width_ = 0;
         overlay_height_ = 0;
         create_targets();
@@ -114,16 +122,65 @@ public:
         SDL_SetTextureScaleMode(art, SDL_SCALEMODE_LINEAR);
         // Built on the first drawn frame, once the renderer's context is
         // current - the same reason GlPatternTransition is.
-        if (want_anime4k_ && !anime4k_) {
+        if (mode_ == ArtUpscaling::anime4k && !anime4k_) {
             anime4k_ = std::make_unique<GlAnime4K>(renderer_);
             SDL_Log("upscaler: %s", anime4k_->available()
                         ? "Anime4K (GLES shader)" : "linear magnification");
         }
-        // The art layer only, and only this draw: the shader magnifies, so
-        // it stands in for the blit rather than wrapping it.  A failure here
-        // is not fatal - the plain blit below runs instead.
-        if (!(anime4k_ && anime4k_->draw(renderer_, art, destination))) {
+        if (cunny_model() && !cunny_) {
+            cunny_ = std::make_unique<GlCunny>(renderer_, *cunny_model());
+            SDL_Log("upscaler: %s",
+                    cunny_->available() ? "CuNNy (GLES shaders)"
+                    : cunny_->building()
+                        ? "CuNNy, shaders building - linear until then"
+                        : "linear magnification");
+        }
+        // The art layer only, and only this draw: the shaders magnify, so
+        // they stand in for the blit rather than wrapping it.  A failure
+        // here is not fatal - the plain blit below runs instead.
+        bool drawn = false;
+        ArtPath path{"linear", static_cast<int>(std::round(destination.w)),
+                     static_cast<int>(std::round(destination.h))};
+        float art_w = 0.0f;
+        float art_h = 0.0f;
+        SDL_GetTextureSize(art, &art_w, &art_h);
+        if (cunny_ && destination.w > art_w) {
+            // The network's 2x picture, Lanczos-resampled to the letterbox
+            // (gl_lanczos.hpp) and drawn 1:1, at whole pixels so nothing
+            // filters it again.  Both run only when the art or the size
+            // changed.  At 1x or below there is nothing to upscale, and the
+            // art is blitted as it is.
+            const SDL_FRect whole{
+                std::round(destination.x), std::round(destination.y),
+                std::round(destination.w), std::round(destination.h)};
+            if (SDL_Texture* const upscaled = cunny_->upscale(
+                    renderer_, art, art_changed_,
+                    static_cast<int>(whole.w), static_cast<int>(whole.h))) {
+                drawn = SDL_RenderTexture(renderer_, upscaled, nullptr, &whole);
+                art_changed_ = false;
+            }
+            path.method = drawn ? cunny_method()
+                : cunny_->building() ? "linear, CuNNy building" : "linear";
+        } else if (anime4k_) {
+            drawn = anime4k_->draw(renderer_, art, destination);
+            art_changed_ = false;
+            path.method = drawn ? "Anime4K" : "linear";
+        } else if (!cunny_) {
+            art_changed_ = false;
+        }
+        // (With CuNNy chosen but not drawn - skipped at 1x, or its shaders
+        // still building - art_changed_ stays set, so the network runs on
+        // the first frame it can.)
+        if (!drawn) {
             SDL_RenderTexture(renderer_, art, nullptr, &destination);
+        }
+        if (cunny_ && !(destination.w > art_w)) {
+            path.method = "linear, 1x or below";
+        }
+        if (path != art_path_) {
+            art_path_ = path;
+            SDL_Log("upscaler: art %s to %dx%d output pixels",
+                    path.method, path.width, path.height);
         }
         if (authentic_text_content_) {
             SDL_RenderTexture(
@@ -171,9 +228,30 @@ private:
         overlay_height_ = height;
     }
 
+    const char* cunny_method() const
+    {
+        switch (mode_) {
+        case ArtUpscaling::cunny_fast: return "CuNNy fast 2x + Lanczos";
+        case ArtUpscaling::cunny_4x16: return "CuNNy 4x16 2x + Lanczos";
+        case ArtUpscaling::cunny_4x32: return "CuNNy 4x32 2x + Lanczos";
+        default: return "CuNNy";
+        }
+    }
+
+    std::optional<CunnyModel> cunny_model() const
+    {
+        switch (mode_) {
+        case ArtUpscaling::cunny_fast: return CunnyModel::fast;
+        case ArtUpscaling::cunny_4x16: return CunnyModel::c4x16;
+        case ArtUpscaling::cunny_4x32: return CunnyModel::c4x32;
+        default: return std::nullopt;
+        }
+    }
+
     SDL_Renderer* renderer_;
-    bool want_anime4k_ = false;
+    ArtUpscaling mode_ = ArtUpscaling::linear;
     std::unique_ptr<GlAnime4K> anime4k_;
+    std::unique_ptr<GlCunny> cunny_;
     Texture art_;
     Texture authentic_text_;
     Texture overlay_;
@@ -189,7 +267,7 @@ namespace {
 // The GL form needs SDL to be drawing through GLES; the shader itself is not
 // built until the first frame, so this is the question that can be answered
 // at construction time.
-bool renderer_can_run_gl_anime4k(SDL_Renderer* renderer)
+bool renderer_can_run_gl_shaders(SDL_Renderer* renderer)
 {
     const char* name = SDL_GetRendererName(renderer);
     if (!name) {
@@ -205,17 +283,18 @@ bool renderer_can_run_gl_anime4k(SDL_Renderer* renderer)
 std::unique_ptr<Upscaler> create_upscaler(
     SDL_Renderer* renderer,
     const std::filesystem::path& shader_dir,
-    bool use_anime4k,
-    bool* anime4k_available)
+    ArtUpscaling mode,
+    bool* shaders_available)
 {
+    const bool use_anime4k = mode == ArtUpscaling::anime4k;
     // The SDL_GPU implementation first, for a build still running that
     // renderer.  On GLES - which is every build now - it cannot initialise,
     // and the GL form inside LinearUpscaler takes over.
     try {
         auto anime4k = std::make_unique<Anime4K>(renderer, shader_dir);
         if (anime4k->available()) {
-            if (anime4k_available) {
-                *anime4k_available = true;
+            if (shaders_available) {
+                *shaders_available = true;
             }
             if (use_anime4k) {
                 return anime4k;
@@ -224,12 +303,12 @@ std::unique_ptr<Upscaler> create_upscaler(
     } catch (const std::exception& error) {
         SDL_Log("Anime4K (SDL_GPU) unavailable: %s", error.what());
     }
-    auto linear = std::make_unique<LinearUpscaler>(renderer, use_anime4k);
-    if (anime4k_available) {
+    auto linear = std::make_unique<LinearUpscaler>(renderer, mode);
+    if (shaders_available) {
         // Reported as available whenever the renderer can carry the GL form;
         // whether the shader built is only known after the first frame, and
         // the answer here drives a settings toggle rather than a draw.
-        *anime4k_available = renderer_can_run_gl_anime4k(renderer);
+        *shaders_available = renderer_can_run_gl_shaders(renderer);
     }
     return linear;
 }

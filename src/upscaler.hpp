@@ -1,5 +1,7 @@
 #pragma once
 
+#include "config.hpp"
+
 #include <SDL3/SDL.h>
 
 #include <filesystem>
@@ -54,10 +56,29 @@ public:
     // art target itself.
     void set_art_source(SDL_Texture* art) { art_source_ = art; }
 
+    // The art was drawn this frame - by a tick, or into the copy a frame
+    // between ticks draws.  An upscaler that keeps its result (CuNNy) runs
+    // again only after this; until then the art it last saw is unchanged.
+    void mark_art_changed() { art_changed_ = true; }
+
+    // What the art layer went through on the last frame, and the size it
+    // landed at in output pixels - the renderer's, never window points, so
+    // a 2.6x phone showing a 754-point window upscales to 1967 pixels.
+    // For the settings panel's viewport readings; the log gets each change.
+    struct ArtPath {
+        const char* method = "";
+        int width = 0;
+        int height = 0;
+        bool operator==(const ArtPath&) const = default;
+    };
+    const ArtPath& art_path() const { return art_path_; }
+
 protected:
     bool authentic_text_content_ = true;
     bool sidebar_content_ = true;
     SDL_Texture* art_source_ = nullptr;
+    bool art_changed_ = true;
+    ArtPath art_path_;
 
 public:
 
@@ -68,14 +89,15 @@ public:
     virtual bool is_anime4k() const { return false; }
 };
 
-// Creates the best available upscaler. If use_anime4k is true and the
-// Anime4K GPU path is available, returns that; otherwise returns a linear
-// fallback. If anime4k_available is non-null, it is set to true when the
-// Anime4K path could be initialized.
+// Creates the upscaler for `mode`.  Anime4K and CuNNy are shaders run on
+// SDL's GLES context; where they cannot run, the art is magnified linearly.
+// If shaders_available is non-null it is set to whether the renderer can
+// carry them at all - whether one actually built is only known once a frame
+// has been drawn, and a failure then falls back to the linear blit.
 std::unique_ptr<Upscaler> create_upscaler(
     SDL_Renderer* renderer,
     const std::filesystem::path& shader_dir,
-    bool use_anime4k,
-    bool* anime4k_available = nullptr);
+    ArtUpscaling mode,
+    bool* shaders_available = nullptr);
 
 }  // namespace th2

@@ -498,8 +498,10 @@ private:
     th2::TouchInput touch_input_;
     GamepadInput gamepad_input_;
     th2::GameFont font_;
-    bool anime4k_available_ = false;
-    bool last_anime4k_wanted_ = false;
+    // Whether the renderer can run the upscaling shaders (Anime4K, CuNNy),
+    // and the choice the current upscaler_ was made for.
+    bool upscaling_shaders_available_ = false;
+    th2::ArtUpscaling upscaler_built_for_ = th2::ArtUpscaling::linear;
     // BMP_BACK is the background as loaded plus whatever characters have
     // been composited into it; BMP_BACK2 is the clean copy taken before any
     // of them were, and BMP_BACKHALF the darkened copy of the plate.  All

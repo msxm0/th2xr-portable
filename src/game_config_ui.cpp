@@ -250,14 +250,38 @@ void Game::draw_config()
                     option_changed = true;
                 }
 #endif
-                ImGui::BeginDisabled(!anime4k_available_);
-                option_changed |= ImGui::Checkbox(
-                    "Anime4K art upscaling", &config_.anime4k);
-                ImGui::EndDisabled();
-                if (!anime4k_available_) {
-                    ImGui::TextDisabled(
-                        "Anime4K requires SDL's GPU renderer with SPIR-V support.");
+                // th2::ArtUpscaling's order.
+                static constexpr std::array upscaling_labels{
+                    "Linear", "Anime4K (sharpen)", "CuNNy fast",
+                    "CuNNy 4x16", "CuNNy 4x32",
+                };
+                const auto upscaling =
+                    static_cast<std::size_t>(config_.art_upscaling);
+                if (ImGui::BeginCombo(
+                        "Art upscaling", upscaling_labels[upscaling])) {
+                    for (std::size_t i = 0; i < upscaling_labels.size(); ++i) {
+                        // Everything but Linear is a GLES shader.
+                        ImGui::BeginDisabled(
+                            i != 0 && !upscaling_shaders_available_);
+                        const bool selected = upscaling == i;
+                        if (ImGui::Selectable(
+                                upscaling_labels[i], selected)) {
+                            config_.art_upscaling =
+                                static_cast<th2::ArtUpscaling>(i);
+                            option_changed = true;
+                        }
+                        ImGui::EndDisabled();
+                        if (selected) {
+                            ImGui::SetItemDefaultFocus();
+                        }
+                    }
+                    ImGui::EndCombo();
                 }
+                ImGui::TextDisabled(
+                    upscaling_shaders_available_
+                        ? "CuNNy is a neural upscaler trained on visual novels;"
+                          " 4x16 and 4x32 need a fast GPU."
+                        : "The upscaling shaders need SDL's GLES renderer.");
                 option_changed |= ImGui::Checkbox(
                     "Smooth motion between engine ticks",
                     &config_.smooth_motion);
@@ -343,6 +367,11 @@ void Game::draw_config()
                         "density %.3f  scale %.3f",
                         SDL_GetWindowPixelDensity(window_),
                         SDL_GetWindowDisplayScale(window_));
+                    if (upscaler_ && upscaler_->art_path().width > 0) {
+                        const auto& art = upscaler_->art_path();
+                        ImGui::Text("art %s to %dx%d", art.method,
+                                    art.width, art.height);
+                    }
 #ifdef __EMSCRIPTEN__
                     // The page's own readings.  SDL derives its pixel size
                     // rather than measuring the canvas, so these are the only

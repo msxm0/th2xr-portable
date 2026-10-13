@@ -148,8 +148,8 @@ FORCE=1 ci/build-wasm-third-party.sh ffmpeg
 
 There is no fontconfig, no libiconv (Emscripten's libc has a CP932
 capable `iconv`), and no glslang: SDL_GPU has no browser backend, so
-the anime4k upscaler compiles in but reports itself unavailable and no
-SPIR-V is built.
+no SPIR-V is built.  The art upscalers (Anime4K, CuNNy) are GLES shaders
+and run in WebGL 2 as they do on the desktop.
 
 ### Building and serving
 
@@ -377,9 +377,32 @@ portable fallback, at the cost of a much larger and slower binary.
   ImGui button press is a frame old, well inside the transient
   activation window.  `_malloc`/`_free` are in `EXPORTED_FUNCTIONS`
   because the file picker allocates from JS.
-- **No anime4k.** There is no SDL_GPU backend in the browser, so the
-  upscaler reports itself unavailable and the renderer falls back to
-  WebGL 2.
+- **No SDL_GPU.** There is no SDL_GPU backend in the browser; SDL
+  renders through WebGL 2, and the art upscalers run on that context.
+
+## CuNNy weights
+
+The CuNNy upscaler (`src/gl_cunny.cpp`) runs the NVL models of
+https://github.com/funnyplanter/CuNNy, whose weights live in
+`shaders/cunny/*.bin` and are embedded at build time
+(`cmake/embed_cunny.cmake`).  They are read out of CuNNy's Magpie effects
+as text - never from its `pretrained/*.pickle`, which would need an
+unpickler:
+
+```
+git clone https://github.com/funnyplanter/CuNNy /tmp/CuNNy
+python3 tools/cunny_convert.py /tmp/CuNNy shaders/cunny
+```
+
+`src/cunny_model.cpp` generates one GLSL ES 3.00 pass per layer (four
+output channels per texture, 8-bit like the Magpie effect's).  The weights
+go in uniform buffers, not into the shader source as Magpie's do: on Mesa
+(Arc B50) literal weights made 4x32 take 6.2 s to compile, on the calling
+thread despite KHR_parallel_shader_compile, and ran 1.8x slower (13.3 ms
+against 7.5 ms per 800x600 picture).
+`th2-cunny-check MODEL in.bmp out.bmp [RUNS [WxH]]` runs a model through
+the game's code path and times it; `tools/cunny_reference.py` computes the
+same picture in numpy to compare against.
 
 ## CI
 

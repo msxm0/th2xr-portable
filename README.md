@@ -22,7 +22,8 @@ platform supported by SDL3.
 Compared to the original engine, we have:
 
  * Fully resizable window
- * Anime4k-based upscaling of art (optional)
+ * Upscaling of the art (optional): Anime4K sharpening, or CuNNy, a neural
+   upscaler trained on visual novels
  * Desktop-resolution text rendering, any font (optional)
  * Autosaves (optional)
  * Native builds on Mac, Linux, Android
@@ -234,18 +235,24 @@ See [HACKING.md](HACKING.md) for information on developing or debugging the engi
 
 ## License
 
-This project is licensed under the GNU General Public License v2.0. See
-[LICENSE.txt](LICENSE.txt) for details.
+This project is licensed under the GNU General Public License, version 2
+or (at your option) any later version. See [LICENSE.txt](LICENSE.txt) for
+details. Builds include the CuNNy upscaler's weights, which are LGPL v3
+(see [licenses/cunny](licenses/cunny/README.md)), so the program as built
+is distributed under the GPL v3.
 
 ## Acknowledgements
 
 The [original ToHeart2 source code](https://github.com/autch/aquaplus_gpl)
-was released by Aquaplus under the GPLv2. 
+was released by Aquaplus under the GPL, version 2 or any later version
+(its `ライセンスについて.txt`).
 
 This project uses:
 - [SDL3](https://libsdl.org/) for cross-platform windowing, input, and rendering
 - [Dear ImGui](https://github.com/ocornut/imgui) for the config and player name panels
 - [Anime4K](https://github.com/bloc97/Anime4K) for real-time upscaling
+- [CuNNy](https://github.com/funnyplanter/CuNNy)'s NVL models for neural
+  upscaling trained on visual novels
 - [FFmpeg](https://ffmpeg.org/) for video/audio playback
 
 ## AI Disclosure
