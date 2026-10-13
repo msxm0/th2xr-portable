@@ -88,8 +88,12 @@ GameConfig load_config(const std::filesystem::path& path)
         } else if (key == "window_height") {
             config.window_height =
                 parse_int(value, config.window_height, 480, 16384);
-        } else if (key == "anime4k") {
-            config.anime4k = parse_bool(value);
+        } else if (key == "art_upscaling") {
+            const auto found = std::ranges::find(art_upscaling_keys, value);
+            if (found != art_upscaling_keys.end()) {
+                config.art_upscaling = static_cast<ArtUpscaling>(
+                    found - art_upscaling_keys.begin());
+            }
         } else if (key == "smooth_motion") {
             config.smooth_motion = parse_bool(value);
         } else if (key == "authentic_font") {
@@ -164,7 +168,9 @@ void save_config(const std::filesystem::path& path, const GameConfig& config)
            << "window_y=" << config.window_y << '\n'
            << "window_width=" << config.window_width << '\n'
            << "window_height=" << config.window_height << '\n'
-           << "anime4k=" << config.anime4k << '\n'
+           << "art_upscaling="
+           << art_upscaling_keys[static_cast<std::size_t>(config.art_upscaling)]
+           << '\n'
            << "smooth_motion=" << config.smooth_motion << '\n'
            << "authentic_font=" << config.authentic_font << '\n'
            << "font_family=" << config.font_family << '\n'

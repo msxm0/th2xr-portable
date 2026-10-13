@@ -182,6 +182,30 @@ target_include_directories(th2_config PUBLIC src)
 target_link_libraries(th2_config PUBLIC SQLite3::SQLite3 th2_data)
 target_compile_options(th2_config PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>)
 
+# CuNNy NVL weights (tools/cunny_convert.py), embedded in the binary - see
+# src/cunny_weights.hpp.  The order here is th2::CunnyModel's.
+set(CUNNY_WEIGHT_FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/cunny/cunny-fast-nvl.bin"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/cunny/cunny-4x16-nvl.bin"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/cunny/cunny-4x32-nvl.bin")
+set(CUNNY_WEIGHTS_CPP "${CMAKE_CURRENT_BINARY_DIR}/cunny_weights.cpp")
+# '|' rather than ';': a list would be split into separate arguments.
+string(REPLACE ";" "|" CUNNY_WEIGHT_ARG "${CUNNY_WEIGHT_FILES}")
+add_custom_command(
+    OUTPUT "${CUNNY_WEIGHTS_CPP}"
+    COMMAND "${CMAKE_COMMAND}" "-DOUT=${CUNNY_WEIGHTS_CPP}"
+            "-DINPUTS=${CUNNY_WEIGHT_ARG}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cunny.cmake"
+    DEPENDS ${CUNNY_WEIGHT_FILES}
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cunny.cmake"
+    VERBATIM)
+add_library(th2_cunny
+    src/cunny_model.cpp
+    "${CUNNY_WEIGHTS_CPP}"
+)
+target_include_directories(th2_cunny PUBLIC src)
+target_compile_options(th2_cunny PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>)
+
 add_library(th2_soak
     src/soak.cpp
 )
@@ -565,6 +589,15 @@ if(NOT EMSCRIPTEN)
         target_link_libraries(toheart2 PRIVATE PkgConfig::GLESV2)
         target_compile_definitions(toheart2 PRIVATE TH2_HAVE_GLES3=1)
         message(STATUS "GLES3 found: GL shader path enabled on desktop")
+        # Checks GlCunny against tools/cunny_reference.py and times it.
+        add_executable(th2-cunny-check
+            src/cunny_check.cpp
+            src/gl_cunny.cpp
+            src/gl_lanczos.cpp
+        )
+        target_compile_definitions(th2-cunny-check PRIVATE TH2_HAVE_GLES3=1)
+        target_link_libraries(th2-cunny-check PRIVATE
+            th2_cunny SDL3::SDL3 PkgConfig::GLESV2)
     else()
         message(STATUS "No GLES3: GL shader path is browser-only")
     endif()
@@ -605,7 +638,8 @@ else()
     target_link_libraries(toheart2 PRIVATE
         SDL3::SDL3 PkgConfig::SDL3_TTF PkgConfig::FONTCONFIG th2_runtime th2_soak)
 endif()
-target_link_libraries(toheart2 PRIVATE th2_audio th2_character th2_config imgui)
+target_sources(toheart2 PRIVATE src/gl_cunny.cpp src/gl_lanczos.cpp)
+target_link_libraries(toheart2 PRIVATE th2_audio th2_character th2_config th2_cunny imgui)
 target_link_libraries(toheart2 PRIVATE PkgConfig::FFMPEG ZSTD::ZSTD ZLIB::ZLIB)
 
 if(EMSCRIPTEN)
@@ -698,6 +732,12 @@ if(BUILD_TESTING AND NOT EMSCRIPTEN)
     )
     target_link_libraries(th2-config-test PRIVATE th2_config)
     add_test(NAME config-roundtrip COMMAND th2-config-test)
+
+    add_executable(th2-cunny-model-test
+        src/cunny_model_test.cpp
+    )
+    target_link_libraries(th2-cunny-model-test PRIVATE th2_cunny)
+    add_test(NAME cunny-model COMMAND th2-cunny-model-test)
 
     add_executable(th2-persistent-state-test
         src/persistent_state_test.cpp

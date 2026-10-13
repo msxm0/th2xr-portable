@@ -308,9 +308,9 @@ Game::Game(
     }
 #endif
     upscaler_ = th2::create_upscaler(
-        renderer_, anime4k_shader_dir(), config_.anime4k,
-        &anime4k_available_);
-    last_anime4k_wanted_ = config_.anime4k;
+        renderer_, anime4k_shader_dir(), config_.art_upscaling,
+        &upscaling_shaders_available_);
+    upscaler_built_for_ = config_.art_upscaling;
     imgui_ = std::make_unique<th2::ImGuiLayer>(window_, renderer_);
     SDL_Log("ImGui layer initialized");
     // Every one of these is a separate archive entry, and in the browser a

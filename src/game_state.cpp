@@ -196,13 +196,13 @@ void Game::warm_renderer_programs()
 
 void Game::ensure_upscaler()
 {
-    if (last_anime4k_wanted_ == config_.anime4k) {
+    if (upscaler_built_for_ == config_.art_upscaling) {
         return;
     }
-    last_anime4k_wanted_ = config_.anime4k;
+    upscaler_built_for_ = config_.art_upscaling;
     upscaler_ = th2::create_upscaler(
-        renderer_, anime4k_shader_dir(), config_.anime4k,
-        &anime4k_available_);
+        renderer_, anime4k_shader_dir(), config_.art_upscaling,
+        &upscaling_shaders_available_);
 }
 
 std::size_t Game::voice_character_index(int character) const

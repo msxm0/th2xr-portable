@@ -10,7 +10,7 @@ int main()
     source.bgm_volume = 99;
     source.bgm_muted = true;
     source.auto_skip_read = true;
-    source.anime4k = false;
+    source.art_upscaling = th2::ArtUpscaling::cunny_4x16;
     source.authentic_font = true;
     source.sidebar_mode = 2;
     source.fullscreen = true;
@@ -33,7 +33,7 @@ int main()
     std::filesystem::remove(path);
     if (loaded.bgm_volume != 99 || !loaded.bgm_muted
         || !loaded.auto_skip_read
-        || loaded.anime4k
+        || loaded.art_upscaling != th2::ArtUpscaling::cunny_4x16
         || !loaded.authentic_font
         || loaded.sidebar_mode != 2
         || !loaded.fullscreen

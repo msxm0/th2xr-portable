@@ -3,8 +3,17 @@
 #include <array>
 #include <filesystem>
 #include <string>
+#include <string_view>
 
 namespace th2 {
+
+// How the 800x600 art is magnified to the window - presentation only, the
+// engine draws the same art whichever is chosen.  Anime4K is its DoG
+// sharpening pass; the CuNNy entries are the NVL models of that CNN
+// upscaler (src/gl_cunny.hpp), smallest and fastest first.
+enum class ArtUpscaling { linear, anime4k, cunny_fast, cunny_4x16, cunny_4x32 };
+inline constexpr std::array<std::string_view, 5> art_upscaling_keys{
+    "linear", "anime4k", "cunny-fast", "cunny-4x16", "cunny-4x32"};
 
 struct GameConfig {
     int bgm_volume = 176;
@@ -47,7 +56,7 @@ struct GameConfig {
     int window_y = -1;
     int window_width = 1600;
     int window_height = 1200;
-    bool anime4k = true;
+    ArtUpscaling art_upscaling = ArtUpscaling::anime4k;
     // Draw fades, slides and the typewriter between engine ticks on a
     // display faster than the engine's 62.5Hz.  Presentation only: the
     // engine's state and every frame that lands on a tick are unchanged.

@@ -1250,6 +1250,11 @@ void Game::draw_frame()
         && art_cleared_for_ == art_target
         && (ui_mode_ == UiMode::game || ui_mode_ == UiMode::map)
         && !movie_ && !name_input_open_;
+    // Every path below draws the art when it is not current - the early
+    // returns for movies and the port's own screens included.
+    if (!art_current) {
+        upscaler_->mark_art_changed();
+    }
     if (shake_characters && !art_current) {
         chars().set_char_pos_shake(
             static_cast<int>(shake.x), static_cast<int>(shake.y), 1);
@@ -1462,6 +1467,7 @@ void Game::draw_frame()
                 });
             draw_art(scratch);
             display().set_presenter({});
+            upscaler_->mark_art_changed();
             if (scroll_present_extra_ > 0.0) {
                 // setup_background_graphs writes the graphs it sets up;
                 // put them back as a tick leaves them.
