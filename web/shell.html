@@ -537,6 +537,18 @@
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') flushStorage();
   });
+  // A hidden tab gets few animation frames or none, and the frame loop is
+  // what keeps the audio fed, so the sound ran dry and stuttered.  Suspended
+  // here, at once, since the loop may not run again until the tab is back;
+  // the game stands still meanwhile (Game::on_page_visibility).  Resuming
+  // needs no new gesture: the Start click is the page's activation.
+  document.addEventListener('visibilitychange', () => {
+    const context = Module.SDL3 && Module.SDL3.audioContext;
+    if (!context) return;
+    const change = document.visibilityState === 'hidden'
+      ? context.suspend() : context.resume();
+    change.catch(() => {});
+  });
 
   window.onerror = (message) => {
     // Covering a running game with an error panel over a warning is worse

@@ -411,4 +411,9 @@ void VideoPlayer::set_speed(double speed)
     impl_->set_speed(speed);
 }
 
+void VideoPlayer::skip_time(std::chrono::steady_clock::duration duration)
+{
+    impl_->started += duration;
+}
+
 }  // namespace th2

@@ -707,6 +707,15 @@ private:
     std::string background_tone_curve_;
     bool running_ = true;
     bool app_active_ = true;
+    // The browser tab is hidden: the page has suspended the audio
+    // (web/shell.html) and the game stands still until it is shown again.
+    // page_hidden_ns_ is when it was hidden, on SDL's event clock;
+    // page_hidden_total_ all the time spent hidden, which the audio
+    // channels' clock leaves out (see on_page_visibility).
+    bool page_hidden_ = false;
+    Uint64 page_hidden_ns_ = 0;
+    std::chrono::nanoseconds page_hidden_total_{0};
+    void on_page_visibility(const SDL_Event& event);
     std::chrono::steady_clock::time_point next_frame_{};
     // Last device pixel ratio pushed into SDL (browser only).
     double web_pixel_ratio_ = 0.0;

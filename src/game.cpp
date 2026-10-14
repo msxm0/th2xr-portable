@@ -437,6 +437,14 @@ Game::Game(
     // drain.  On the web that wait is on the main thread, where SDL also
     // feeds the device: a frame hitch whenever the sounds stopped, and the
     // next sound's opening stuttering while the device came back up.
+    // The audio channels' clock in normal play: the wall clock less the
+    // time the browser tab spent hidden (on_page_visibility).  A trace
+    // points it at engine_now() instead (enable_trace).
+    th2::AudioChannel::set_clock([this] {
+        return std::chrono::steady_clock::now()
+            - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                page_hidden_total_);
+    });
     if (!suppress_audio_output_) {
         audio_keepalive_ =
             SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, nullptr);
@@ -921,6 +929,13 @@ void Game::iterate()
             SDL_Log("Render device lost");
             continue;
         }
+#ifdef __EMSCRIPTEN__
+        // Not consumed: a hidden page also drops the touches below.
+        if (event.type == SDL_EVENT_WINDOW_HIDDEN
+            || event.type == SDL_EVENT_WINDOW_SHOWN) {
+            on_page_visibility(event);
+        }
+#endif
 #ifndef __ANDROID__
         if (event.type == SDL_EVENT_WINDOW_MOVED
             || event.type == SDL_EVENT_WINDOW_RESIZED
@@ -1060,9 +1075,10 @@ void Game::iterate()
     handle_touch_actions();
     process_save_bundle_dialog();
 
-    if (!app_active_) {
+    if (!app_active_ || page_hidden_) {
         // Pause the loop while the app is in the background so we
-        // don't keep rendering to a surface that may be destroyed.
+        // don't keep rendering to a surface that may be destroyed, and
+        // while the browser tab is hidden (see on_page_visibility).
 #ifndef __EMSCRIPTEN__
         SDL_Delay(50);
 #endif

@@ -534,5 +534,54 @@ th2::AudioChannel& Game::waited_audio_channel()
     return transient_se_.at(audio_wait_->channel - se_channels_.size());
 }
 
+void Game::on_page_visibility(const SDL_Event& event)
+{
+    // A hidden tab gets few animation frames or none, and the frame loop is
+    // what keeps the audio streams topped up, so the sound ran dry and
+    // stuttered.  The page suspends the audio context the moment the tab
+    // is hidden - the loop may not run again until it is back - and the
+    // game stands still with it (iterate returns early).
+    //
+    // The two often arrive together, on the first frame after the tab is
+    // back, so the time hidden comes from the events' own timestamps.  The
+    // audio channels' clock leaves it out: a voice the context held is not
+    // over because the wall clock moved on, and a fade picks up where it
+    // was.  The movie and the tick accumulator skip it the same way; the
+    // engine's waits count ticks, which did not advance.
+    //
+    // Not in a trace: its progress is the tick count alone, and a harness
+    // tab being hidden must not stop it.
+    if (trace_mode_) {
+        return;
+    }
+    if (event.type == SDL_EVENT_WINDOW_HIDDEN) {
+        if (!page_hidden_) {
+            page_hidden_ = true;
+            page_hidden_ns_ = event.window.timestamp;
+            SDL_Log("Page hidden: audio and game paused");
+        }
+        return;
+    }
+    if (event.type != SDL_EVENT_WINDOW_SHOWN || !page_hidden_) {
+        return;
+    }
+    page_hidden_ = false;
+    const std::chrono::nanoseconds hidden{
+        event.window.timestamp > page_hidden_ns_
+            ? event.window.timestamp - page_hidden_ns_ : 0};
+    page_hidden_total_ += hidden;
+    const auto skipped =
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(hidden);
+    if (character_control_time_ != std::chrono::steady_clock::time_point{}) {
+        character_control_time_ += skipped;
+    }
+    if (movie_) {
+        movie_->skip_time(skipped);
+    }
+    SDL_Log("Page shown after %lld ms hidden",
+            static_cast<long long>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(hidden)
+                    .count()));
+}
 
 }  // namespace th2app

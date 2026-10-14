@@ -37,6 +37,9 @@ public:
     void draw() const;
     bool finished() const;
     void set_speed(double speed);
+    // Leaves `duration` of wall time out of the movie's clock: time it
+    // stood still while its sound did (a hidden browser tab).
+    void skip_time(std::chrono::steady_clock::duration duration);
 
 private:
     struct Impl;
