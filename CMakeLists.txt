@@ -434,6 +434,7 @@ if(ANDROID)
         src/game_flow.cpp
         src/game_map.cpp
         src/game_media.cpp
+        src/game_audio_selftest.cpp
         src/game_omake_input.cpp
         src/game_trace_title.cpp
         src/game_prefetch.cpp
@@ -484,6 +485,7 @@ else()
         src/game_flow.cpp
         src/game_map.cpp
         src/game_media.cpp
+        src/game_audio_selftest.cpp
         src/game_omake_input.cpp
         src/game_trace_title.cpp
         src/game_prefetch.cpp

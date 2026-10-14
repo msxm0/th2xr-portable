@@ -1,0 +1,8 @@
+20 move 400 441
+21 every 4 lclick 3 until 134
+134 move 204 147
+135 every 4 lclick 3 until 164
+164 move 526 335
+165 every 4 lclick 3 until 182
+214 every 30 lclick 3
+214 every 1 num1

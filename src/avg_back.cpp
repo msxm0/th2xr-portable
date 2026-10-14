@@ -1141,8 +1141,13 @@ void AvgBack::control_fade()
 
 void AvgBack::reset_fade_freeze()
 {
-    fade_.grp_flag.fill(false);
-    fade_.txt_flag = false;
+    // ZeroMemory( &FadeStruct ): no fade running - a fade-out AVG_SetLoad
+    // began from the title is dropped here - and black, which the next
+    // AVG_SetFade starts from.
+    fade_ = FadeStruct{};
+    fade_.sr = fade_.sg = fade_.sb = 0;
+    fade_.er = fade_.eg = fade_.eb = 0;
+    fade_.r = fade_.g = fade_.b = 0;
     display_.reset_graph(grp_disp);
     display_.release_bmp(bmp_disp);
 }

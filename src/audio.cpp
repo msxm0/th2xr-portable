@@ -5,6 +5,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/dict.h>
+#include <libavutil/intreadwrite.h>
 #include <libavutil/samplefmt.h>
 #include <libswresample/swresample.h>
 }
@@ -158,7 +159,40 @@ std::optional<PlainPcm> plain_pcm(std::span<const std::uint8_t> bytes)
     return std::nullopt;
 }
 
-AVCodecContext* open_codec(AVFormatContext* format, int stream)
+// The last page's granule position: the stream's length in frames, which
+// is where libvorbis (the original's decoder) ends it.  -1 when the bytes do
+// not end on a page that completes a packet.
+std::int64_t ogg_end_granule(std::span<const std::uint8_t> bytes)
+{
+    if (bytes.size() < 27) {
+        return -1;
+    }
+    for (std::size_t at = bytes.size() - 27 + 1; at-- > 0;) {
+        const auto* page = bytes.data() + at;
+        if (std::memcmp(page, "OggS", 4) != 0 || page[4] != 0) {
+            continue;
+        }
+        const std::size_t segments = page[26];
+        std::size_t end = at + 27 + segments;
+        if (end > bytes.size()) {
+            continue;
+        }
+        for (std::size_t i = 0; i < segments; ++i) {
+            end += page[27 + i];
+        }
+        if (end != bytes.size()) {
+            continue;
+        }
+        std::int64_t granule = 0;
+        for (int i = 7; i >= 0; --i) {
+            granule = granule << 8 | page[6 + i];
+        }
+        return granule;
+    }
+    return -1;
+}
+
+AVCodecContext* open_codec(AVFormatContext* format, int stream, bool skip_manual)
 {
     const auto* parameters = format->streams[stream]->codecpar;
     const AVCodec* codec = avcodec_find_decoder(parameters->codec_id);
@@ -170,6 +204,9 @@ AVCodecContext* open_codec(AVFormatContext* format, int stream)
         throw std::bad_alloc();
     }
     int result = avcodec_parameters_to_context(context, parameters);
+    if (skip_manual) {
+        context->flags2 |= AV_CODEC_FLAG2_SKIP_MANUAL;
+    }
     if (result >= 0) {
         result = avcodec_open2(context, codec, nullptr);
     }
@@ -181,7 +218,8 @@ AVCodecContext* open_codec(AVFormatContext* format, int stream)
 }
 
 void append_frame(
-    AudioClip& clip, SwrContext* resampler, const AVFrame* frame, int channels)
+    AudioClip& clip, SwrContext* resampler, const AVFrame* frame, int channels,
+    std::size_t frame_limit)
 {
     const int output_samples = av_rescale_rnd(
         swr_get_delay(resampler, frame->sample_rate) + frame->nb_samples,
@@ -198,9 +236,26 @@ void append_frame(
         const_cast<const std::uint8_t**>(frame->extended_data),
         frame->nb_samples);
     if (converted > 0) {
-        const auto sample_count = static_cast<std::size_t>(converted) * channels;
-        clip.samples.insert(
-            clip.samples.end(), buffer.data(), buffer.data() + sample_count);
+        auto sample_count = static_cast<std::size_t>(converted) * channels;
+        // Under SKIP_MANUAL the decoder only marks what to drop.  The start
+        // is the Vorbis priming, dropped as libvorbis drops it; the end is
+        // the granule's to say (frame_limit), not this.
+        std::size_t first = 0;
+        if (const auto* skip =
+                av_frame_get_side_data(frame, AV_FRAME_DATA_SKIP_SAMPLES);
+            skip && skip->size >= 4) {
+            first = std::min(sample_count,
+                             static_cast<std::size_t>(AV_RL32(skip->data))
+                                 * channels);
+        }
+        sample_count -= first;
+        if (frame_limit != 0) {
+            const auto limit = frame_limit * static_cast<std::size_t>(channels);
+            sample_count = std::min(
+                sample_count, limit - std::min(limit, clip.samples.size()));
+        }
+        clip.samples.insert(clip.samples.end(), buffer.data() + first,
+                            buffer.data() + first + sample_count);
     }
 }
 
@@ -217,6 +272,8 @@ struct AudioDecoder::State {
     SwrContext* resampler = nullptr;
     int stream_index = -1;
     bool drained = false;
+    // Ogg Vorbis: the end granule, where the stream stops (0: no limit).
+    std::size_t frame_limit = 0;
     // Set for plain PCM, which is converted here and never opens ffmpeg.
     std::optional<PlainPcm> pcm;
     std::size_t pcm_at = 0;     // bytes into the data chunk
@@ -461,7 +518,17 @@ void AudioDecoder::open_stream()
     if (state.stream_index < 0) {
         throw std::runtime_error("audio file has no audio stream");
     }
-    state.codec = open_codec(state.format, state.stream_index);
+    // Vorbis in Ogg ends where its last page's granule says, as libvorbis
+    // ends it.  ffmpeg works out its own trimming from the page timestamps,
+    // and a stream whose audio is all on one page - 132 of the voice files -
+    // defeats it: it cut 128 real frames off the end of 119 of them and left
+    // the decoder's ~1000 frames of padding on the other 13.  So it trims
+    // nothing (SKIP_MANUAL) and the granule cuts the stream.
+    const std::int64_t end_granule = container
+            && std::strcmp(container->name, "ogg") == 0
+        ? ogg_end_granule(state.bytes) : -1;
+    state.codec = open_codec(state.format, state.stream_index, end_granule > 0);
+    state.frame_limit = end_granule > 0 ? static_cast<std::size_t>(end_granule) : 0;
     if (state.codec->sample_rate <= 0
         || state.codec->ch_layout.nb_channels <= 0) {
         throw std::runtime_error("invalid audio stream");
@@ -787,7 +854,7 @@ bool AudioDecoder::decode(std::chrono::nanoseconds budget,
                     throw ffmpeg_error("receive audio frame", result);
                 }
                 append_frame(clip_, state.resampler, state.frame,
-                             clip_.channels);
+                             clip_.channels, state.frame_limit);
             }
         }
         av_packet_unref(state.packet);
@@ -815,7 +882,8 @@ bool AudioDecoder::decode(std::chrono::nanoseconds budget,
         if (result < 0) {
             throw ffmpeg_error("receive flushed audio frame", result);
         }
-        append_frame(clip_, state.resampler, state.frame, clip_.channels);
+        append_frame(clip_, state.resampler, state.frame, clip_.channels,
+                     state.frame_limit);
     }
     done_ = true;
     if (clip_.samples.empty()) {
@@ -984,8 +1052,7 @@ void AudioChannel::play_intro_loop_streaming(
 
 void AudioChannel::queue()
 {
-    const auto& clip = active_clip();
-    if (!stream_ || clip.samples.size() <= queued_samples_) {
+    if (!stream_) {
         return;
     }
     // Only up to the high mark, and only once the device has drained to the
@@ -999,17 +1066,64 @@ void AudioChannel::queue()
     if (in_device >= mark_samples(window_low_ms)) {
         return;
     }
-    const auto room = mark_samples(window_high_ms) - in_device;
-    const auto count =
-        std::min(clip.samples.size() - queued_samples_, room);
-    if (!SDL_PutAudioStreamData(
-            stream_, clip.samples.data() + queued_samples_,
-            static_cast<int>(count * sizeof(float)))) {
-        throw std::runtime_error(SDL_GetError());
+    auto room = mark_samples(window_high_ms) - in_device;
+    while (room > 0) {
+        const auto& clip = active_clip();
+        if (clip.samples.size() > queued_samples_) {
+            const auto count =
+                std::min(clip.samples.size() - queued_samples_, room);
+            if (!SDL_PutAudioStreamData(
+                    stream_, clip.samples.data() + queued_samples_,
+                    static_cast<int>(count * sizeof(float)))) {
+                throw std::runtime_error(SDL_GetError());
+            }
+            queued_samples_ += count;
+            room -= count;
+            advance_playback_end(count);
+            continue;
+        }
+        if (source_ && !source_->done()) {
+            return;     // more of this one is still being decoded
+        }
+        // All of it is in.  What follows - the loop body after an intro, or
+        // the clip again - goes in straight behind it, in the same window.
+        // Waiting for the device to play the end out first, as this once
+        // did, left 4-33 ms of silence at every loop point (playbacktest).
+        if (!continue_into_next()) {
+            // The real end.  Only now is the resampler told no more input
+            // is coming: a flush on every top-up pads its history with
+            // silence, a glitch at each refill of any resampled stream.
+            SDL_FlushAudioStream(stream_);
+            return;
+        }
     }
-    SDL_FlushAudioStream(stream_);
-    queued_samples_ += count;
-    advance_playback_end(count);
+}
+
+bool AudioChannel::continue_into_next()
+{
+    if (loop_source_) {
+        // The intro is all handed over; the body takes over as the looping
+        // source, exactly as loop_clip_ does for a fully decoded track.
+        source_ = std::move(loop_source_);
+        loop_source_.reset();
+        clip_ = {};
+        loop_ = true;
+        queued_samples_ = 0;
+        return true;
+    }
+    if (!loop_clip_.samples.empty()) {
+        source_.reset();
+        clip_ = std::move(loop_clip_);
+        loop_clip_ = {};
+        loop_ = true;
+        queued_samples_ = 0;
+        return true;
+    }
+    if (loop_ && !active_clip().samples.empty()) {
+        queued_samples_ = 0;
+        return true;
+    }
+    return false;
 }
 
 void AudioChannel::stop()
@@ -1142,33 +1256,17 @@ void AudioChannel::update()
     if (source_ && !source_->done()) {
         return;
     }
+    // A loop never ends here: queue() carries it on by itself.
+    if (loop_ || loop_source_ || !loop_clip_.samples.empty()) {
+        return;
+    }
     // now(), not the wall clock: playback_end_ is set from the same source,
     // and comparing a time from one clock against a deadline from another is
     // not a smaller error than either clock's - it is nonsense.
     if (now() < playback_end_) {
         return;
     }
-    if (loop_source_) {
-        // The intro has played out; the body takes over as the looping
-        // source, exactly as loop_clip_ does for a fully decoded track.
-        source_ = std::move(loop_source_);
-        loop_source_.reset();
-        clip_ = {};
-        loop_ = true;
-        queued_samples_ = 0;
-        queue();
-    } else if (!loop_clip_.samples.empty()) {
-        source_.reset();
-        clip_ = std::move(loop_clip_);
-        loop_ = true;
-        queued_samples_ = 0;
-        queue();
-    } else if (loop_) {
-        queued_samples_ = 0;
-        queue();
-    } else {
-        active_ = false;
-    }
+    active_ = false;
 }
 
 bool AudioChannel::playing() const

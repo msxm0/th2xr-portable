@@ -107,11 +107,38 @@ void Game::begin_load(int slot)
     // FadeStruct only counts; the darkening is drawn by the overlay that
     // reads it (Game::screen_flash_alpha), in black.
     screen_flash_ = ScreenFlash{0, 0, 0, 1, 1, engine_now()};
-    load_step_next_ = LoadStep::fadeout;
+    if (save_window_.title_load) {
+        // From the title, AVG_ChangeSetp only sets NextAvgStep: the step
+        // comes in at AVG_System's AVG_RenewSetp, the end of the AVG_INIT
+        // tick (start_pending_title_load).
+        title_load_pending_ = true;
+        title_load_clicked_ = menu_now();
+    } else {
+        load_step_next_ = LoadStep::fadeout;
+    }
     for (int layer = 0; layer < th2::mouse_layers; ++layer) {
         msg().reset_mouse_rect_layer(layer);    // MUS_ResetMouseRect_All
     }
     msg().set_mouse_layer(0);
+}
+
+void Game::start_pending_title_load()
+{
+    // GM_Title.cpp, TTL_SYS_LOAD's -2: TTL_SYS_END the tick after the
+    // click, TTL_TERM (END_LOADSTART: GAME_AVG, no scenario) the next, and
+    // AVG_System's AVG_INIT on the third.  Its AVG_Init zeroes FadeStruct -
+    // the fade-out AVG_SetLoad began is dropped, black - and its
+    // AVG_RenewSetp brings in LOAD_FADEOUT, which then finds no fade to
+    // wait for and loads on the tick after.
+    if (!title_load_pending_
+        || menu_now() - title_load_clicked_
+            < std::chrono::milliseconds(3 * engine_tick_ms)) {
+        return;
+    }
+    title_load_pending_ = false;
+    start_new_game();
+    screen_flash_ = ScreenFlash{0, 0, 0, 1, 1, engine_now()};
+    load_step_next_ = LoadStep::fadeout;
 }
 
 void Game::control_load()

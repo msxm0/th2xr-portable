@@ -820,7 +820,18 @@ bool GlExactBlend::draw(
     if (box_x1 <= box_x0 || box_y1 <= box_y0) {
         return true;    // none of it lands on the target: drawn, invisibly
     }
-    if (!layer
+    // The poly walker at full strength replaces its rows outright: it reads
+    // no alpha (texel_alpha is 255), so rev = 256 - 256 = 0 and BlendTable[0]
+    // of the destination is 0 whatever it holds.  It needs no copy - a roll
+    // shake redraws the whole background this way every tick, and on a
+    // tiling GPU every copy is a render-pass flush.
+    const bool replaces = mode == 5 && alpha >= 256;
+    if (replaces
+        && (box_x1 <= 0 || box_y1 <= 0 || box_x0 >= target_w
+            || box_y0 >= target_h)) {
+        return true;    // the box is off the target entirely
+    }
+    if (!layer && !replaces
         && !impl_->copy_destination(static_cast<int>(target_w),
                                     static_cast<int>(target_h), box_x0,
                                     box_y0, box_x1, box_y1)) {

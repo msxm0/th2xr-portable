@@ -93,6 +93,11 @@ rm -f "$HERE/run/Sys.sav"
 # page and a save into an occupied slot asks first, so a run that inherits
 # the last run's saves takes different input paths.
 rm -f "$HERE"/run/save_*.sav
+# TH2REF_SEED_SAVES=DIR starts the run with DIR's save_*.sav instead - a
+# load from the title needs a save made by an earlier run.
+if [ -n "${TH2REF_SEED_SAVES:-}" ]; then
+    cp -p "$TH2REF_SEED_SAVES"/save_*.sav "$HERE/run/" || exit 1
+fi
 stop_ref || exit 1
 # Whoever parks a reference says which one it is (window.sh); a fresh start
 # from here is nobody's until they do.

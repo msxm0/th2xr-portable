@@ -979,7 +979,6 @@ void Game::reset_render_state()
     if (upscaler_) {
         upscaler_->reset();
     }
-    shake_target_.reset();
     subtick_art_.reset();
     display().release_bmp(th2::bmp_back);
     background_baked_dirty_ = true;
@@ -989,58 +988,10 @@ void Game::reset_render_state()
     sidebar_layer_used_ = true;
     display().release_bmp(th2::bmp_backhalf);
     title_masked_.reset();
+    title_masked_rate_ = -1;
     if (imgui_) {
         imgui_->rebuild_font_atlas(imgui_display_scale());
     }
-}
-
-bool Game::draw_pose_dissolve(
-    SDL_Texture* next, SDL_Texture* previous, float progress,
-    Uint8 brightness, int alpha, const SDL_FRect& destination)
-{
-    if (!ensure_pose_blend_target()) {
-        return false;
-    }
-    // Both poses are added in weighted by their share of the dissolve, with
-    // the alpha channel weighted the same way, which is what makes the two
-    // of them add up to one solid sprite.
-    const auto accumulate = SDL_ComposeCustomBlendMode(
-        SDL_BLENDFACTOR_SRC_ALPHA, SDL_BLENDFACTOR_ONE,
-        SDL_BLENDOPERATION_ADD,
-        SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE,
-        SDL_BLENDOPERATION_ADD);
-    if (!SDL_SetTextureBlendMode(next, accumulate)
-        || !SDL_SetTextureBlendMode(previous, accumulate)) {
-        SDL_SetTextureBlendMode(next, SDL_BLENDMODE_BLEND);
-        SDL_SetTextureBlendMode(previous, SDL_BLENDMODE_BLEND);
-        return false;  // No custom blending here; the plain path still works.
-    }
-    auto* const scene = SDL_GetRenderTarget(renderer_);
-    SDL_SetRenderTarget(renderer_, pose_blend_target_.get());
-    SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
-    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 0);
-    SDL_RenderClear(renderer_);
-    const SDL_FRect whole{0.0f, 0.0f, 800.0f, 600.0f};
-    for (const auto& [texture, weight] : {
-             std::pair{previous, 1.0f - progress},
-             std::pair{next, progress}}) {
-        SDL_SetTextureColorMod(texture, 255, 255, 255);
-        SDL_SetTextureAlphaMod(
-            texture,
-            static_cast<Uint8>(std::clamp(weight * 255.0f, 0.0f, 255.0f)));
-        SDL_RenderTexture(renderer_, texture, nullptr, &whole);
-    }
-    SDL_SetRenderTarget(renderer_, scene);
-    SDL_SetTextureBlendMode(next, SDL_BLENDMODE_BLEND);
-    SDL_SetTextureBlendMode(previous, SDL_BLENDMODE_BLEND);
-    SDL_SetTextureColorMod(
-        pose_blend_target_.get(), brightness, brightness, brightness);
-    SDL_SetTextureAlphaMod(
-        pose_blend_target_.get(),
-        static_cast<Uint8>(std::clamp(alpha, 0, 255)));
-    SDL_RenderTexture(
-        renderer_, pose_blend_target_.get(), nullptr, &destination);
-    return true;
 }
 
 bool Game::draw_exact_fade()
@@ -1086,37 +1037,6 @@ bool Game::draw_exact_fade()
     return gl->capture_destination(renderer_)
         && gl->draw(renderer_, fade_scratch_.get(), whole, whole, false,
                     false, 0, 256, r, g, b);
-}
-
-bool Game::ensure_pose_blend_target()
-{
-    if (pose_blend_target_) {
-        return true;
-    }
-    pose_blend_target_.reset(SDL_CreateTexture(
-        renderer_, SDL_PIXELFORMAT_RGBA32,
-        SDL_TEXTUREACCESS_TARGET, 800, 600));
-    if (!pose_blend_target_) {
-        return false;
-    }
-    // The dissolve accumulates both poses premultiplied, so the result is
-    // composited as premultiplied too.
-    return SDL_SetTextureBlendMode(
-        pose_blend_target_.get(), SDL_BLENDMODE_BLEND_PREMULTIPLIED);
-}
-
-void Game::ensure_shake_target()
-{
-    if (shake_target_) {
-        return;
-    }
-    shake_target_.reset(SDL_CreateTexture(
-        renderer_, SDL_PIXELFORMAT_RGBA32,
-        SDL_TEXTUREACCESS_TARGET, 800, 600));
-    if (!shake_target_) {
-        throw std::runtime_error(SDL_GetError());
-    }
-    SDL_SetTextureBlendMode(shake_target_.get(), SDL_BLENDMODE_NONE);
 }
 
 bool Game::copy_back_plate()

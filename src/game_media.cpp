@@ -811,9 +811,6 @@ bool Game::trace_se_playing(std::size_t channel) const
 void Game::trace_note_audio(const char* kind, int a, int b, int c, int d,
                             const char* name)
 {
-    if (!trace_mode_) {
-        return;
-    }
     static std::FILE* log = [] {
         const char* path = SDL_getenv("TH2_AUDIO_LOG");
         return path ? std::fopen(path, "a") : nullptr;
@@ -821,9 +818,12 @@ void Game::trace_note_audio(const char* kind, int a, int b, int c, int d,
     if (!log) {
         return;
     }
+    // A trace stamps the tick; normal play the wall clock in milliseconds,
+    // for checking what was heard against what was asked for.
     std::fprintf(log, "%llu %s %d %d %d %d %s\n",
-                 static_cast<unsigned long long>(trace_tick_), kind,
-                 a, b, c, d, name ? name : "-");
+                 static_cast<unsigned long long>(
+                     trace_mode_ ? trace_tick_ : SDL_GetTicks()),
+                 kind, a, b, c, d, name ? name : "-");
     std::fflush(log);
 }
 

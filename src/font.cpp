@@ -416,6 +416,21 @@ struct GameFont::Modern {
         }
         font = primary.font;
         TTF_SetFontHinting(font, TTF_HINTING_LIGHT_SUBPIXEL);
+        // One line measured and rendered and thrown away, fallback glyphs
+        // included, so the first line the player sees does not pay for it:
+        // in the browser every FreeType and SDL_ttf function is compiled on
+        // its first call, about 3 ms of the first scene's first frame.
+        static constexpr std::string_view sample =
+            "Aa, \xe3\x81\x82\xe3\x82\xa2\xe6\xbc\xa2";
+        int sample_width = 0;
+        int sample_height = 0;
+        TTF_GetStringSize(font, sample.data(), sample.size(), &sample_width,
+                          &sample_height);
+        if (SDL_Surface* const warm = TTF_RenderText_Blended(
+                font, sample.data(), sample.size(),
+                SDL_Color{255, 255, 255, 255})) {
+            SDL_DestroySurface(warm);
+        }
         family = requested_family;
         logical_size = requested_size;
         scale = requested_scale;

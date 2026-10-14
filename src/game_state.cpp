@@ -191,6 +191,13 @@ void Game::warm_renderer_programs()
         if (display_) {
             display_->reserve_targets(width, height, 3);
         }
+        // And the copy a frame between ticks draws into, which would
+        // otherwise be made on the first such frame - the first scene's
+        // fade-in.  In a browser making a target is a synchronous
+        // checkFramebufferStatus; that frame took 8-9 ms.
+        if (config_.smooth_motion && !trace_mode_) {
+            ensure_subtick_art();
+        }
     }
 }
 

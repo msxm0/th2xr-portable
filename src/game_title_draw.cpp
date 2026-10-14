@@ -535,35 +535,38 @@ void Game::draw_title()
     if (title_foreground_pixels_ && title_masked_ && frame >= 16) {
         const int vague = 32;
         const int rate = std::clamp((frame - 16) * 8, 0, 256);
-        const int blend_offset = rate * (256 + vague) / 256;
-        std::vector<std::uint8_t> pixels(800 * 600 * 4);
-        const auto* source = static_cast<const std::uint8_t*>(
-            title_foreground_pixels_->pixels);
-        for (int y = 0; y < 600; ++y) {
-            const int mask_y = y * title_mask_height_ / 600;
-            for (int x = 0; x < 800; ++x) {
-                const int mask_x = x * title_mask_width_ / 800;
-                const int mask = title_mask_[
-                    static_cast<std::size_t>(mask_y) * title_mask_width_
-                    + mask_x];
-                const int alpha = std::clamp(
-                    (mask + blend_offset - 256) * 256 / vague, 0, 255);
-                const auto source_offset =
-                    static_cast<std::size_t>(y)
-                        * title_foreground_pixels_->pitch
-                    + static_cast<std::size_t>(x) * 4;
-                const auto output_offset =
-                    (static_cast<std::size_t>(y) * 800 + x) * 4;
-                for (int channel = 0; channel < 3; ++channel) {
-                    pixels[output_offset + channel] =
-                        source[source_offset + channel];
+        if (rate != title_masked_rate_) {
+            title_masked_rate_ = rate;
+            const int blend_offset = rate * (256 + vague) / 256;
+            std::vector<std::uint8_t> pixels(800 * 600 * 4);
+            const auto* source = static_cast<const std::uint8_t*>(
+                title_foreground_pixels_->pixels);
+            for (int y = 0; y < 600; ++y) {
+                const int mask_y = y * title_mask_height_ / 600;
+                for (int x = 0; x < 800; ++x) {
+                    const int mask_x = x * title_mask_width_ / 800;
+                    const int mask = title_mask_[
+                        static_cast<std::size_t>(mask_y) * title_mask_width_
+                        + mask_x];
+                    const int alpha = std::clamp(
+                        (mask + blend_offset - 256) * 256 / vague, 0, 255);
+                    const auto source_offset =
+                        static_cast<std::size_t>(y)
+                            * title_foreground_pixels_->pitch
+                        + static_cast<std::size_t>(x) * 4;
+                    const auto output_offset =
+                        (static_cast<std::size_t>(y) * 800 + x) * 4;
+                    for (int channel = 0; channel < 3; ++channel) {
+                        pixels[output_offset + channel] =
+                            source[source_offset + channel];
+                    }
+                    pixels[output_offset + 3] =
+                        static_cast<std::uint8_t>(alpha);
                 }
-                pixels[output_offset + 3] =
-                    static_cast<std::uint8_t>(alpha);
             }
+            SDL_UpdateTexture(
+                title_masked_.get(), nullptr, pixels.data(), 800 * 4);
         }
-        SDL_UpdateTexture(
-            title_masked_.get(), nullptr, pixels.data(), 800 * 4);
         SDL_SetTextureColorModFloat(
             title_masked_.get(), brightness, brightness, brightness);
         SDL_RenderTexture(renderer_, title_masked_.get(), nullptr, nullptr);

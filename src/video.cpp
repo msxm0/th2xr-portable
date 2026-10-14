@@ -277,8 +277,15 @@ struct VideoPlayer::Impl {
 
     void present_due_frame(double elapsed)
     {
-        while (!video_frames.empty()
-               && video_frames.front().time <= elapsed + 0.001) {
+        // Only the last frame that is due is ever seen, so only it is
+        // uploaded - skipping at up to 8x, or catching up after a stall,
+        // makes several due at once.
+        while (video_frames.size() > 1
+               && video_frames[1].time <= elapsed + 0.001) {
+            video_frames.pop_front();
+        }
+        if (!video_frames.empty()
+            && video_frames.front().time <= elapsed + 0.001) {
             const auto& due = video_frames.front();
             if (!SDL_UpdateTexture(
                     texture.get(), nullptr, due.pixels.data(),

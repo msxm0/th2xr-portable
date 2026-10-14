@@ -283,8 +283,8 @@ public:
     void set_bright(int r, int g, int b);                        // AVG_SetBright
     void set_flash(int r, int g, int b, int fade1, int fade2);
     void control_fade();
-    // AVG_Init's share of FadeStruct and the graphs: GRP_DISP and BMP_DISP
-    // gone, and nothing left for the end of the next fade to turn back on.
+    // AVG_Init's share of FadeStruct and the graphs: FadeStruct zeroed,
+    // GRP_DISP and BMP_DISP gone.
     void reset_fade_freeze();
     bool wait_fade() const { return fade_.flag != 0; }
     const FadeStruct& fade() const { return fade_; }

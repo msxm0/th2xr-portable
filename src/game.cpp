@@ -400,6 +400,7 @@ Game::Game(
     title_masked_ = Texture(SDL_CreateTexture(
         renderer_, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING,
         800, 600));
+    title_masked_rate_ = -1;
     if (title_masked_) {
         SDL_SetTextureBlendMode(title_masked_.get(), SDL_BLENDMODE_BLEND);
     }
@@ -1054,6 +1055,8 @@ void Game::iterate()
         trace_title_input();
     }
     start_pending_replay();
+    start_pending_title_load();
+    run_audio_selftest();
     handle_touch_actions();
     process_save_bundle_dialog();
 
@@ -1356,7 +1359,10 @@ void Game::run_tick()
     if (avg_init_tick_) {
         avg_init_tick_ = false;
     } else if (ui_mode_ == UiMode::game || ui_mode_ == UiMode::map
-        || ui_mode_ == UiMode::save || ui_mode_ == UiMode::load) {
+        || ui_mode_ == UiMode::save
+        || (ui_mode_ == UiMode::load && !save_window_.title_load)) {
+        // The title's own load window runs under TTL_System, which never
+        // writes it.
         runtime_.set_flag(5, default_char_name_);
     } else if (title_return_count_ && *title_return_count_ < global_count_) {
         // AVG_END's frame: AVG_System's write, then AVG_Term and the title,

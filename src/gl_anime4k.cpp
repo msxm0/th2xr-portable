@@ -39,6 +39,7 @@ void main()
 // before it can divide a vec2.
 constexpr char fragment_source[] = R"(#version 300 es
 precision highp float;
+precision highp int;
 precision highp sampler2D;
 uniform sampler2D u_source;
 in vec2 v_uv;

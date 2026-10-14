@@ -210,6 +210,9 @@ private:
 
     const AudioClip& active_clip() const;
     void queue();
+    // What plays after the active clip is all queued: the loop body, or the
+    // clip again.  False at the real end.
+    bool continue_into_next();
     void advance_playback_end(std::size_t samples);
 };
 

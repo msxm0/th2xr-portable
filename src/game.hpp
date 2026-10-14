@@ -692,6 +692,9 @@ private:
     std::uint32_t sakura_random_ = 0x13579bdfu;
     Surface title_foreground_pixels_;
     Texture title_masked_;
+    // The wipe rate title_masked_ holds, -1 for none: the pass below only
+    // runs when the rate moves, which it stops doing once the wipe is done.
+    int title_masked_rate_ = -1;
     std::vector<std::uint8_t> title_mask_;
     int title_mask_width_ = 0;
     int title_mask_height_ = 0;
@@ -865,8 +868,6 @@ private:
     std::optional<BackgroundFade> background_fade_;
     std::optional<ScreenFlash> screen_flash_;
     std::optional<ShakeState> shake_;
-    Texture shake_target_;
-    Texture pose_blend_target_;
     // FadeStruct's GRP_DISP in a trace: the frame so far, drawn back over
     // itself with the fade's brightness through BrightTable.
     Texture fade_scratch_;
@@ -1027,6 +1028,10 @@ private:
     // A replay clicked and not yet started (start_replay), and when.
     int replay_start_slot_ = -1;
     std::chrono::steady_clock::time_point replay_start_clicked_;
+    // A load answered Yes over the title, not yet started
+    // (start_pending_title_load), and when.
+    bool title_load_pending_ = false;
+    std::chrono::steady_clock::time_point title_load_clicked_;
     // The pointer as the port's screens last saw it, in game coordinates:
     // the bonus screens' selection is whatever is under it, every frame
     // (MUS_GetMouseNo), not the last item it moved over.
@@ -1921,6 +1926,17 @@ private:
     };
     void draw_omake_cancel(int highlight);
     void start_pending_replay();
+    void start_pending_title_load();
+    // TH2_AUDIO_SELFTEST (game_audio_selftest.cpp).
+    void run_audio_selftest();
+    struct AudioSelftest {
+        bool started = false;
+        std::FILE* out = nullptr;
+        std::vector<std::pair<const th2::Archive*, std::string>> queue;
+        std::size_t next = 0;
+        std::shared_ptr<th2::AudioDecoder> decoder;
+    };
+    AudioSelftest audio_selftest_;
     Texture bake_omake_cancel(const char* background, int passes);
     void open_cg_gallery();
     void open_music_room();
@@ -2127,7 +2143,6 @@ private:
     // The ramp is done live on the background instead, which is why the two
     // are separate.
     float half_tone_target_factor() const;
-    void ensure_shake_target();
     // The engine never clears its framebuffer, so whatever a transform fails
     // to cover keeps the pixels from the frame before.  That is visible in
     // the original - the corners a rotation leaves behind hold the previous
@@ -2143,10 +2158,6 @@ private:
     // their last clear: an empty layer is neither cleared nor composited.
     bool text_layer_used_ = true;
     bool sidebar_layer_used_ = true;
-    // Cross-dissolves two character poses through a scratch target, the way
-    // the original blends the pair inside one sprite.  False when the
-    // renderer cannot do it, so the caller falls back.
-    bool ensure_pose_blend_target();
     // Draws `draw` at DRW_BLD(alpha), alpha 0..256, through
     // save_layer_target_ when it is not opaque.
     template <typename Draw>
@@ -2155,9 +2166,6 @@ private:
     void draw_save_load_buttons();
     void draw_save_load_slots();
     void draw_save_load_prompt();
-    bool draw_pose_dissolve(
-        SDL_Texture* next, SDL_Texture* previous, float progress,
-        Uint8 brightness, int alpha, const SDL_FRect& destination);
     void draw_frame();
     void draw();
 };
