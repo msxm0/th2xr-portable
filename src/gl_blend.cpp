@@ -909,16 +909,8 @@ bool GlExactBlend::draw(
                          | (th2::texture_source_folded(source2) ? 2 : 0));
     impl_->uniform_i(impl_->row_count_location,
                      poly_rows ? poly_row_count : 0);
+    impl_->bind_rows();
     if (poly_rows) {
-        if (!impl_->rows_name) {
-            glGenTextures(1, &impl_->rows_name);
-        }
-        glActiveTexture(GL_TEXTURE3);
-        glBindTexture(GL_TEXTURE_2D, impl_->rows_name);
-        // Integer textures cannot be filtered; texelFetch needs NEAREST set
-        // or the texture is incomplete and reads zero.
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         // Unpack state as SDL leaves it - alignment 1, which it sets once
         // at creation, and no row length, which nothing here sets - suits
         // rows of 16 byte texels as it is, so it is neither changed nor

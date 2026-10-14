@@ -111,6 +111,31 @@ struct GlExactBlend::Impl {
             glUniform2f(location, a, b);
         }
     }
+    // The poly walker's rows texture on unit 3, made if there is none yet,
+    // before every draw - whether the draw reads it or not.  u_rows is an
+    // isampler2D, and WebGL fails any draw whose integer sampler's unit
+    // holds a normalised texture, which is what other GL code leaves there
+    // (CuNNy's 4x16 and 4x32 passes bind their layers to units 0-8): every
+    // glyph and blended effect after the network had run failed with
+    // INVALID_OPERATION.  Leaves unit 3 active.
+    void bind_rows()
+    {
+        glActiveTexture(GL_TEXTURE3);
+        if (!rows_name) {
+            glGenTextures(1, &rows_name);
+            glBindTexture(GL_TEXTURE_2D, rows_name);
+            // Integer textures cannot be filtered; texelFetch needs NEAREST
+            // set or the texture is incomplete and reads zero.
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            const GLint zero[8] = {};
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32I, 2, 1, 0,
+                         GL_RGBA_INTEGER, GL_INT, zero);
+            return;
+        }
+        glBindTexture(GL_TEXTURE_2D, rows_name);
+    }
+
     int scratch_width = 0;
     int scratch_height = 0;
     bool captured = false;

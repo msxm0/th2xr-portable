@@ -240,6 +240,7 @@ bool GlExactBlend::draw_mask_batch(
     glBindTexture(GL_TEXTURE_2D, atlas_name);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, dest_name);
+    impl_->bind_rows();
     if (!impl_->batch_samplers_set) {
         // All four, though only two are read: samplers left at their
         // default all point at unit 0, and u_rows is an isampler2D - two
