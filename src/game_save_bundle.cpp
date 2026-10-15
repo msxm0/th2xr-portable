@@ -161,11 +161,22 @@ void Game::initialize_scenario_flags()
     runtime_.set_flag(7, 0);
 }
 
+void Game::init_eopr_flag()
+{
+    eopr_flag_.fill(0);
+    opcode_phase_ = 1;
+}
+
 void Game::start_new_game()
 {
     reset_play_state();
     reset_back_struct();
     initialize_scenario_flags();
+    // MAIN_StartScenario's ESC_InitEOprFlag.  The flags are per opcode, so
+    // a game left from the settings screen while a line waited for the
+    // reader kept the message opcode's set; the next game's first line then
+    // skipped its set-up and waited for a message never shown.
+    init_eopr_flag();
     direct_scenario_ = false;
     load_script(new_game_script);
     ui_mode_ = UiMode::game;

@@ -101,6 +101,15 @@ void Game::return_to_title()
     }
     config_open_ = false;
     confirm_return_title_ = false;
+    // Our Return to Title is asked from the settings screen, which the side
+    // bar opens through AVG_GoConfig: the script stopped, the back closed,
+    // the engine in its config step.  The engine only ever left that screen
+    // back into the scene; going to the title instead, AVG_Term drops it all
+    // and TTL_Term turns the script on for whatever the title starts next.
+    // Kept, the next new game ran no script and drew nothing.
+    engine_config_loaded();
+    engine_back_closed_ = false;
+    script_flag_ = true;
     auto_mode_ = false;
     skip_mode_ = false;
     const bool from_replay = replay_mode_;

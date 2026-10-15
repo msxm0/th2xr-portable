@@ -680,8 +680,7 @@ bool Game::load_body(std::istream& in)
     // ESC_InitEOprFlag - the instruction the save stopped on runs its set-up
     // again rather than resuming a wait it never set up.
     msg().init();
-    eopr_flag_.fill(0);
-    opcode_phase_ = 1;
+    init_eopr_flag();
     // And the rest of AVG_Init that the scene below is rebuilt on:
     //     ZeroMemory( &BackStruct ); AVG_SetBackFadeDirect( 128, 128, 128 );
     //     AVG_ResetHalfTone();

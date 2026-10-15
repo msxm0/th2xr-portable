@@ -395,6 +395,7 @@ void Game::start_replay_scenario(int number)
     initialize_scenario_flags();
     direct_scenario_ = false;
     replay_mode_ = true;
+    init_eopr_flag();   // MAIN_StartOmakeScenario's ESC_InitEOprFlag
     load_script(std::format("8000{:05d}.SDT", number));
     ui_mode_ = UiMode::game;
     title_extras_ = false;

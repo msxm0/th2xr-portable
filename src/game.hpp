@@ -1746,6 +1746,8 @@ private:
     void initialize_scenario_flags();
     void reset_back_struct();
     void start_new_game();
+    // ESC_InitEOprFlag: no instruction's set-up counted as done.
+    void init_eopr_flag();
     // The name dialog: it opens on the current names, as NameDialogBoxProc
     // does with NameL..NameNN; "Reset Defaults" is its IDC_RESET_NAME.
     void open_name_input();
